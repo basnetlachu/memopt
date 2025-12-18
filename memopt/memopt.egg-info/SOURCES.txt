@@ -1,0 +1,6 @@
+setup.py
+memopt.egg-info/PKG-INFO
+memopt.egg-info/SOURCES.txt
+memopt.egg-info/dependency_links.txt
+memopt.egg-info/requires.txt
+memopt.egg-info/top_level.txt

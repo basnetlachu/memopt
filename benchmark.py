@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+Benchmark script for MemOpt
+
+Compares baseline vs optimized inference and provides customer-ready metrics.
+
+Usage:
+    python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
+    python benchmark.py --model mistralai/Mistral-7B-v0.1 --mode optimized
+"""
+
+import argparse
+import torch
+import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import json
+
+from memopt import OptimizedLLM, ProfileStats
+from memopt.profiler import compare_profiles
+
+
+def run_baseline(model_name: str, prompts: list, max_tokens: int = 256):
+    """
+    Run baseline inference without optimizations.
+    
+    Returns:
+        ProfileStats
+    """
+    print("\n" + "="*70)
+    print("RUNNING BASELINE (No Optimizations)")
+    print("="*70)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Load model normally
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map=device,
+        low_cpu_mem_usage=True
+    )
+    model.eval()
+    
+    # Reset memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    
+    start_time = time.time()
+    total_tokens = 0
+    
+    # Run inference
+    with torch.no_grad():
+        for i, prompt in enumerate(prompts):
+            print(f"  Processing prompt {i+1}/{len(prompts)}...")
+            
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            
+            total_tokens += len(outputs[0]) - len(inputs['input_ids'][0])
+    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    # Collect stats
+    stats = ProfileStats()
+    stats.total_tokens_generated = total_tokens
+    stats.total_time_seconds = total_time
+    stats.tokens_per_second = total_tokens / total_time
+    stats.latency_per_token_ms = (total_time / total_tokens) * 1000
+    
+    if torch.cuda.is_available():
+        stats.peak_memory_allocated_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        stats.peak_memory_reserved_gb = torch.cuda.max_memory_reserved() / (1024**3)
+        
+        # Estimate bandwidth usage (baseline is inefficient)
+        bytes_per_token = 26e9  # 26GB for FP16 13B model
+        achieved_bandwidth = stats.tokens_per_second * bytes_per_token
+        theoretical_bandwidth = 2e12  # 2TB/s for A100
+        stats.memory_bandwidth_utilization_pct = min(
+            (achieved_bandwidth / theoretical_bandwidth) * 100, 100.0
+        )
+        stats.gpu_stall_pct = 100.0 - stats.memory_bandwidth_utilization_pct
+        stats.gpu_utilization_pct = 100.0 - stats.gpu_stall_pct
+    
+    # Cost estimate
+    gpu_hourly_cost = 5.0  # A100 80GB
+    stats.estimated_gpu_hours = total_time / 3600.0
+    cost_for_run = stats.estimated_gpu_hours * gpu_hourly_cost
+    stats.cost_per_1m_tokens_usd = (cost_for_run / total_tokens) * 1e6
+    
+    print(f"\n✓ Baseline complete: {stats.tokens_per_second:.1f} tok/s")
+    
+    # Cleanup
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return stats
+
+
+def run_optimized(
+    model_name: str,
+    prompts: list,
+    max_tokens: int = 256,
+    optimization_level: str = "high"
+):
+    """
+    Run optimized inference with MemOpt.
+    
+    Returns:
+        ProfileStats
+    """
+    print("\n" + "="*70)
+    print(f"RUNNING OPTIMIZED (MemOpt - {optimization_level})")
+    print("="*70)
+    
+    # Load with MemOpt
+    model = OptimizedLLM(
+        model=model_name,
+        optimization_level=optimization_level,
+        enable_profiling=True
+    )
+    
+    # Run inference
+    for i, prompt in enumerate(prompts):
+        print(f"  Processing prompt {i+1}/{len(prompts)}...")
+        
+        _ = model.generate(
+            prompt,
+            max_tokens=max_tokens,
+            do_sample=False
+        )
+        
+        # Reset cache between unrelated prompts
+        model.reset_kv_cache()
+    
+    # Get stats
+    stats = model.get_profiling_stats()
+    
+    print(f"\n✓ Optimized complete: {stats.tokens_per_second:.1f} tok/s")
+    
+    return stats
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark MemOpt")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="meta-llama/Llama-2-7b-hf",
+        help="Model name or path"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["baseline", "optimized", "both"],
+        default="both",
+        help="Which mode to run"
+    )
+    parser.add_argument(
+        "--optimization-level",
+        type=str,
+        choices=["conservative", "balanced", "high", "aggressive"],
+        default="high",
+        help="Optimization level"
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="Max tokens to generate per prompt"
+    )
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=5,
+        help="Number of prompts to test"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="benchmark_results.json",
+        help="Output file for results"
+    )
+    
+    args = parser.parse_args()
+    
+    # Test prompts
+    prompts = [
+        "Explain how neural networks work in simple terms.",
+        "Write a Python function to compute the Fibonacci sequence.",
+        "What are the key differences between RAM and storage?",
+        "Describe the process of photosynthesis step by step.",
+        "How does TCP/IP networking function at a high level?",
+        "Explain the concept of recursion with an example.",
+        "What makes quantum computing different from classical computing?",
+        "Write a short story about a robot learning to paint.",
+    ][:args.num_prompts]
+    
+    print("\n" + "="*70)
+    print("MEMOPT BENCHMARK")
+    print("="*70)
+    print(f"Model: {args.model}")
+    print(f"Prompts: {len(prompts)}")
+    print(f"Max tokens per prompt: {args.max_tokens}")
+    print(f"Optimization level: {args.optimization_level}")
+    
+    if not torch.cuda.is_available():
+        print("\n⚠️  WARNING: CUDA not available, running on CPU (will be slow)")
+    
+    # Run benchmarks
+    baseline_stats = None
+    optimized_stats = None
+    
+    if args.mode in ["baseline", "both"]:
+        baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
+    
+    if args.mode in ["optimized", "both"]:
+        optimized_stats = run_optimized(
+            args.model, prompts, args.max_tokens, args.optimization_level
+        )
+    
+    # Print results
+    print("\n" + "="*70)
+    print("RESULTS SUMMARY")
+    print("="*70)
+    
+    if baseline_stats:
+        print("\n📊 BASELINE:")
+        print(f"  Throughput:         {baseline_stats.tokens_per_second:.1f} tok/s")
+        print(f"  Latency:            {baseline_stats.latency_per_token_ms:.2f} ms/tok")
+        print(f"  Memory:             {baseline_stats.peak_memory_allocated_gb:.2f} GB")
+        print(f"  GPU stall:          {baseline_stats.gpu_stall_pct:.1f}%")
+        print(f"  Cost per 1M tokens: ${baseline_stats.cost_per_1m_tokens_usd:.2f}")
+    
+    if optimized_stats:
+        print("\n🚀 OPTIMIZED:")
+        print(f"  Throughput:         {optimized_stats.tokens_per_second:.1f} tok/s")
+        print(f"  Latency:            {optimized_stats.latency_per_token_ms:.2f} ms/tok")
+        print(f"  Memory:             {optimized_stats.peak_memory_allocated_gb:.2f} GB")
+        print(f"  GPU stall:          {optimized_stats.gpu_stall_pct:.1f}%")
+        print(f"  Cost per 1M tokens: ${optimized_stats.cost_per_1m_tokens_usd:.2f}")
+    
+    if baseline_stats and optimized_stats:
+        print("\n💰 IMPROVEMENT:")
+        speedup = optimized_stats.tokens_per_second / baseline_stats.tokens_per_second
+        memory_reduction = (
+            (baseline_stats.peak_memory_allocated_gb - optimized_stats.peak_memory_allocated_gb) /
+            baseline_stats.peak_memory_allocated_gb * 100
+        )
+        cost_reduction = (
+            (baseline_stats.cost_per_1m_tokens_usd - optimized_stats.cost_per_1m_tokens_usd) /
+            baseline_stats.cost_per_1m_tokens_usd * 100
+        )
+        stall_reduction = baseline_stats.gpu_stall_pct - optimized_stats.gpu_stall_pct
+        
+        print(f"  Speedup:            {speedup:.2f}x")
+        print(f"  Memory reduction:   {memory_reduction:.1f}%")
+        print(f"  Cost reduction:     {cost_reduction:.1f}%")
+        print(f"  Stall reduction:    {stall_reduction:.1f}%")
+        
+        # Calculate annual savings for a realistic workload
+        tokens_per_day = 10e9  # 10B tokens/day
+        daily_baseline_cost = (tokens_per_day / 1e6) * baseline_stats.cost_per_1m_tokens_usd
+        daily_optimized_cost = (tokens_per_day / 1e6) * optimized_stats.cost_per_1m_tokens_usd
+        daily_savings = daily_baseline_cost - daily_optimized_cost
+        annual_savings = daily_savings * 365
+        
+        print(f"\n💵 ROI ANALYSIS (10B tokens/day):")
+        print(f"  Daily baseline cost:   ${daily_baseline_cost:,.0f}")
+        print(f"  Daily optimized cost:  ${daily_optimized_cost:,.0f}")
+        print(f"  Daily savings:         ${daily_savings:,.0f}")
+        print(f"  Annual savings:        ${annual_savings:,.0f}")
+        print(f"\n  MemOpt price: $50,000/year")
+        print(f"  Payback period: {(50000 / daily_savings):.1f} days")
+        print(f"  First year ROI: {(annual_savings / 50000):.1f}x")
+    
+    # Save results
+    results = {}
+    if baseline_stats:
+        results["baseline"] = baseline_stats.to_dict()
+    if optimized_stats:
+        results["optimized"] = optimized_stats.to_dict()
+    
+    if baseline_stats and optimized_stats:
+        results["comparison"] = {
+            "speedup": speedup,
+            "memory_reduction_pct": memory_reduction,
+            "cost_reduction_pct": cost_reduction,
+            "stall_reduction_pct": stall_reduction,
+        }
+        results["roi_analysis"] = {
+            "tokens_per_day": 10e9,
+            "daily_savings_usd": daily_savings,
+            "annual_savings_usd": annual_savings,
+            "memopt_annual_cost_usd": 50000,
+            "payback_days": 50000 / daily_savings,
+            "first_year_roi": annual_savings / 50000
+        }
+    
+    with open(args.output, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\n✓ Results saved to {args.output}")
+    print("\n" + "="*70 + "\n")
+
+
+if __name__ == "__main__":
+    main()
