@@ -1,0 +1,58 @@
+{
+  "model": "gpt2-xl",
+  "num_prompts": 8,
+  "max_tokens": 1000,
+  "optimization_level": "high",
+  "gpu": "NVIDIA GeForce RTX 4070",
+  "baseline": {
+    "total_tokens_generated": 8000,
+    "total_time_seconds": 141.34623408317566,
+    "tokens_per_second": 56.59860732683103,
+    "latency_per_token_ms": 17.668279260396957,
+    "peak_memory_allocated_gb": 3.2487282752990723,
+    "peak_memory_reserved_gb": 3.404296875,
+    "memory_bandwidth_utilization_pct": 32.58099893192054,
+    "gpu_utilization_pct": 32.58099893192053,
+    "gpu_stall_pct": 67.41900106807947,
+    "cost_per_1m_tokens_usd": 24.539276750551334,
+    "estimated_gpu_hours": 0.03926284280088213,
+    "kv_cache_memory_gb": 0.0,
+    "kv_cache_hit_rate": 0.0,
+    "memory_saved_by_quantization_gb": 0.0,
+    "avg_batch_size": 0.0,
+    "avg_sequence_length": 0.0
+  },
+  "optimized": {
+    "total_tokens_generated": 8000,
+    "total_time_seconds": 35.42590234375,
+    "tokens_per_second": 225.82346449141036,
+    "latency_per_token_ms": 4.42823779296875,
+    "peak_memory_allocated_gb": 4.624490261077881,
+    "peak_memory_reserved_gb": 4.775390625,
+    "memory_bandwidth_utilization_pct": 100.0,
+    "gpu_utilization_pct": 100.0,
+    "gpu_stall_pct": 0.0,
+    "cost_per_1m_tokens_usd": 6.765363294813368,
+    "estimated_gpu_hours": 0.009840528428819445,
+    "kv_cache_memory_gb": 0.0,
+    "kv_cache_hit_rate": 0.0,
+    "memory_saved_by_quantization_gb": 1.371002197265625,
+    "avg_batch_size": 0.0,
+    "avg_sequence_length": 0.0
+  },
+  "comparison": {
+    "speedup": 3.9899120341845746,
+    "memory_change_gb": 1.3757619857788086,
+    "cost_reduction_pct": 72.43046988065217
+  },
+  "roi_analysis": {
+    "tokens_per_day": 100000000000.0,
+    "daily_savings_usd": 1777391.3455737964,
+    "annual_savings_usd": 648747841.1344357,
+    "revenue_share_pct": 35.0,
+    "memopt_annual_cost_usd": 227061744.39705247,
+    "customer_keeps_usd": 421686096.7373832,
+    "customer_roi": 1.8571428571428572,
+    "payback_days": 127.74999999999999
+  }
+}

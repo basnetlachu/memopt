@@ -221,6 +221,17 @@ class PagedKVCache:
             v: Value tensor [batch=1, num_heads, seq_len, head_dim]
             start_pos: Starting position in sequence
         """
+        # Handle shape - ensure we have [batch, num_heads, seq_len, head_dim]
+        if k.dim() == 3:
+            # [num_heads, seq_len, head_dim] -> [1, num_heads, seq_len, head_dim]
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        
+        # Transpose if needed: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
+        if k.shape[1] != self.num_heads:
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+        
         seq_len = k.shape[2]
         end_pos = start_pos + seq_len
         
@@ -265,16 +276,20 @@ class PagedKVCache:
             cache_start = max(0, offset if i == 0 else 0)
             cache_end = cache_start + (seq_end - seq_start)
             
-            k_block = k_flat[:, seq_start:seq_end, :]
-            v_block = v_flat[:, seq_start:seq_end, :]
+            k_block = k_flat[:, seq_start:seq_end, :].contiguous()
+            v_block = v_flat[:, seq_start:seq_end, :].contiguous()
             
             if self.quantize:
                 # Quantize and store
                 k_quant, k_scale, k_zero = self._quantize_tensor(k_block)
                 v_quant, v_scale, v_zero = self._quantize_tensor(v_block)
                 
-                self.k_cache[layer_idx, block_id, cache_start:cache_end] = k_quant
-                self.v_cache[layer_idx, block_id, cache_start:cache_end] = v_quant
+                # Ensure shapes match for assignment
+                k_quant_reshaped = k_quant.permute(1, 0, 2)  # [seq_len, num_heads, head_dim]
+                v_quant_reshaped = v_quant.permute(1, 0, 2)  # [seq_len, num_heads, head_dim]
+                
+                self.k_cache[layer_idx, block_id, cache_start:cache_end] = k_quant_reshaped
+                self.v_cache[layer_idx, block_id, cache_start:cache_end] = v_quant_reshaped
                 
                 self.k_scales[layer_idx, block_id] = k_scale
                 self.v_scales[layer_idx, block_id] = v_scale
@@ -282,8 +297,11 @@ class PagedKVCache:
                 self.v_zeros[layer_idx, block_id] = v_zero
             else:
                 # Direct FP16 storage
-                self.k_cache[layer_idx, block_id, cache_start:cache_end] = k_block
-                self.v_cache[layer_idx, block_id, cache_start:cache_end] = v_block
+                k_block_reshaped = k_block.permute(1, 0, 2)  # [seq_len, num_heads, head_dim]
+                v_block_reshaped = v_block.permute(1, 0, 2)  # [seq_len, num_heads, head_dim]
+                
+                self.k_cache[layer_idx, block_id, cache_start:cache_end] = k_block_reshaped
+                self.v_cache[layer_idx, block_id, cache_start:cache_end] = v_block_reshaped
     
     def read_cache(
         self,
@@ -351,8 +369,12 @@ class PagedKVCache:
                 k_block = self.k_cache[layer_idx, block_id, cache_start:cache_end]
                 v_block = self.v_cache[layer_idx, block_id, cache_start:cache_end]
             
-            k_out[0, :, out_pos:out_pos+read_len, :] = k_block
-            v_out[0, :, out_pos:out_pos+read_len, :] = v_block
+            # k_block is [read_len, num_heads, head_dim], need [num_heads, read_len, head_dim]
+            k_block_transposed = k_block.permute(1, 0, 2)
+            v_block_transposed = v_block.permute(1, 0, 2)
+            
+            k_out[0, :, out_pos:out_pos+read_len, :] = k_block_transposed
+            v_out[0, :, out_pos:out_pos+read_len, :] = v_block_transposed
             
             out_pos += read_len
             offset = 0
