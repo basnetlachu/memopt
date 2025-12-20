@@ -1,15 +1,65 @@
-# Test logging
-from memopt.monitoring.logger import get_logger
-logger = get_logger(__name__)
-logger.info("Production system ready!")
+"""
+Test the actual API server
+"""
 
-# Test validation
-from memopt.utils.validation import InputValidator
-prompt = InputValidator.validate_prompt("Hello world")
-max_tokens = InputValidator.validate_max_tokens(100)
+from memopt.api import run_server
+import threading
+import time
+import requests
 
-# Test memory manager
-from memopt.core.memory_manager import MemoryManager
-mem_mgr = MemoryManager()
-stats = mem_mgr.get_memory_stats()
-print(f"GPU Memory: {stats['allocated_gb']:.2f} GB")
+def test_api():
+    print("="*70)
+    print("API Server Test")
+    print("="*70)
+    
+    # Start server in background thread
+    print("\nStarting API server...")
+    server_thread = threading.Thread(
+        target=run_server,
+        kwargs={
+            'model_name': 'gpt2',
+            'optimization_level': 'high',
+            'host': '127.0.0.1',
+            'port': 8000
+        },
+        daemon=True
+    )
+    server_thread.start()
+    
+    # Wait for server to start
+    print("Waiting for server to initialize...")
+    time.sleep(10)
+    
+    # Test health endpoint
+    print("\nTesting /health endpoint...")
+    try:
+        response = requests.get("http://127.0.0.1:8000/health")
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.json()}")
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    # Test generate endpoint
+    print("\nTesting /generate endpoint...")
+    try:
+        response = requests.post(
+            "http://127.0.0.1:8000/generate",
+            json={
+                "prompt": "Hello world",
+                "max_tokens": 20
+            }
+        )
+        print(f"Status: {response.status_code}")
+        print(f"Response: {response.json()}")
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    print("\n" + "="*70)
+    print("✓ API Server Test Complete!")
+    print("="*70)
+    
+    # Keep alive
+    input("\nPress Enter to stop server...")
+
+if __name__ == "__main__":
+    test_api()

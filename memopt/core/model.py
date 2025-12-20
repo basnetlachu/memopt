@@ -15,12 +15,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Optional, Dict, List
 import time
 
-from memopt.core.kv_cache import PagedKVCache
-from memopt.core.memory_manager import MemoryManager
-from memopt.monitoring.logger import get_logger
-from memopt.monitoring.metrics import MetricsCollector
-from memopt.utils.validation import InputValidator
-from memopt.utils.errors import (
+from .kv_cache import PagedKVCache
+from .memory_manager import MemoryManager
+from ..monitoring.logger import get_logger
+from ..monitoring.metrics import MetricsCollector
+from ..utils.validation import InputValidator
+from ..utils.errors import (
     ModelLoadError,
     GenerationError,
     OutOfMemoryError,
@@ -48,7 +48,7 @@ class OptimizedLLM:
         model: str,
         device: str = "cuda",
         optimization_level: str = "high",
-        torch_dtype: torch.dtype = torch.float16,
+        torch_dtype = torch.float16, 
         enable_profiling: bool = False,
         memory_threshold: float = 0.9
     ):
