@@ -3,7 +3,7 @@ Copyright (c) 2025 Sophisticates
 All rights reserved.
 
 This software and its associated documentation (the "Software") are the
-exclusive property of [YOUR NAME OR COMPANY].
+exclusive property of Sophisticates.
 
 No part of this Software may be reproduced, modified, distributed, published,
 sublicensed, sold, or used for commercial purposes without explicit prior
