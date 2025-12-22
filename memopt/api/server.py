@@ -17,6 +17,23 @@ import time
 import json
 from typing import Optional
 
+from memopt.utils.license_client import validate_license, LicenseError
+
+logger = get_logger(__name__)
+
+# ADD THIS: Validate license on module load (before anything else)
+try:
+    logger.info("Validating MemOpt license...")
+    validate_license()
+    logger.info("✓ License validation successful")
+except LicenseError as e:
+    logger.error(f"❌ License validation failed: {e}")
+    logger.error("MemOpt cannot start without valid license")
+    sys.exit(1)
+except Exception as e:
+    logger.error(f"❌ Unexpected error during license validation: {e}")
+    sys.exit(1)
+
 from memopt.core.model import OptimizedLLM
 from memopt.monitoring.logger import get_logger
 from memopt.utils.errors import MemOptError
