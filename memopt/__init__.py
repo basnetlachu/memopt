@@ -13,9 +13,9 @@ except ImportError:
     except ImportError:
         # Fallback to regular location
         try:
-            from .model import OptimizedLLM
+            from memopt.core.model import OptimizedLLM
         except ImportError:
-            from memopt.model import OptimizedLLM
+            from memopt.core.model import OptimizedLLM
 
 # Import utilities
 from .utils.errors import (

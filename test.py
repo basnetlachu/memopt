@@ -1,65 +1,80 @@
+#!/usr/bin/env python3
 """
-Test the actual API server
+MemOpt Test Script
+Verifies that the installation works correctly
 """
 
-from memopt.api import run_server
-import threading
-import time
-import requests
+import sys
+import torch
 
-def test_api():
-    print("="*70)
-    print("API Server Test")
-    print("="*70)
-    
-    # Start server in background thread
-    print("\nStarting API server...")
-    server_thread = threading.Thread(
-        target=run_server,
-        kwargs={
-            'model_name': 'gpt2',
-            'optimization_level': 'high',
-            'host': '127.0.0.1',
-            'port': 8000
-        },
-        daemon=True
+print("="*70)
+print("MEMOPT INSTALLATION TEST")
+print("="*70)
+
+# Test 1: Import MemOpt
+print("\n[1/5] Testing imports...")
+try:
+    from memopt import OptimizedLLM, ProfileStats
+    print("✓ MemOpt imported successfully")
+except ImportError as e:
+    print(f"❌ Failed to import MemOpt: {e}")
+    sys.exit(1)
+
+# Test 2: Check CUDA
+print("\n[2/5] Checking CUDA...")
+if torch.cuda.is_available():
+    print(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
+    device = "cuda"
+else:
+    print("⚠️  CUDA not available, using CPU (will be slower)")
+    device = "cpu"
+
+# Test 3: Initialize model
+print("\n[3/5] Initializing model...")
+try:
+    model = OptimizedLLM(
+        model="gpt2",
+        optimization_level="balanced",
+        device=device,
+        enable_profiling=True
     )
-    server_thread.start()
-    
-    # Wait for server to start
-    print("Waiting for server to initialize...")
-    time.sleep(10)
-    
-    # Test health endpoint
-    print("\nTesting /health endpoint...")
-    try:
-        response = requests.get("http://127.0.0.1:8000/health")
-        print(f"Status: {response.status_code}")
-        print(f"Response: {response.json()}")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Test generate endpoint
-    print("\nTesting /generate endpoint...")
-    try:
-        response = requests.post(
-            "http://127.0.0.1:8000/generate",
-            json={
-                "prompt": "Hello world",
-                "max_tokens": 20
-            }
-        )
-        print(f"Status: {response.status_code}")
-        print(f"Response: {response.json()}")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    print("\n" + "="*70)
-    print("✓ API Server Test Complete!")
-    print("="*70)
-    
-    # Keep alive
-    input("\nPress Enter to stop server...")
+    print("✓ Model initialized successfully")
+except Exception as e:
+    print(f"❌ Failed to initialize model: {e}")
+    sys.exit(1)
 
-if __name__ == "__main__":
-    test_api()
+# Test 4: Generate text
+print("\n[4/5] Generating text...")
+try:
+    output = model.generate(
+        "Hello, this is a test",
+        max_tokens=30,
+        do_sample=False
+    )
+    print(f"✓ Text generated successfully")
+    print(f"   Output: {output[:100]}...")
+except Exception as e:
+    print(f"❌ Failed to generate text: {e}")
+    sys.exit(1)
+
+# Test 5: Get stats
+print("\n[5/5] Checking profiling...")
+try:
+    stats = model.get_profiling_stats()
+    print(f"✓ Profiling works")
+    print(f"   Throughput: {stats.tokens_per_second:.1f} tok/s")
+    print(f"   Memory: {stats.peak_memory_allocated_gb:.2f} GB")
+except Exception as e:
+    print(f"❌ Failed to get stats: {e}")
+    sys.exit(1)
+
+# Success!
+print("\n" + "="*70)
+print("🎉 ALL TESTS PASSED!")
+print("="*70)
+print("\nMemOpt is installed correctly and working.")
+print("\nNext steps:")
+print("  1. Run benchmark: python benchmark.py --model gpt2 --mode both")
+print("  2. Try different optimization levels: conservative, balanced, high, aggressive")
+print("  3. Test with your own models")
+print("\n✨ Happy optimizing! ✨\n")

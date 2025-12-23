@@ -16,7 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 
 from memopt import OptimizedLLM, ProfileStats
-from memopt.memopt.monitoring.profiler import compare_profiles
+from memopt.monitoring.profiler import compare_profiles
 
 
 # GPU bandwidth lookup (measured values from spec sheets)

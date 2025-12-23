@@ -5,35 +5,28 @@
   "optimization_level": "high",
   "gpu": "NVIDIA GeForce RTX 4070",
   "baseline": {
+    "total_requests": 0,
     "total_tokens_generated": 8000,
-    "total_time_seconds": 141.34623408317566,
-    "tokens_per_second": 56.59860732683103,
-    "latency_per_token_ms": 17.668279260396957,
+    "total_time_seconds": 139.46645426750183,
+    "tokens_per_second": 57.36146403102572,
+    "latency_per_token_ms": 17.43330678343773,
     "peak_memory_allocated_gb": 3.2487282752990723,
     "peak_memory_reserved_gb": 3.404296875,
-    "memory_bandwidth_utilization_pct": 32.58099893192054,
-    "gpu_utilization_pct": 32.58099893192053,
-    "gpu_stall_pct": 67.41900106807947,
-    "cost_per_1m_tokens_usd": 24.539276750551334,
-    "estimated_gpu_hours": 0.03926284280088213,
-    "kv_cache_memory_gb": 0.0,
-    "kv_cache_hit_rate": 0.0,
-    "memory_saved_by_quantization_gb": 0.0,
-    "avg_batch_size": 0.0,
-    "avg_sequence_length": 0.0
+    "gpu_name": "NVIDIA GeForce RTX 4070",
+    "cost_per_1m_tokens_usd": 24.21292608810796
   },
   "optimized": {
     "total_tokens_generated": 8000,
-    "total_time_seconds": 35.42590234375,
-    "tokens_per_second": 225.82346449141036,
-    "latency_per_token_ms": 4.42823779296875,
+    "total_time_seconds": 40.1250859375,
+    "tokens_per_second": 199.3765200269236,
+    "latency_per_token_ms": 5.0156357421875,
     "peak_memory_allocated_gb": 4.624490261077881,
     "peak_memory_reserved_gb": 4.775390625,
     "memory_bandwidth_utilization_pct": 100.0,
     "gpu_utilization_pct": 100.0,
     "gpu_stall_pct": 0.0,
-    "cost_per_1m_tokens_usd": 6.765363294813368,
-    "estimated_gpu_hours": 0.009840528428819445,
+    "cost_per_1m_tokens_usd": 7.662776828342015,
+    "estimated_gpu_hours": 0.011145857204861113,
     "kv_cache_memory_gb": 0.0,
     "kv_cache_hit_rate": 0.0,
     "memory_saved_by_quantization_gb": 1.371002197265625,
@@ -41,18 +34,18 @@
     "avg_sequence_length": 0.0
   },
   "comparison": {
-    "speedup": 3.9899120341845746,
+    "speedup": 3.4757920390435757,
     "memory_change_gb": 1.3757619857788086,
-    "cost_reduction_pct": 72.43046988065217
+    "cost_reduction_pct": 68.35253698599631
   },
   "roi_analysis": {
     "tokens_per_day": 100000000000.0,
-    "daily_savings_usd": 1777391.3455737964,
-    "annual_savings_usd": 648747841.1344357,
+    "daily_savings_usd": 1655014.9259765944,
+    "annual_savings_usd": 604080447.981457,
     "revenue_share_pct": 35.0,
-    "memopt_annual_cost_usd": 227061744.39705247,
-    "customer_keeps_usd": 421686096.7373832,
+    "memopt_annual_cost_usd": 211428156.79350993,
+    "customer_keeps_usd": 392652291.18794703,
     "customer_roi": 1.8571428571428572,
-    "payback_days": 127.74999999999999
+    "payback_days": 127.75
   }
 }
