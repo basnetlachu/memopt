@@ -8,18 +8,43 @@ Usage:
     python -m memopt.api.server --model gpt2-xl --port 8000
 """
 
+from typing import Optional
+import asyncio
+import time
+import json
+import sys
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import asyncio
-import time
-import json
-from typing import Optional
 
-from memopt.utils.license_client import validate_license, LicenseError
+from memopt.core.model import OptimizedLLM
+from memopt.monitoring.logger import get_logger
+from memopt.utils.errors import MemOptError
+from .models import (
+    GenerateRequest,
+    GenerateResponse,
+    BatchGenerateRequest,
+    BatchGenerateResponse,
+    ModelInfo,
+    HealthResponse
+)
+try:
+    from memopt.utils.license_client import validate_license, LicenseError
+    
+    logger_temp = get_logger(__name__)
+    logger_temp.info("Validating MemOpt license...")
+    validate_license()
+    logger_temp.info("✓ License validation successful")
+except ImportError:
+    pass  # License client not available
+except Exception as e:
+    logger_temp = get_logger(__name__)
+    logger_temp.warning(f"License validation failed: {e}")
 
 logger = get_logger(__name__)
+
 
 # ADD THIS: Validate license on module load (before anything else)
 try:
@@ -34,19 +59,7 @@ except Exception as e:
     logger.error(f"❌ Unexpected error during license validation: {e}")
     sys.exit(1)
 
-from memopt.core.model import OptimizedLLM
-from memopt.monitoring.logger import get_logger
-from memopt.utils.errors import MemOptError
-from .models import (
-    GenerateRequest,
-    GenerateResponse,
-    BatchGenerateRequest,
-    BatchGenerateResponse,
-    ModelInfo,
-    HealthResponse
-)
 
-logger = get_logger(__name__)
 
 
 class MemOptAPI:

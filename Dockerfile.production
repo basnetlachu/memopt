@@ -23,7 +23,7 @@ COPY memopt/__init__.py memopt/__init__.py
 
 # Install dependencies
 RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+    pip3 install --no-cache-dir --progress-bar=on -r requirements.txt
 
 # Copy full source code
 COPY . .
