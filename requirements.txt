@@ -1,0 +1,21 @@
+# MemOpt Requirements
+# Production-ready LLM inference optimization
+
+# Core dependencies
+torch>=2.1.0
+transformers>=4.35.0
+accelerate>=0.25.0
+
+# Optional: FlashAttention for maximum performance
+# flash-attn>=2.3.0  # Install separately: pip install flash-attn --no-build-isolation
+
+# Optional: Triton for custom kernels
+triton>=2.1.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.66.0
+
+# Development
+pytest>=7.4.0
+black>=23.0.0
