@@ -7,6 +7,7 @@ Compares baseline vs optimized inference and provides customer-ready metrics.
 Usage:
     python benchmark.py --model gpt2-large --mode both
     python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
+    this file is not working, fucking files 
 """
 
 import argparse
