@@ -221,6 +221,18 @@ class PagedKVCache:
             v: Value tensor [batch=1, num_heads, seq_len, head_dim]
             start_pos: Starting position in sequence
         """
+        # Handle different input shapes
+        if k.dim() == 3:
+            # [num_heads, seq_len, head_dim] -> add batch dimension
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        
+        # Ensure correct shape: [batch, num_heads, seq_len, head_dim]
+        if k.shape[1] != self.num_heads:
+            # Might be [batch, seq_len, num_heads, head_dim] -> transpose
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+        
         seq_len = k.shape[2]
         end_pos = start_pos + seq_len
         
@@ -246,7 +258,8 @@ class PagedKVCache:
         # Write to blocks
         blocks = self.block_tables[seq_id][start_block:end_block]
         
-        k_flat = k.squeeze(0)  # [num_heads, seq_len, head_dim]
+        # Remove batch dimension: [batch, num_heads, seq_len, head_dim] -> [num_heads, seq_len, head_dim]
+        k_flat = k.squeeze(0)
         v_flat = v.squeeze(0)
         
         offset = start_pos % self.block_size
@@ -265,8 +278,13 @@ class PagedKVCache:
             cache_start = max(0, offset if i == 0 else 0)
             cache_end = cache_start + (seq_end - seq_start)
             
-            k_block = k_flat[:, seq_start:seq_end, :]
-            v_block = v_flat[:, seq_start:seq_end, :]
+            # Extract the block to write: [num_heads, block_len, head_dim]
+            k_block = k_flat[:, seq_start:seq_end, :].contiguous()
+            v_block = v_flat[:, seq_start:seq_end, :].contiguous()
+            
+            # Transpose to cache format: [block_len, num_heads, head_dim]
+            k_block = k_block.transpose(0, 1).contiguous()
+            v_block = v_block.transpose(0, 1).contiguous()
             
             if self.quantize:
                 # Quantize and store
@@ -336,7 +354,7 @@ class PagedKVCache:
             read_len = cache_end - cache_start
             
             if self.quantize:
-                # Dequantize
+                # Dequantize: returns [read_len, num_heads, head_dim]
                 k_block = self._dequantize_tensor(
                     self.k_cache[layer_idx, block_id, cache_start:cache_end],
                     self.k_scales[layer_idx, block_id].item(),
@@ -348,9 +366,15 @@ class PagedKVCache:
                     self.v_zeros[layer_idx, block_id].item()
                 )
             else:
+                # Read FP16: [read_len, num_heads, head_dim]
                 k_block = self.k_cache[layer_idx, block_id, cache_start:cache_end]
                 v_block = self.v_cache[layer_idx, block_id, cache_start:cache_end]
             
+            # Transpose to output format: [read_len, num_heads, head_dim] -> [num_heads, read_len, head_dim]
+            k_block = k_block.transpose(0, 1).contiguous()
+            v_block = v_block.transpose(0, 1).contiguous()
+            
+            # Write to output
             k_out[0, :, out_pos:out_pos+read_len, :] = k_block
             v_out[0, :, out_pos:out_pos+read_len, :] = v_block
             

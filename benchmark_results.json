@@ -1,0 +1,52 @@
+{
+  "baseline": {
+    "total_tokens_generated": 8000,
+    "total_time_seconds": 158.71911573410034,
+    "tokens_per_second": 50.40350661606681,
+    "latency_per_token_ms": 19.839889466762543,
+    "peak_memory_allocated_gb": 3.2497048377990723,
+    "peak_memory_reserved_gb": 3.40625,
+    "memory_bandwidth_utilization_pct": 65.52455860088685,
+    "gpu_utilization_pct": 65.52455860088685,
+    "gpu_stall_pct": 34.47544139911315,
+    "cost_per_1m_tokens_usd": 27.555402037170197,
+    "estimated_gpu_hours": 0.044088643259472315,
+    "kv_cache_memory_gb": 0.0,
+    "kv_cache_hit_rate": 0.0,
+    "memory_saved_by_quantization_gb": 0.0,
+    "avg_batch_size": 0.0,
+    "avg_sequence_length": 0.0
+  },
+  "optimized": {
+    "total_tokens_generated": 8000,
+    "total_time_seconds": 24.78666015625,
+    "tokens_per_second": 322.75425368200666,
+    "latency_per_token_ms": 3.09833251953125,
+    "peak_memory_allocated_gb": 14.123714923858643,
+    "peak_memory_reserved_gb": 14.279296875,
+    "memory_bandwidth_utilization_pct": 100.0,
+    "gpu_utilization_pct": 100.0,
+    "gpu_stall_pct": 0.0,
+    "cost_per_1m_tokens_usd": 4.733563571506076,
+    "estimated_gpu_hours": 0.0068851833767361115,
+    "kv_cache_memory_gb": 0.0,
+    "kv_cache_hit_rate": 0.0,
+    "memory_saved_by_quantization_gb": 10.8673095703125,
+    "avg_batch_size": 0.0,
+    "avg_sequence_length": 0.0
+  },
+  "comparison": {
+    "speedup": 6.40340871797845,
+    "memory_reduction_pct": -334.6153151996478,
+    "cost_reduction_pct": 82.8216493988335,
+    "stall_reduction_pct": 34.47544139911315
+  },
+  "roi_analysis": {
+    "tokens_per_day": 10000000000.0,
+    "daily_savings_usd": 228218.38465664122,
+    "annual_savings_usd": 83299710.39967404,
+    "memopt_annual_cost_usd": 50000,
+    "payback_days": 0.2190883967355475,
+    "first_year_roi": 1665.9942079934808
+  }
+}
