@@ -44,28 +44,31 @@ class OptimizedLLM:
             # Stage 1 optimizations (disabled in conservative mode)
             "enable_adaptive_allocation": False,
             "enable_workspace_reuse": False,
+            "use_torch_compile": False,  # Disabled in conservative
             # Stage 2 optimizations (disabled in conservative mode)
             "use_continuous_batching": False,
         },
         "balanced": {
-            "quantize_kv": True,
+            "quantize_kv": False,  # FP16 for maximum speed (Stage 1)
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
             # Stage 1 optimizations (enabled in balanced+)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
+            "use_torch_compile": True,  # Stage 1: torch.compile for speedup
             # Stage 2 optimizations (disabled in balanced, enabled in high+)
             "use_continuous_batching": False,
         },
         "high": {
-            "quantize_kv": True,
+            "quantize_kv": False,  # FP16 for maximum speed (Stage 2)
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
             # Stage 1 optimizations (enabled)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
+            "use_torch_compile": True,  # Stage 2: torch.compile enabled
             # Stage 2 optimizations (enabled in high+)
             "use_continuous_batching": True,
         },
@@ -77,6 +80,7 @@ class OptimizedLLM:
             # Stage 1 optimizations (enabled)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
+            "use_torch_compile": True,  # Enabled in aggressive
             # Stage 2 optimizations (enabled)
             "use_continuous_batching": True,
         }
@@ -187,14 +191,29 @@ class OptimizedLLM:
                 self.tokenizer = None
         
         self.model.eval()
-        
+
+        # Stage 1/2: Apply torch.compile for speedup
+        if self.opt_config.get('use_torch_compile', False):
+            try:
+                print("  Applying torch.compile optimization...")
+                # Compile the model for faster inference
+                self.model = torch.compile(
+                    self.model,
+                    mode="reduce-overhead",  # Best for inference
+                    fullgraph=False,  # More compatible
+                    dynamic=True  # Handle varying sequence lengths
+                )
+                print("  ✓ torch.compile enabled")
+            except Exception as e:
+                print(f"  ⚠️  torch.compile failed ({e}), continuing without it")
+
         # Extract architecture details
         self.num_layers = self.config.num_hidden_layers
         self.num_heads = self.config.num_attention_heads
         self.num_kv_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
         self.head_dim = self.config.hidden_size // self.num_heads
         self.hidden_size = self.config.hidden_size
-        
+
         print(f"  Model: {self.model_name}")
         print(f"  Layers: {self.num_layers}, Heads: {self.num_heads} (KV: {self.num_kv_heads})")
         print(f"  Hidden size: {self.hidden_size}")
