@@ -2,8 +2,8 @@
 # Production-ready LLM inference optimization
 
 # Core dependencies
-torch>=2.1.0
-transformers>=4.35.0
+torch==2.1.2
+transformers==4.36.2
 accelerate>=0.25.0
 
 # Optional: FlashAttention for maximum performance
@@ -24,8 +24,8 @@ black>=23.0.0
 # Performance
 flash-attn>=2.0.0  # FlashAttention-2 (requires CUDA 11.8+)
 # Utilities
-numpy>=1.24.0
+numpy==1.26.4
 # Optional: API server
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-pydantic>=2.0.0
+pydantic>=2.6.4

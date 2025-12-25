@@ -5,8 +5,31 @@ CRITICAL: Ensures Stage 1 optimizations produce IDENTICAL outputs to Stage 0.
 No numerical differences are acceptable.
 """
 
+try:
+    import pytest
+    PYTEST_AVAILABLE = True
+except ImportError:
+    PYTEST_AVAILABLE = False
+    # Mock pytest for standalone execution
+    class pytest:
+        class mark:
+            @staticmethod
+            def skipif(condition, reason=""):
+                def decorator(func):
+                    def wrapper(*args, **kwargs):
+                        if condition:
+                            print(f"⏭️  Skipped: {reason}")
+                            return
+                        return func(*args, **kwargs)
+                    return wrapper
+                return decorator
+
+        @staticmethod
+        def fail(message):
+            raise AssertionError(message)
+
+
 import torch
-import pytest
 from memopt import OptimizedLLM
 
 
@@ -16,33 +39,29 @@ class TestOutputCorrectness:
 
     def test_identical_outputs_simple_prompt(self):
         """Test that Stage 0 and Stage 1 produce identical outputs for simple prompt"""
-        # Use a small model for fast testing
-        model_name = "gpt2"  # Small model for CI/testing
+        model_name = "gpt2"
         prompt = "The quick brown fox"
         max_tokens = 20
 
-        # Stage 0: Conservative mode (Stage 1 disabled)
         model_stage0 = OptimizedLLM(
             model=model_name,
             optimization_level="conservative",
             enable_profiling=False
         )
 
-        # Stage 1: Balanced mode (Stage 1 enabled)
         model_stage1 = OptimizedLLM(
             model=model_name,
             optimization_level="balanced",
             enable_profiling=False
         )
 
-        # Set same seed for reproducibility
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
         output_stage0 = model_stage0.generate(
             prompt,
             max_tokens=max_tokens,
-            do_sample=False  # Greedy decoding for determinism
+            do_sample=False
         )
 
         torch.manual_seed(42)
@@ -54,12 +73,10 @@ class TestOutputCorrectness:
             do_sample=False
         )
 
-        # Outputs MUST be identical
         assert output_stage0 == output_stage1, \
             f"Outputs differ!\nStage 0: {output_stage0}\nStage 1: {output_stage1}"
 
-        print(f"✓ Outputs identical for simple prompt")
-        print(f"  Output: {output_stage0[:100]}...")
+        print("✓ Outputs identical for simple prompt")
 
     def test_identical_outputs_multiple_prompts(self):
         """Test outputs are identical across multiple diverse prompts"""
@@ -125,7 +142,6 @@ class TestOutputCorrectness:
             enable_profiling=False
         )
 
-        # Run 10 generations
         for run in range(10):
             torch.manual_seed(100 + run)
             torch.cuda.manual_seed(100 + run)
@@ -148,7 +164,7 @@ class TestOutputCorrectness:
             assert output_stage0 == output_stage1, \
                 f"Run {run} differs! Numerical drift detected."
 
-        print(f"✓ No numerical drift over 10 runs")
+        print("✓ No numerical drift over 10 runs")
 
 
 class TestMemoryCorrectness:
@@ -159,17 +175,16 @@ class TestMemoryCorrectness:
         """Ensure adaptive allocation doesn't cause OOM"""
         model_name = "gpt2"
 
-        # Test various batch sizes and token lengths
         test_cases = [
-            (1, 100),   # Small
-            (4, 256),   # Medium
-            (8, 512),   # Large
+            (1, 100),
+            (4, 256),
+            (8, 512),
         ]
 
         for num_prompts, max_tokens in test_cases:
             model = OptimizedLLM(
                 model=model_name,
-                optimization_level="balanced",  # Stage 1 enabled
+                optimization_level="balanced",
                 expected_batch_size=num_prompts,
                 expected_seq_len=max_tokens,
                 enable_profiling=False
@@ -179,22 +194,27 @@ class TestMemoryCorrectness:
 
             try:
                 for prompt in prompts:
-                    _ = model.generate(prompt, max_tokens=max_tokens, do_sample=False)
+                    _ = model.generate(
+                        prompt,
+                        max_tokens=max_tokens,
+                        do_sample=False
+                    )
 
                 print(f"✓ No OOM for {num_prompts} prompts × {max_tokens} tokens")
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    pytest.fail(f"OOM error with {num_prompts} prompts × {max_tokens} tokens")
+                    pytest.fail(
+                        f"OOM error with {num_prompts} prompts × {max_tokens} tokens"
+                    )
                 else:
                     raise
 
 
 if __name__ == "__main__":
-    # Run tests manually
-    print("="*70)
+    print("=" * 70)
     print("CORRECTNESS VALIDATION TESTS")
-    print("="*70)
+    print("=" * 70)
 
     if not torch.cuda.is_available():
         print("⚠️  WARNING: CUDA not available, tests will be skipped")
@@ -210,7 +230,7 @@ if __name__ == "__main__":
     test_memory = TestMemoryCorrectness()
     test_memory.test_no_out_of_memory_errors()
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("✅ ALL CORRECTNESS TESTS PASSED")
     print("Stage 1 produces IDENTICAL outputs to Stage 0")
-    print("="*70)
+    print("=" * 70)

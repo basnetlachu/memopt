@@ -12,16 +12,17 @@ except ImportError:
     PYTEST_AVAILABLE = False
     # Mock pytest for standalone execution
     class pytest:
-        @staticmethod
-        def mark_skipif(condition, reason=""):
-            def decorator(func):
-                def wrapper(*args, **kwargs):
-                    if condition:
-                        print(f"⏭️  Skipped: {reason}")
-                        return
-                    return func(*args, **kwargs)
-                return wrapper
-            return decorator
+        class mark:
+            @staticmethod
+            def skipif(condition, reason=""):
+                def decorator(func):
+                    def wrapper(*args, **kwargs):
+                        if condition:
+                            print(f"⏭️  Skipped: {reason}")
+                            return
+                        return func(*args, **kwargs)
+                    return wrapper
+                return decorator
 
 import torch
 from memopt.memory_manager import SmartMemoryManager
@@ -278,8 +279,6 @@ class TestStage1Integration:
             use_flash=True
         )
         assert hasattr(attention, 'enable_workspace_reuse')
-
-        print(f"✓ Backward compatibility maintained")
 
 
 if __name__ == "__main__":
