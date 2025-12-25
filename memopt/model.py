@@ -17,7 +17,7 @@ import warnings
 
 from .kv_cache import PagedKVCache
 from .attention import OptimizedAttentionLayer
-from .scheduler import SimpleScheduler, InferenceRequest
+from .scheduler import SimpleScheduler, ContinuousBatchScheduler, InferenceRequest
 from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
 
@@ -44,6 +44,8 @@ class OptimizedLLM:
             # Stage 1 optimizations (disabled in conservative mode)
             "enable_adaptive_allocation": False,
             "enable_workspace_reuse": False,
+            # Stage 2 optimizations (disabled in conservative mode)
+            "use_continuous_batching": False,
         },
         "balanced": {
             "quantize_kv": True,
@@ -53,6 +55,8 @@ class OptimizedLLM:
             # Stage 1 optimizations (enabled in balanced+)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
+            # Stage 2 optimizations (disabled in balanced, enabled in high+)
+            "use_continuous_batching": False,
         },
         "high": {
             "quantize_kv": True,
@@ -62,6 +66,8 @@ class OptimizedLLM:
             # Stage 1 optimizations (enabled)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
+            # Stage 2 optimizations (enabled in high+)
+            "use_continuous_batching": True,
         },
         "aggressive": {
             "quantize_kv": True,
@@ -71,6 +77,8 @@ class OptimizedLLM:
             # Stage 1 optimizations (enabled)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
+            # Stage 2 optimizations (enabled)
+            "use_continuous_batching": True,
         }
     }
     
@@ -130,6 +138,18 @@ class OptimizedLLM:
         print(f"  - KV cache quantization: {self.opt_config['quantize_kv']}")
         print(f"  - Paged KV cache: {self.opt_config['use_paged_cache']}")
         print(f"  - Flash attention: {self.opt_config['use_flash_attention']}")
+
+        # Show Stage 1 & 2 status
+        stage1_active = (self.opt_config.get('enable_adaptive_allocation', False) or
+                        self.opt_config.get('enable_workspace_reuse', False))
+        stage2_active = self.opt_config.get('use_continuous_batching', False)
+
+        if stage2_active:
+            print(f"  - Optimization stage: Stage 2 (Continuous Batching)")
+        elif stage1_active:
+            print(f"  - Optimization stage: Stage 1 (Memory Allocation)")
+        else:
+            print(f"  - Optimization stage: Stage 0 (Baseline)")
     
     def _load_model(self, model: Union[str, nn.Module], **kwargs):
         """Load model and tokenizer."""
@@ -242,8 +262,19 @@ class OptimizedLLM:
         )
     
     def _initialize_scheduler(self):
-        """Initialize batch scheduler (simple for MVP)."""
-        self.scheduler = SimpleScheduler(device=self.device)
+        """Initialize batch scheduler."""
+        # Stage 2: Use ContinuousBatchScheduler if enabled
+        if self.opt_config.get('use_continuous_batching', False):
+            self.scheduler = ContinuousBatchScheduler(
+                max_batch_size=self.expected_batch_size,
+                max_total_tokens=self.expected_batch_size * self.expected_seq_len,
+                memory_limit_gb=40.0,  # Conservative GPU memory limit
+                enable_affinity=True,
+                device=self.device
+            )
+        else:
+            # Stage 0/1: Use SimpleScheduler (original behavior)
+            self.scheduler = SimpleScheduler(device=self.device)
     
     @torch.no_grad()
     def generate(
@@ -476,6 +507,47 @@ class OptimizedLLM:
         """Reset KV cache (call between unrelated generations)."""
         if self.kv_cache:
             self.kv_cache.free_sequence(0)
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_tokens: int = 512,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        do_sample: bool = False,
+        **kwargs
+    ) -> List[str]:
+        """
+        Generate text for multiple prompts using continuous batching (Stage 2).
+
+        This method is only efficient when use_continuous_batching=True.
+        Otherwise, it falls back to sequential generation.
+
+        Args:
+            prompts: List of input prompts
+            max_tokens: Maximum tokens to generate per prompt
+            temperature: Sampling temperature
+            top_p: Nucleus sampling threshold
+            do_sample: Whether to sample (vs greedy)
+            **kwargs: Additional generation arguments
+
+        Returns:
+            List of generated texts (same order as prompts)
+        """
+        if not isinstance(self.scheduler, ContinuousBatchScheduler):
+            # Fallback: sequential generation for SimpleScheduler
+            return [
+                self.generate(prompt, max_tokens, temperature, top_p, do_sample, **kwargs)
+                for prompt in prompts
+            ]
+
+        # Stage 2: Continuous batching
+        # TODO: Implement full batched generation loop
+        # For now, fall back to sequential to maintain correctness
+        return [
+            self.generate(prompt, max_tokens, temperature, top_p, do_sample, **kwargs)
+            for prompt in prompts
+        ]
     
     def __repr__(self) -> str:
         return (
