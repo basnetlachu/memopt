@@ -219,12 +219,19 @@ def print_memory_analysis(optimized_model, baseline_memory_gb, optimized_peak_gb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark MemOpt - All Stages")
+    parser = argparse.ArgumentParser(description="Benchmark MemOpt")
     parser.add_argument(
         "--model",
         type=str,
         default="meta-llama/Llama-2-7b-hf",
         help="Model name or path"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["baseline", "optimized", "both"],
+        default="both",
+        help="Which mode to run"
     )
     parser.add_argument(
         "--max-tokens",
@@ -260,79 +267,32 @@ def main():
     ][:args.num_prompts]
 
     print("\n" + "="*70)
-    print("MEMOPT BENCHMARK - ALL STAGES")
+    print("MEMOPT BENCHMARK")
     print("="*70)
     print(f"Model: {args.model}")
     print(f"Prompts: {len(prompts)}")
     print(f"Max tokens per prompt: {args.max_tokens}")
-    print("Testing: Baseline → Stage 0 → Stage 1 → Stage 2")
+    print("Optimization: All stages integrated (Stage 0+1+2)")
 
     if not torch.cuda.is_available():
         print("\n⚠️  WARNING: CUDA not available, running on CPU (will be slow)")
 
-    # Run all stages
-    all_results = []
+    # Run benchmarks
+    baseline_stats = None
+    optimized_stats = None
+    optimized_model = None
 
-    # 1. Baseline (no MemOpt)
-    print("\n" + "="*70)
-    print("STAGE: BASELINE (No MemOpt)")
-    print("="*70)
-    baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
-    all_results.append({
-        'name': 'Baseline',
-        'stats': baseline_stats,
-        'model': None
-    })
+    if args.mode in ["baseline", "both"]:
+        baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
 
-    # 2. Stage 0 - Conservative
-    print("\n" + "="*70)
-    print("STAGE 0: CONSERVATIVE")
-    print("="*70)
-    stage0_stats, stage0_model = run_optimized(
-        args.model, prompts, args.max_tokens, "conservative"
-    )
-    all_results.append({
-        'name': 'Stage 0 (Conservative)',
-        'stats': stage0_stats,
-        'model': stage0_model
-    })
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        time.sleep(2)
+    if args.mode in ["optimized", "both"]:
+        # Use "high" which integrates Stage 0 + Stage 1 + Stage 2
+        optimized_stats, optimized_model = run_optimized(
+            args.model, prompts, args.max_tokens, "high"
+        )
 
-    # 3. Stage 1 - Balanced
-    print("\n" + "="*70)
-    print("STAGE 1: BALANCED")
-    print("="*70)
-    stage1_stats, stage1_model = run_optimized(
-        args.model, prompts, args.max_tokens, "balanced"
-    )
-    all_results.append({
-        'name': 'Stage 1 (Balanced)',
-        'stats': stage1_stats,
-        'model': stage1_model
-    })
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        time.sleep(2)
-
-    # 4. Stage 2 - High
-    print("\n" + "="*70)
-    print("STAGE 2: HIGH")
-    print("="*70)
-    stage2_stats, stage2_model = run_optimized(
-        args.model, prompts, args.max_tokens, "high"
-    )
-    all_results.append({
-        'name': 'Stage 2 (High)',
-        'stats': stage2_stats,
-        'model': stage2_model
-    })
-
-    # Use the last model for memory analysis
-    baseline_stats = all_results[0]['stats']
-    optimized_stats = all_results[-1]['stats']
-    optimized_model = all_results[-1]['model']
+    # Note: Previously ran stages 0,1,2 separately, but that's not correct
+    # "Optimized" should be a single run with "high" mode that has all optimizations integrated
     
     # Print results
     print("\n" + "="*70)
