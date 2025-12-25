@@ -102,14 +102,15 @@ class ContinuousBatchScheduler:
         self.memory_limit_gb = memory_limit_gb
         self.enable_affinity = enable_affinity
         self.device = device
-        
+
         # Request queues
-        self.waiting_queue: List[Tuple[int, float, InferenceRequest]] = []  # Priority queue
+        self.waiting_queue: List[Tuple[int, float, int, InferenceRequest]] = []  # Priority queue
         self.running_batch: List[InferenceRequest] = []
-        
+        self._request_counter = 0  # Tie-breaker for heap queue
+
         # Affinity tracking: prompt_prefix -> cached KV
         self.affinity_groups: Dict[str, List[str]] = defaultdict(list)
-        
+
         # Metrics
         self.metrics = BatchMetrics()
         self.total_requests_processed = 0
@@ -118,17 +119,19 @@ class ContinuousBatchScheduler:
     def add_request(self, request: InferenceRequest):
         """
         Add a new inference request to the queue.
-        
+
         Args:
             request: Inference request to add
         """
-        # Priority queue: (negative priority, timestamp, request)
+        # Priority queue: (negative priority, timestamp, counter, request)
         # Negative priority so higher priority comes first
+        # Counter acts as tie-breaker to avoid comparing InferenceRequest objects
         heapq.heappush(
             self.waiting_queue,
-            (-request.priority, request.created_at, request)
+            (-request.priority, request.created_at, self._request_counter, request)
         )
-        
+        self._request_counter += 1
+
         # Track affinity group (first 50 chars of prompt)
         if self.enable_affinity:
             prefix = request.prompt[:50]
@@ -174,32 +177,32 @@ class ContinuousBatchScheduler:
     def schedule_batch(self) -> Optional[List[InferenceRequest]]:
         """
         Schedule the next batch for execution.
-        
+
         Returns:
             List of requests to process, or None if no requests ready
         """
         # Remove finished requests from running batch
         self.running_batch = [req for req in self.running_batch if not req.finished]
-        
+
         # Try to add new requests from waiting queue
         while self.waiting_queue:
             # Peek at highest priority request
-            neg_priority, timestamp, request = heapq.heappop(self.waiting_queue)
-            
+            neg_priority, timestamp, counter, request = heapq.heappop(self.waiting_queue)
+
             if self.can_add_to_batch(request):
                 # Add to batch
                 request.start_time = time.time()
                 self.running_batch.append(request)
             else:
                 # Can't fit, put back in queue
-                heapq.heappush(self.waiting_queue, (neg_priority, timestamp, request))
+                heapq.heappush(self.waiting_queue, (neg_priority, timestamp, counter, request))
                 break
-        
+
         # Return current batch if not empty
         if self.running_batch:
             self._update_metrics()
             return self.running_batch
-        
+
         return None
     
     def update_batch(self, new_tokens: List[int]):
