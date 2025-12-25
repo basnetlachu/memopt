@@ -24,12 +24,14 @@ class SmartMemoryManager:
     def __init__(
         self,
         device: str = "cuda",
-        target_memory_reduction: float = 4.0  # Target 4x memory reduction
+        target_memory_reduction: float = 4.0,  # Target 4x memory reduction
+        enable_adaptive_allocation: bool = False  # Stage 1 optimization
     ):
         self.device = device
         self.target_memory_reduction = target_memory_reduction
+        self.enable_adaptive_allocation = enable_adaptive_allocation
         self.enabled = torch.cuda.is_available() if device.startswith("cuda") else False
-        
+
         if self.enabled:
             self.device_id = int(device.split(':')[1]) if ':' in device else 0
             props = torch.cuda.get_device_properties(self.device_id)
@@ -66,12 +68,22 @@ class SmartMemoryManager:
         """
         # Calculate actual tokens needed
         total_tokens_needed = num_prompts * max_tokens_per_prompt
-        
+
         # Blocks needed for this workload
         blocks_needed = (total_tokens_needed + block_size - 1) // block_size
-        
-        # Add 20% buffer for safety
-        blocks_with_buffer = int(blocks_needed * 1.2)
+
+        # Stage 1: Adaptive buffer allocation
+        # Smaller batches need less buffer, larger batches benefit from slightly more
+        if self.enable_adaptive_allocation:
+            if num_prompts <= 8:
+                buffer_multiplier = 1.1  # 10% buffer for small batches
+            else:
+                buffer_multiplier = 1.15  # 15% buffer for larger batches
+        else:
+            # Original: Fixed 20% buffer (Stage 0 baseline)
+            buffer_multiplier = 1.2
+
+        blocks_with_buffer = int(blocks_needed * buffer_multiplier)
         
         # Calculate memory per block
         bytes_per_value = 1 if quantize else 2  # INT8 vs FP16

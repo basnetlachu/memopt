@@ -41,24 +41,36 @@ class OptimizedLLM:
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
+            # Stage 1 optimizations (disabled in conservative mode)
+            "enable_adaptive_allocation": False,
+            "enable_workspace_reuse": False,
         },
         "balanced": {
             "quantize_kv": True,
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
+            # Stage 1 optimizations (enabled in balanced+)
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
         },
         "high": {
             "quantize_kv": True,
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
+            # Stage 1 optimizations (enabled)
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
         },
         "aggressive": {
             "quantize_kv": True,
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 32,
+            # Stage 1 optimizations (enabled)
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
         }
     }
     
@@ -172,10 +184,14 @@ class OptimizedLLM:
         if not self.opt_config['use_paged_cache']:
             self.kv_cache = None
             return
-        
+
         # Use Smart Memory Manager for optimal allocation
         # This reduces memory by 4-5x compared to naive allocation
-        memory_manager = SmartMemoryManager(device=self.device)
+        # Stage 1: Pass adaptive allocation flag
+        memory_manager = SmartMemoryManager(
+            device=self.device,
+            enable_adaptive_allocation=self.opt_config.get('enable_adaptive_allocation', False)
+        )
         
         # Configure based on expected workload
         workload_config = {
@@ -215,12 +231,14 @@ class OptimizedLLM:
         if not self.opt_config['use_flash_attention']:
             self.attention = None
             return
-        
+
+        # Stage 1: Pass workspace reuse flag
         self.attention = OptimizedAttentionLayer(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            use_flash=True
+            use_flash=True,
+            enable_workspace_reuse=self.opt_config.get('enable_workspace_reuse', False)
         )
     
     def _initialize_scheduler(self):

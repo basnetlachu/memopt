@@ -272,7 +272,8 @@ class OptimizedAttentionLayer:
         num_kv_heads: Optional[int] = None,
         head_dim: int = 64,
         max_seq_len: int = 8192,
-        use_flash: bool = True
+        use_flash: bool = True,
+        enable_workspace_reuse: bool = False  # Stage 1 optimization
     ):
         """
         Args:
@@ -281,15 +282,45 @@ class OptimizedAttentionLayer:
             head_dim: Dimension per head
             max_seq_len: Maximum sequence length
             use_flash: Whether to use FlashAttention-style optimizations
+            enable_workspace_reuse: Whether to reuse workspace tensors (Stage 1)
         """
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.use_flash = use_flash
-        
+        self.enable_workspace_reuse = enable_workspace_reuse
+
         self.scale = 1.0 / math.sqrt(head_dim)
-    
+
+        # Stage 1: Workspace tensor pool for reuse
+        # Only allocate if workspace reuse is enabled
+        self._workspace_pool = {} if enable_workspace_reuse else None
+
+    def _get_workspace_tensor(self, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """
+        Get a reusable workspace tensor from pool or allocate new one.
+        Stage 1 optimization: Reduces allocation overhead during decode phase.
+        """
+        if not self.enable_workspace_reuse or self._workspace_pool is None:
+            # Workspace reuse disabled, allocate normally
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        # Create key for this tensor configuration
+        key = (shape, dtype, device)
+
+        if key in self._workspace_pool:
+            # Reuse existing tensor
+            tensor = self._workspace_pool[key]
+            # Verify size matches (should always be true)
+            if tensor.shape == shape:
+                return tensor
+
+        # Allocate new tensor and cache it
+        tensor = torch.empty(shape, dtype=dtype, device=device)
+        self._workspace_pool[key] = tensor
+        return tensor
+
     def __call__(
         self,
         query: torch.Tensor,
