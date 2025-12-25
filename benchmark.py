@@ -219,26 +219,12 @@ def print_memory_analysis(optimized_model, baseline_memory_gb, optimized_peak_gb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark MemOpt")
+    parser = argparse.ArgumentParser(description="Benchmark MemOpt - All Stages")
     parser.add_argument(
         "--model",
         type=str,
         default="meta-llama/Llama-2-7b-hf",
         help="Model name or path"
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["baseline", "optimized", "both"],
-        default="both",
-        help="Which mode to run"
-    )
-    parser.add_argument(
-        "--optimization-level",
-        type=str,
-        choices=["conservative", "balanced", "high", "aggressive"],
-        default="high",
-        help="Optimization level"
     )
     parser.add_argument(
         "--max-tokens",
@@ -258,9 +244,9 @@ def main():
         default="benchmark_results.json",
         help="Output file for results"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Test prompts
     prompts = [
         "Explain how neural networks work in simple terms.",
@@ -272,30 +258,81 @@ def main():
         "What makes quantum computing different from classical computing?",
         "Write a short story about a robot learning to paint.",
     ][:args.num_prompts]
-    
+
     print("\n" + "="*70)
-    print("MEMOPT BENCHMARK")
+    print("MEMOPT BENCHMARK - ALL STAGES")
     print("="*70)
     print(f"Model: {args.model}")
     print(f"Prompts: {len(prompts)}")
     print(f"Max tokens per prompt: {args.max_tokens}")
-    print(f"Optimization level: {args.optimization_level}")
-    
+    print("Testing: Baseline → Stage 0 → Stage 1 → Stage 2")
+
     if not torch.cuda.is_available():
         print("\n⚠️  WARNING: CUDA not available, running on CPU (will be slow)")
-    
-    # Run benchmarks
-    baseline_stats = None
-    optimized_stats = None
-    optimized_model = None
-    
-    if args.mode in ["baseline", "both"]:
-        baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
-    
-    if args.mode in ["optimized", "both"]:
-        optimized_stats, optimized_model = run_optimized(
-            args.model, prompts, args.max_tokens, args.optimization_level
-        )
+
+    # Run all stages
+    all_results = []
+
+    # 1. Baseline (no MemOpt)
+    print("\n" + "="*70)
+    print("STAGE: BASELINE (No MemOpt)")
+    print("="*70)
+    baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
+    all_results.append({
+        'name': 'Baseline',
+        'stats': baseline_stats,
+        'model': None
+    })
+
+    # 2. Stage 0 - Conservative
+    print("\n" + "="*70)
+    print("STAGE 0: CONSERVATIVE")
+    print("="*70)
+    stage0_stats, stage0_model = run_optimized(
+        args.model, prompts, args.max_tokens, "conservative"
+    )
+    all_results.append({
+        'name': 'Stage 0 (Conservative)',
+        'stats': stage0_stats,
+        'model': stage0_model
+    })
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        time.sleep(2)
+
+    # 3. Stage 1 - Balanced
+    print("\n" + "="*70)
+    print("STAGE 1: BALANCED")
+    print("="*70)
+    stage1_stats, stage1_model = run_optimized(
+        args.model, prompts, args.max_tokens, "balanced"
+    )
+    all_results.append({
+        'name': 'Stage 1 (Balanced)',
+        'stats': stage1_stats,
+        'model': stage1_model
+    })
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        time.sleep(2)
+
+    # 4. Stage 2 - High
+    print("\n" + "="*70)
+    print("STAGE 2: HIGH")
+    print("="*70)
+    stage2_stats, stage2_model = run_optimized(
+        args.model, prompts, args.max_tokens, "high"
+    )
+    all_results.append({
+        'name': 'Stage 2 (High)',
+        'stats': stage2_stats,
+        'model': stage2_model
+    })
+
+    # Use the last model for memory analysis
+    baseline_stats = all_results[0]['stats']
+    optimized_stats = all_results[-1]['stats']
+    optimized_model = all_results[-1]['model']
     
     # Print results
     print("\n" + "="*70)

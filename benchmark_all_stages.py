@@ -3,7 +3,8 @@
 Comprehensive Multi-Stage Benchmark
 
 Compares ALL optimization stages in a single run:
-- Stage 0: Conservative (baseline)
+- Baseline: No MemOpt optimizations (plain transformers)
+- Stage 0: Conservative (MemOpt with basic optimizations)
 - Stage 1: Balanced (memory allocation optimizations)
 - Stage 2: High (continuous batching)
 
@@ -15,7 +16,126 @@ import argparse
 import torch
 import json
 import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from memopt import OptimizedLLM
+
+
+def run_baseline(model_name: str, prompts: list, max_tokens: int):
+    """Run baseline inference without MemOpt optimizations"""
+    print(f"\n{'='*70}")
+    print("RUNNING BASELINE (No MemOpt Optimizations)")
+    print(f"{'='*70}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Load model with plain transformers
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map=device,
+        low_cpu_mem_usage=True
+    )
+    model.eval()
+
+    # Reset memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    # Warmup
+    print("  Warming up...")
+    inputs = tokenizer(prompts[0], return_tensors="pt").to(device)
+    with torch.no_grad():
+        _ = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    # Actual benchmark
+    print(f"  Running {len(prompts)} prompts...")
+    start_time = time.time()
+    total_tokens = 0
+    outputs = []
+
+    with torch.no_grad():
+        for i, prompt in enumerate(prompts):
+            print(f"    Prompt {i+1}/{len(prompts)}...")
+
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+            output_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+            outputs.append(output_text)
+
+            total_tokens += len(generated[0]) - len(inputs['input_ids'][0])
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    # Calculate stats
+    throughput = total_tokens / total_time
+    latency = (total_time / total_tokens) * 1000
+
+    if torch.cuda.is_available():
+        peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    else:
+        peak_memory_gb = 0.0
+
+    print(f"\n✓ BASELINE complete:")
+    print(f"    Scheduler: N/A (plain transformers)")
+    print(f"    Throughput: {throughput:.1f} tok/s")
+    print(f"    Latency: {latency:.2f} ms/tok")
+    print(f"    Total time: {total_time:.2f}s")
+    print(f"    Peak memory: {peak_memory_gb:.2f} GB")
+
+    # Cleanup
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Create stats dict matching OptimizedLLM format
+    class BaselineStats:
+        def __init__(self, throughput, latency, total_time):
+            self.tokens_per_second = throughput
+            self.latency_per_token_ms = latency
+            self.total_time_seconds = total_time
+            self.cost_per_1m_tokens_usd = (total_time / 3600.0 * 5.0 / total_tokens) * 1e6
+
+    stats = BaselineStats(throughput, latency, total_time)
+
+    return {
+        'stage_name': 'BASELINE (No MemOpt)',
+        'optimization_level': 'none',
+        'outputs': outputs,
+        'stats': stats,
+        'total_time': total_time,
+        'peak_memory_gb': peak_memory_gb,
+        'scheduler_type': 'N/A (plain transformers)',
+        'kv_stats': None
+    }
 
 
 def run_stage(
@@ -166,23 +286,30 @@ def print_comparison_table(all_results):
     print(f"{'='*70}\n")
 
     # Header
-    print(f"{'Stage':<25} {'Throughput':<15} {'Latency':<15} {'Memory':<12} {'Speedup':<10}")
-    print(f"{'-'*25} {'-'*15} {'-'*15} {'-'*12} {'-'*10}")
+    print(f"{'Stage':<35} {'Throughput':<15} {'Latency':<15} {'Memory':<12} {'Speedup':<10}")
+    print(f"{'-'*35} {'-'*15} {'-'*15} {'-'*12} {'-'*10}")
 
+    # First result is the baseline for comparison
     baseline_throughput = all_results[0]['stats'].tokens_per_second
 
-    for result in all_results:
+    for i, result in enumerate(all_results):
         stage_name = result['stage_name']
         stats = result['stats']
         throughput = stats.tokens_per_second
         latency = stats.latency_per_token_ms
         memory = result['peak_memory_gb']
-        speedup = throughput / baseline_throughput
 
-        speedup_emoji = "✅" if speedup >= 1.0 else "❌"
+        if i == 0:
+            # First entry is baseline
+            speedup_str = "1.00× (baseline)"
+            speedup_emoji = ""
+        else:
+            speedup = throughput / baseline_throughput
+            speedup_emoji = "✅" if speedup >= 1.0 else "❌"
+            speedup_str = f"{speedup:.2f}× {speedup_emoji}"
 
-        print(f"{stage_name:<25} {throughput:>7.1f} tok/s   {latency:>6.2f} ms/tok   "
-              f"{memory:>5.2f} GB    {speedup:>4.2f}× {speedup_emoji}")
+        print(f"{stage_name:<35} {throughput:>7.1f} tok/s   {latency:>6.2f} ms/tok   "
+              f"{memory:>5.2f} GB    {speedup_str}")
 
     print()
 
@@ -193,17 +320,19 @@ def print_detailed_comparison(all_results):
     print("DETAILED METRICS")
     print(f"{'='*70}")
 
+    # First result is always baseline
     baseline = all_results[0]
     baseline_stats = baseline['stats']
+    baseline_name = baseline['stage_name']
 
     for i, result in enumerate(all_results):
         if i == 0:
-            continue  # Skip baseline
+            continue  # Skip baseline in comparison
 
         stage_name = result['stage_name']
         stats = result['stats']
 
-        print(f"\n{stage_name} vs Baseline:")
+        print(f"\n{stage_name} vs {baseline_name}:")
         print(f"{'─'*70}")
 
         # Throughput
@@ -273,14 +402,21 @@ def main():
     parser.add_argument(
         "--stages",
         type=str,
-        default="0,1,2",
-        help="Stages to test (comma-separated: 0,1,2)"
+        default="baseline,0,1,2",
+        help="Stages to test (comma-separated: baseline,0,1,2)"
+    )
+    parser.add_argument(
+        "--skip-baseline",
+        action="store_true",
+        help="Skip baseline test (only run MemOpt stages)"
     )
 
     args = parser.parse_args()
 
     # Parse stages
-    stages_to_test = [int(s.strip()) for s in args.stages.split(",")]
+    stage_list = [s.strip() for s in args.stages.split(",")]
+    if args.skip_baseline and "baseline" in stage_list:
+        stage_list.remove("baseline")
 
     # Test prompts
     all_prompts = [
@@ -301,7 +437,7 @@ def main():
     print(f"Model: {args.model}")
     print(f"Prompts: {len(prompts)}")
     print(f"Max tokens per prompt: {args.max_tokens}")
-    print(f"Testing stages: {', '.join(f'Stage {s}' for s in stages_to_test)}")
+    print(f"Testing stages: {', '.join(stage_list)}")
 
     if not torch.cuda.is_available():
         print("\n⚠️  WARNING: CUDA not available, running on CPU (will be slow)")
@@ -309,13 +445,27 @@ def main():
     # Run all stages
     all_results = []
 
+    # Stage configurations
     stage_configs = {
-        0: ("STAGE 0 (Conservative - Baseline)", "conservative"),
-        1: ("STAGE 1 (Balanced - Memory Optimized)", "balanced"),
-        2: ("STAGE 2 (High - Continuous Batching)", "high"),
+        '0': ("STAGE 0 (Conservative)", "conservative"),
+        '1': ("STAGE 1 (Balanced)", "balanced"),
+        '2': ("STAGE 2 (High)", "high"),
     }
 
-    for stage_num in stages_to_test:
+    for stage_id in stage_list:
+        # Handle baseline separately
+        if stage_id.lower() == 'baseline':
+            result = run_baseline(args.model, prompts, args.max_tokens)
+            all_results.append(result)
+
+            # Clean up between stages
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                time.sleep(2)
+            continue
+
+        # Handle numbered stages
+        stage_num = stage_id
         if stage_num not in stage_configs:
             print(f"\n⚠️  Warning: Unknown stage {stage_num}, skipping")
             continue
