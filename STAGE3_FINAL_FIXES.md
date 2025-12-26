@@ -153,11 +153,35 @@ free_sequence(1)
 # free_blocks gains: {0, 1, 4, 5}
 ```
 
+## Additional Fix: Test Assertion Update
+
+### Issue in `test_free_with_shared_blocks`
+
+The test expected `block_ref_counts[block_id] == 0` for freed blocks, but the implementation **deletes** the ref count entry when it reaches 0 (line 185 in kv_cache.py):
+
+```python
+if self.block_ref_counts[block_id] == 0:
+    self.free_blocks.add(block_id)
+    self.stats.used_pages -= 1
+    del self.block_ref_counts[block_id]  # Entry deleted
+```
+
+This is **correct behavior** - no need to track ref counts for freed blocks.
+
+**Updated test** (lines 416-420):
+```python
+# NOW shared blocks should be freed
+for block_id in prefix_blocks:
+    assert block_id in kv_cache.free_blocks
+    # Ref count should be deleted (not tracked for freed blocks)
+    assert block_id not in kv_cache.block_ref_counts
+```
+
 ## Impact
 
 ### Fixed Tests
 - ✅ `test_prefix_reference_counting`: Now tests correct behavior
-- ✅ `test_free_with_shared_blocks`: Should now pass (ref counts correct)
+- ✅ `test_free_with_shared_blocks`: Fixed assertion (check deleted, not == 0)
 - ✅ All 11 Stage 3 tests should pass
 
 ### Memory Safety

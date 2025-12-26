@@ -416,7 +416,8 @@ class TestPrefixSharingIntegration:
         # NOW shared blocks should be freed
         for block_id in prefix_blocks:
             assert block_id in kv_cache.free_blocks
-            assert kv_cache.block_ref_counts[block_id] == 0
+            # Ref count should be deleted (not tracked for freed blocks)
+            assert block_id not in kv_cache.block_ref_counts
 
 
 if __name__ == "__main__":
@@ -459,7 +460,9 @@ if __name__ == "__main__":
                 print(f"✓ {test_name}")
                 tests_passed += 1
             except Exception as e:
-                print(f"✗ {test_name}: {str(e)}")
+                print(f"✗ {test_name}:")
+                import traceback
+                traceback.print_exc()
 
         print("=" * 70)
         print(f"Tests passed: {tests_passed}/{tests_run}")
