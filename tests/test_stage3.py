@@ -172,7 +172,7 @@ class TestPrefixSharing:
         # Allocate blocks first
         for block_id in blocks:
             kv_cache.free_blocks.discard(block_id)
-            kv_cache.block_ref_count[block_id] = 1
+            kv_cache.block_ref_counts[block_id] = 1
 
         kv_cache.register_prefix(tokens, blocks)
 
@@ -182,7 +182,7 @@ class TestPrefixSharing:
 
         # Check ref counts incremented
         for block_id in blocks:
-            assert kv_cache.block_ref_count[block_id] == 2
+            assert kv_cache.block_ref_counts[block_id] == 2
 
     def test_multiple_prefixes(self, kv_cache):
         """Test managing multiple different prefixes."""
@@ -221,7 +221,7 @@ class TestPrefixSharing:
         # First request: allocate blocks
         seq_id_1 = 0
         num_blocks_1 = 8
-        blocks_1 = kv_cache.allocate(seq_id_1, num_blocks_1)
+        blocks_1 = kv_cache.allocate_blocks(seq_id_1, num_blocks_1)
 
         # Register the prefix
         prefix_blocks = blocks_1[:4]  # First 4 blocks are prefix
@@ -248,7 +248,7 @@ class TestPrefixSharing:
 
         for block_id in prefix_blocks:
             kv_cache.free_blocks.discard(block_id)
-            kv_cache.block_ref_count[block_id] = 1
+            kv_cache.block_ref_counts[block_id] = 1
 
         kv_cache.register_prefix(prefix_tokens, prefix_blocks)
 
@@ -267,7 +267,7 @@ class TestPrefixSharing:
 
         # Check ref counts incremented for shared blocks
         for block_id in prefix_blocks:
-            assert kv_cache.block_ref_count[block_id] == 2
+            assert kv_cache.block_ref_counts[block_id] == 2
 
     def test_prefix_sharing_disabled_when_flag_false(self):
         """Test that prefix sharing doesn't work when disabled."""
@@ -332,7 +332,7 @@ class TestPrefixSharingIntegration:
         """Test writing and reading KV cache with shared prefix blocks."""
         # Allocate first sequence
         seq_id_1 = 0
-        blocks_1 = kv_cache.allocate(seq_id_1, 4)
+        blocks_1 = kv_cache.allocate_blocks(seq_id_1, 4)
 
         # Write some KV data
         batch_size, num_heads, seq_len, head_dim = 1, 4, 8, 16
@@ -377,7 +377,7 @@ class TestPrefixSharingIntegration:
         """Test freeing sequences with shared blocks."""
         # Allocate first sequence
         seq_id_1 = 0
-        blocks_1 = kv_cache.allocate(seq_id_1, 4)
+        blocks_1 = kv_cache.allocate_blocks(seq_id_1, 4)
 
         # Register prefix
         prefix_tokens = list(range(32))
@@ -396,7 +396,7 @@ class TestPrefixSharingIntegration:
         # Shared blocks should NOT be freed (ref count > 0)
         for block_id in prefix_blocks:
             assert block_id not in kv_cache.free_blocks
-            assert kv_cache.block_ref_count[block_id] == 1
+            assert kv_cache.block_ref_counts[block_id] == 1
 
         # Free second sequence
         kv_cache.free(seq_id_2)
@@ -404,7 +404,7 @@ class TestPrefixSharingIntegration:
         # NOW shared blocks should be freed
         for block_id in prefix_blocks:
             assert block_id in kv_cache.free_blocks
-            assert kv_cache.block_ref_count[block_id] == 0
+            assert kv_cache.block_ref_counts[block_id] == 0
 
 
 if __name__ == "__main__":
