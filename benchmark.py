@@ -4,16 +4,17 @@ Benchmark script for MemOpt
 
 Compares baseline vs optimized inference and provides customer-ready metrics.
 
-The "optimized" mode uses the "maximum" preset which includes all stages:
+The "optimized" mode uses the "ultra" preset by default (all stages including Stage 4):
 - Stage 0: FP16 inference, paged KV cache, flash attention
 - Stage 1: Adaptive allocation, workspace reuse, torch.compile
 - Stage 2: Continuous batching
 - Stage 3: KV cache prefix sharing
+- Stage 4: Priority scheduling (ultra preset)
 
 Usage:
     python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
-    python benchmark.py --model mistralai/Mistral-7B-v0.1 --mode optimized
-    python benchmark.py --model gpt2 --num-prompts 8
+    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level ultra
+    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level maximum  # Stage 3 only
 """
 
 import argparse
@@ -125,7 +126,7 @@ def run_optimized(
     model_name: str,
     prompts: list,
     max_tokens: int = 256,
-    optimization_level: str = "high"
+    optimization_level: str = "ultra"
 ):
     """
     Run optimized inference with MemOpt.
@@ -281,6 +282,13 @@ def main():
         action="store_true",
         help="Add system prompt prefix to all prompts (demonstrates Stage 3 prefix sharing)"
     )
+    parser.add_argument(
+        "--optimization-level",
+        type=str,
+        choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive"],
+        default="ultra",
+        help="Optimization level for optimized mode (default: ultra = all stages)"
+    )
 
     args = parser.parse_args()
 
@@ -325,12 +333,12 @@ def main():
         baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
 
     if args.mode in ["optimized", "both"]:
-        # Use "maximum" which integrates Stage 0 + Stage 1 + Stage 2 + Stage 3
+        # Use specified optimization level (default: ultra = Stage 0+1+2+3+4)
         optimized_stats, optimized_model = run_optimized(
-            args.model, prompts, args.max_tokens, "maximum"
+            args.model, prompts, args.max_tokens, args.optimization_level
         )
 
-    # "Optimized" uses "maximum" mode with all optimizations integrated (Stage 0+1+2+3)
+    # "Optimized" uses specified optimization level (default: ultra with all stages)
     
     # Print results
     print("\n" + "="*70)
@@ -346,12 +354,23 @@ def main():
         print(f"  Cost per 1M tokens: ${baseline_stats.cost_per_1m_tokens_usd:.2f}")
     
     if optimized_stats:
-        print("\n🚀 OPTIMIZED:")
+        print(f"\n🚀 OPTIMIZED ({args.optimization_level.upper()}):")
         print(f"  Throughput:         {optimized_stats.tokens_per_second:.1f} tok/s")
         print(f"  Latency:            {optimized_stats.latency_per_token_ms:.2f} ms/tok")
         print(f"  Memory (peak):      {optimized_stats.peak_memory_allocated_gb:.2f} GB")
         print(f"  GPU stall:          {optimized_stats.gpu_stall_pct:.1f}%")
         print(f"  Cost per 1M tokens: ${optimized_stats.cost_per_1m_tokens_usd:.2f}")
+
+        # Show which stages are enabled
+        stage_map = {
+            "conservative": "Stage 0",
+            "balanced": "Stages 0+1",
+            "high": "Stages 0+1+2",
+            "maximum": "Stages 0+1+2+3",
+            "ultra": "Stages 0+1+2+3+4 (ALL)",
+            "aggressive": "Stages 0+1+2+3 + INT8"
+        }
+        print(f"  Enabled stages:     {stage_map.get(args.optimization_level, args.optimization_level)}")
     
     if baseline_stats and optimized_stats:
         print("\n💰 IMPROVEMENT:")

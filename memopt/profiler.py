@@ -55,6 +55,12 @@ class ProfileStats:
     # Batch metrics
     avg_batch_size: float = 0.0
     avg_sequence_length: float = 0.0
+
+    # Stage 4: Dynamic batching metrics
+    dynamic_batching_enabled: bool = False
+    effective_batch_size: float = 0.0  # Auto-tuned batch size
+    padding_tokens_saved: int = 0      # Tokens saved by smart grouping
+    memory_efficiency_gain_pct: float = 0.0  # Memory saved by better estimation
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -307,10 +313,17 @@ class MemoryProfiler:
         print("\n📦 BATCH METRICS")
         print(f"  Avg batch size:          {stats.avg_batch_size:.1f}")
         print(f"  Avg sequence length:     {stats.avg_sequence_length:.0f}")
-        
+
         if self.kv_cache_stats:
             print(f"  KV cache hit rate:       {stats.kv_cache_hit_rate:.1f}%")
-        
+
+        # Stage 4: Dynamic batching metrics
+        if stats.dynamic_batching_enabled:
+            print("\n🚀 STAGE 4 METRICS (Dynamic Batching)")
+            print(f"  Auto-tuned batch size:   {stats.effective_batch_size:.1f}")
+            print(f"  Padding tokens saved:    {stats.padding_tokens_saved:,}")
+            print(f"  Memory efficiency gain:  {stats.memory_efficiency_gain_pct:.1f}%")
+
         print("\n" + "="*70 + "\n")
     
     def save_stats(self, filename: str, baseline_stats: Optional[ProfileStats] = None):

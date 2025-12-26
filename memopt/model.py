@@ -105,6 +105,24 @@ class OptimizedLLM:
             "use_continuous_batching": True,
             # Stage 3 optimizations (enabled)
             "enable_prefix_sharing": True,
+        },
+        "ultra": {
+            "quantize_kv": False,  # FP16 for maximum speed
+            "use_paged_cache": True,
+            "use_flash_attention": True,
+            "kv_block_size": 16,
+            # Stage 1 optimizations (enabled)
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
+            "use_torch_compile": True,
+            # Stage 2 optimizations (enabled)
+            "use_continuous_batching": True,
+            # Stage 3 optimizations (enabled)
+            "enable_prefix_sharing": True,
+            # Stage 4 optimizations (enabled in ultra)
+            "enable_priority_scheduling": True,   # Stage 4: Priority-aware scheduling
+            "enable_dynamic_batching": True,      # Stage 4: Auto-tune batch size, smart grouping
+            "max_batch_size": 32,                 # Stage 4: Larger batches
         }
     }
     
@@ -313,10 +331,11 @@ class OptimizedLLM:
         # Stage 2: Use ContinuousBatchScheduler if enabled
         if self.opt_config.get('use_continuous_batching', False):
             self.scheduler = ContinuousBatchScheduler(
-                max_batch_size=self.expected_batch_size,
+                max_batch_size=self.opt_config.get('max_batch_size', self.expected_batch_size),
                 max_total_tokens=self.expected_batch_size * self.expected_seq_len,
                 memory_limit_gb=40.0,  # Conservative GPU memory limit
                 enable_affinity=True,
+                enable_dynamic_batching=self.opt_config.get('enable_dynamic_batching', False),  # Stage 4
                 device=self.device
             )
         else:
@@ -403,9 +422,87 @@ class OptimizedLLM:
         ])
         
         generated_text = self.tokenizer.decode(full_ids, skip_special_tokens=True)
-        
+
         return generated_text if not is_batch else [generated_text]
-    
+
+    def generate_with_priority(
+        self,
+        prompt: str,
+        max_tokens: int = 512,
+        priority: int = 2,  # Priority.NORMAL
+        **kwargs
+    ) -> str:
+        """
+        Generate text with priority (Stage 4).
+
+        Args:
+            prompt: Input prompt
+            max_tokens: Maximum tokens to generate
+            priority: Request priority (0=urgent, 4=background)
+            **kwargs: Additional generation arguments
+
+        Returns:
+            Generated text
+        """
+        from .scheduler import Priority as PriorityLevels
+
+        # Validate priority
+        if not (0 <= priority <= 4):
+            priority = PriorityLevels.NORMAL
+
+        # Tokenize
+        if self.tokenizer is None:
+            raise ValueError("No tokenizer available")
+
+        encoded = self.tokenizer(
+            [prompt],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048
+        ).to(self.device)
+
+        input_ids = encoded['input_ids']
+
+        # Start profiling
+        if self.profiler:
+            self.profiler.start_profiling()
+
+        # Create priority request
+        request = InferenceRequest(
+            request_id="gen_priority_0",
+            prompt=prompt,
+            input_ids=input_ids,
+            max_tokens=max_tokens,
+            priority=priority  # Stage 4: Priority support
+        )
+
+        self.scheduler.add_request(request)
+
+        # Generation loop
+        with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
+            outputs = self._generate_loop(
+                request,
+                temperature=kwargs.get('temperature', 1.0),
+                top_p=kwargs.get('top_p', 1.0),
+                do_sample=kwargs.get('do_sample', False)
+            )
+
+        # End profiling
+        if self.profiler:
+            self.profiler.end_profiling()
+            if self.kv_cache:
+                self.profiler.set_kv_cache_stats(self.kv_cache.get_stats())
+
+        # Decode outputs
+        generated_ids = request.generated_ids
+        full_ids = torch.cat([
+            input_ids[0],
+            torch.tensor(generated_ids, device=self.device)
+        ])
+
+        return self.tokenizer.decode(full_ids, skip_special_tokens=True)
+
     def _generate_loop(
         self,
         request: InferenceRequest,
@@ -576,6 +673,20 @@ class OptimizedLLM:
                 stats.num_cached_prefixes = len(self.kv_cache.prefix_cache) if self.kv_cache.enable_prefix_sharing else 0
                 stats.total_prefix_hits = self._prefix_hits
                 stats.total_prefix_misses = self._prefix_misses
+
+            # Add Stage 4 dynamic batching metrics
+            if stats and hasattr(self.scheduler, 'enable_dynamic_batching'):
+                stats.dynamic_batching_enabled = self.scheduler.enable_dynamic_batching
+                if self.scheduler.enable_dynamic_batching:
+                    # Get effective batch size from history
+                    if hasattr(self.scheduler, '_batch_size_history') and self.scheduler._batch_size_history:
+                        stats.effective_batch_size = sum(self.scheduler._batch_size_history) / len(self.scheduler._batch_size_history)
+                    # Get padding tokens saved
+                    if hasattr(self.scheduler, '_grouping_savings'):
+                        stats.padding_tokens_saved = self.scheduler._grouping_savings
+                        # Calculate efficiency gain percentage
+                        if stats.total_tokens_generated > 0:
+                            stats.memory_efficiency_gain_pct = (stats.padding_tokens_saved / stats.total_tokens_generated) * 100
 
             return stats
         return None
