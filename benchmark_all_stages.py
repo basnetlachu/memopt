@@ -412,6 +412,11 @@ def main():
         action="store_true",
         help="Skip baseline test (only run MemOpt stages)"
     )
+    parser.add_argument(
+        "--use-system-prompt",
+        action="store_true",
+        help="Add system prompt prefix to all prompts (demonstrates Stage 3 prefix sharing)"
+    )
 
     args = parser.parse_args()
 
@@ -421,7 +426,7 @@ def main():
         stage_list.remove("baseline")
 
     # Test prompts
-    all_prompts = [
+    base_prompts = [
         "Explain how neural networks work in simple terms.",
         "Write a Python function to compute the Fibonacci sequence.",
         "What are the key differences between RAM and storage?",
@@ -431,7 +436,13 @@ def main():
         "What makes quantum computing different from classical computing?",
         "Write a short story about a robot learning to paint.",
     ]
-    prompts = all_prompts[:args.num_prompts]
+
+    # Add system prompt if requested (to demonstrate Stage 3 prefix sharing)
+    if args.use_system_prompt:
+        system_prompt = "You are a helpful AI assistant. Please provide clear, accurate, and concise answers. "
+        prompts = [system_prompt + p for p in base_prompts[:args.num_prompts]]
+    else:
+        prompts = base_prompts[:args.num_prompts]
 
     print(f"\n{'='*70}")
     print("MULTI-STAGE OPTIMIZATION BENCHMARK")

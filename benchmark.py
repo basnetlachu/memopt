@@ -162,9 +162,19 @@ def run_optimized(
     
     # Get stats
     stats = model.get_profiling_stats()
-    
+
     print(f"\n✓ Optimized complete: {stats.tokens_per_second:.1f} tok/s")
-    
+
+    # Show prefix sharing stats if enabled
+    if stats.prefix_sharing_enabled:
+        print(f"  Prefix sharing stats:")
+        print(f"    Cached prefixes: {stats.num_cached_prefixes}")
+        print(f"    Prefix hits: {stats.total_prefix_hits}")
+        print(f"    Prefix misses: {stats.total_prefix_misses}")
+        if stats.total_prefix_hits + stats.total_prefix_misses > 0:
+            hit_rate = stats.total_prefix_hits / (stats.total_prefix_hits + stats.total_prefix_misses) * 100
+            print(f"    Hit rate: {hit_rate:.1f}%")
+
     return stats, model  # Return model for memory analysis
 
 
@@ -266,11 +276,16 @@ def main():
         default="benchmark_results.json",
         help="Output file for results"
     )
+    parser.add_argument(
+        "--use-system-prompt",
+        action="store_true",
+        help="Add system prompt prefix to all prompts (demonstrates Stage 3 prefix sharing)"
+    )
 
     args = parser.parse_args()
 
     # Test prompts
-    prompts = [
+    base_prompts = [
         "Explain how neural networks work in simple terms.",
         "Write a Python function to compute the Fibonacci sequence.",
         "What are the key differences between RAM and storage?",
@@ -280,6 +295,15 @@ def main():
         "What makes quantum computing different from classical computing?",
         "Write a short story about a robot learning to paint.",
     ][:args.num_prompts]
+
+    # Add system prompt if requested (to demonstrate Stage 3 prefix sharing)
+    if args.use_system_prompt:
+        system_prompt = "You are a helpful AI assistant. Please provide clear, accurate, and concise answers. "
+        prompts = [system_prompt + p for p in base_prompts]
+        print("Using prompts with common system prompt prefix (Stage 3 will benefit)")
+    else:
+        prompts = base_prompts
+        print("Using unique prompts without common prefix (Stage 3 will have minimal overhead)")
 
     print("\n" + "="*70)
     print("MEMOPT BENCHMARK")
