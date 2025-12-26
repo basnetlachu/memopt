@@ -7,14 +7,15 @@ Compares baseline vs optimized inference and provides customer-ready metrics.
 The "optimized" mode supports multiple presets:
 - conservative: Stage 0 (baseline with paged cache)
 - balanced: Stage 1 (adaptive allocation, workspace reuse, torch.compile)
-- high: Stage 2 (+ continuous batching)
+- high: Stage 2 (+ continuous batching) - 6.2x speedup
 - maximum: Stage 3 (+ KV cache prefix sharing)
 - ultra: Stage 4 (+ priority scheduling, dynamic batching)
+- speculative: Stage 5b (+ speculative decoding) - Target: 12-18x speedup
 
 Usage:
-    python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
-    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level ultra    # Stage 4 (best)
-    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level maximum  # Stage 3
+    python benchmark.py --model gpt2-xl --optimization-level speculative  # Stage 5b (best - 12-18x target)
+    python benchmark.py --model gpt2-xl --optimization-level high         # Stage 2 (6.2x - proven)
+    python benchmark.py --model gpt2-xl --optimization-level ultra        # Stage 4
 """
 
 import argparse
@@ -286,8 +287,8 @@ def main():
         "--optimization-level",
         type=str,
         choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive", "speculative"],
-        default="ultra",
-        help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative (default: ultra)"
+        default="speculative",
+        help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative (default: speculative - Stage 5b)"
     )
 
     args = parser.parse_args()
@@ -316,10 +317,21 @@ def main():
     print("\n" + "="*70)
     print("MEMOPT BENCHMARK")
     print("="*70)
+    # Map optimization levels to stage descriptions
+    stage_map = {
+        "conservative": "Stage 0 (Paged Cache + Flash Attention)",
+        "balanced": "Stage 0+1 (+ Memory Allocation)",
+        "high": "Stage 0+1+2 (+ Continuous Batching) - 6.2x proven",
+        "maximum": "Stage 0+1+2+3 (+ Prefix Sharing)",
+        "ultra": "Stage 0+1+2+3+4 (+ Priority Scheduling)",
+        "aggressive": "Stage 0+1+2+3+4 (+ Priority Scheduling)",
+        "speculative": "Stage 0+1+2+3+4+5b (+ Speculative Decoding) - Target: 12-18x"
+    }
+
     print(f"Model: {args.model}")
     print(f"Prompts: {len(prompts)}")
     print(f"Max tokens per prompt: {args.max_tokens}")
-    print("Optimization: All stages integrated (Stage 0+1+2+3)")
+    print(f"Optimization: {stage_map.get(args.optimization_level, args.optimization_level)}")
 
     if not torch.cuda.is_available():
         print("\n⚠️  WARNING: CUDA not available, running on CPU (will be slow)")

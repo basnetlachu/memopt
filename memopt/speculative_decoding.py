@@ -95,7 +95,15 @@ class SpeculativeDecoder:
                 return_dict=True
             )
 
-            next_token_logits = outputs.logits[:, -1, :]  # [1, vocab_size]
+            # Handle different output shapes
+            logits = outputs.logits
+            if logits.dim() == 2:
+                # Shape: [seq_len, vocab_size]
+                next_token_logits = logits[-1:, :]  # [1, vocab_size]
+            else:
+                # Shape: [batch_size, seq_len, vocab_size]
+                next_token_logits = logits[:, -1, :]  # [1, vocab_size]
+
             draft_logits.append(next_token_logits)
 
             # Sample or greedy
@@ -171,7 +179,13 @@ class SpeculativeDecoder:
         self.total_forward_passes += 1
 
         # Get main model logits for each position
-        main_logits = outputs.logits[:, -(draft_ids.shape[1] + 1):, :]  # [1, K+1, vocab_size]
+        logits = outputs.logits
+        if logits.dim() == 2:
+            # Shape: [seq_len, vocab_size]
+            main_logits = logits[-(draft_ids.shape[1] + 1):, :].unsqueeze(0)  # [1, K+1, vocab_size]
+        else:
+            # Shape: [batch_size, seq_len, vocab_size]
+            main_logits = logits[:, -(draft_ids.shape[1] + 1):, :]  # [1, K+1, vocab_size]
 
         # Verify each drafted token
         accepted_tokens = []
