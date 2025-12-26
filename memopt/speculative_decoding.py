@@ -137,10 +137,15 @@ class SpeculativeDecoder:
             # Append for next iteration
             current_ids = torch.cat([current_ids, next_token], dim=1)
 
+        # Combine draft ids and logits
         draft_ids = torch.cat(draft_ids, dim=1)  # [1, num_tokens]
-        draft_logits = torch.stack(draft_logits, dim=1)  # [1, num_tokens, vocab_size]
 
-        return draft_ids, draft_logits
+        # Stack logits - ensure all have same shape [1, vocab_size]
+        # Then stack to create [num_tokens, 1, vocab_size] and transpose to [1, num_tokens, vocab_size]
+        draft_logits_tensor = torch.stack(draft_logits, dim=0)  # [num_tokens, 1, vocab_size]
+        draft_logits_tensor = draft_logits_tensor.squeeze(1).unsqueeze(0)  # [1, num_tokens, vocab_size]
+
+        return draft_ids, draft_logits_tensor
 
     @torch.no_grad()
     def verify_and_correct(
@@ -217,27 +222,28 @@ class SpeculativeDecoder:
 
             if draft_token.item() == main_token.item():
                 # Accept this token
-                accepted_tokens.append(draft_token)
+                accepted_tokens.append(draft_token)  # [1, 1]
                 num_accepted += 1
             else:
                 # Reject this token and stop
                 # Use main model's prediction instead
                 if do_sample and temperature > 0:
-                    corrected_token = torch.multinomial(main_probs, num_samples=1).unsqueeze(0)  # [1, 1]
+                    # multinomial returns [1, 1], reshape to [1, 1]
+                    corrected_token = torch.multinomial(main_probs, num_samples=1).view(1, 1)
                 else:
-                    corrected_token = main_token.unsqueeze(0)  # [1, 1]
+                    corrected_token = main_token.view(1, 1)  # [1, 1]
 
                 accepted_tokens.append(corrected_token)
                 break
 
         # If all draft tokens accepted, add one bonus token from main model
         if num_accepted == draft_ids.shape[1]:
-            bonus_logits = main_logits[:, -1, :]
+            bonus_logits = main_logits[:, -1, :]  # [1, vocab_size]
             if do_sample and temperature > 0:
                 bonus_probs = F.softmax(bonus_logits / temperature, dim=-1)
-                bonus_token = torch.multinomial(bonus_probs, num_samples=1).unsqueeze(0)  # [1, 1]
+                bonus_token = torch.multinomial(bonus_probs, num_samples=1).view(1, 1)  # [1, 1]
             else:
-                bonus_token = torch.argmax(bonus_logits, dim=-1, keepdim=True).unsqueeze(0)  # [1, 1]
+                bonus_token = torch.argmax(bonus_logits, dim=-1, keepdim=True).view(1, 1)  # [1, 1]
 
             accepted_tokens.append(bonus_token)
 
@@ -246,8 +252,8 @@ class SpeculativeDecoder:
             accepted_tokens = torch.cat(accepted_tokens, dim=1)  # [1, N]
         else:
             # Fallback: use first token from main model
-            bonus_logits = main_logits[:, 0, :]
-            accepted_tokens = torch.argmax(bonus_logits, dim=-1, keepdim=True).unsqueeze(0)  # [1, 1]
+            bonus_logits = main_logits[:, 0, :]  # [1, vocab_size]
+            accepted_tokens = torch.argmax(bonus_logits, dim=-1, keepdim=True).view(1, 1)  # [1, 1]
             num_accepted = 0
 
         self.total_draft_tokens += draft_ids.shape[1]
