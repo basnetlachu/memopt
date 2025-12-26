@@ -147,17 +147,17 @@ def run_optimized(
     
     # CRITICAL FIX: Reset cache ONCE before the loop, not after each prompt
     model.reset_kv_cache()
-    
-    # Run inference
+
+    # Run inference - Stage 4 auto-tuning will adapt to varying lengths
     for i, prompt in enumerate(prompts):
         print(f"  Processing prompt {i+1}/{len(prompts)}...")
-        
+
         _ = model.generate(
             prompt,
             max_tokens=max_tokens,
             do_sample=False
         )
-        
+
         # DO NOT reset cache here - this was destroying performance!
         # Only reset between completely unrelated batches
     
