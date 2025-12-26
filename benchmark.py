@@ -356,30 +356,38 @@ def main():
     print("\n" + "="*70)
     print("RESULTS SUMMARY")
     print("="*70)
+    print("\nℹ️  Metrics labeled:")
+    print("  • (measured) = Direct measurements from PyTorch/CUDA APIs")
+    print("  • (estimated) = Derived from theoretical models or business assumptions")
     
     if baseline_stats:
         print("\n📊 BASELINE:")
-        print(f"  Throughput:         {baseline_stats.tokens_per_second:.1f} tok/s")
-        print(f"  Latency:            {baseline_stats.latency_per_token_ms:.2f} ms/tok")
-        print(f"  Memory:             {baseline_stats.peak_memory_allocated_gb:.2f} GB")
-        print(f"  GPU stall:          {baseline_stats.gpu_stall_pct:.1f}%")
-        print(f"  Cost per 1M tokens: ${baseline_stats.cost_per_1m_tokens_usd:.2f}")
+        print(f"  Throughput:         {baseline_stats.tokens_per_second:.1f} tok/s (measured)")
+        print(f"  Latency:            {baseline_stats.latency_per_token_ms:.2f} ms/tok (measured)")
+        print(f"  Memory:             {baseline_stats.peak_memory_allocated_gb:.2f} GB (measured)")
+        print(f"  GPU stall:          {baseline_stats.gpu_stall_pct:.1f}% (estimated)")
+        print(f"  Cost per 1M tokens: ${baseline_stats.cost_per_1m_tokens_usd:.2f} (estimated)")
     
     if optimized_stats:
         print(f"\n🚀 OPTIMIZED ({args.optimization_level.upper()}):")
-        print(f"  Throughput:         {optimized_stats.tokens_per_second:.1f} tok/s")
-        print(f"  Latency:            {optimized_stats.latency_per_token_ms:.2f} ms/tok")
-        print(f"  Memory (peak):      {optimized_stats.peak_memory_allocated_gb:.2f} GB")
-        print(f"  GPU stall:          {optimized_stats.gpu_stall_pct:.1f}%")
-        print(f"  Cost per 1M tokens: ${optimized_stats.cost_per_1m_tokens_usd:.2f}")
+        print(f"  Throughput:         {optimized_stats.tokens_per_second:.1f} tok/s (measured)")
+        print(f"  Latency:            {optimized_stats.latency_per_token_ms:.2f} ms/tok (measured)")
+        print(f"  Memory (peak):      {optimized_stats.peak_memory_allocated_gb:.2f} GB (measured)")
+        print(f"  GPU stall:          {optimized_stats.gpu_stall_pct:.1f}% (estimated)", end="")
+        if optimized_stats.gpu_stall_pct == 0.0:
+            print(" ⚠️  0% may indicate measurement unavailable on this platform")
+        else:
+            print()
+        print(f"  Cost per 1M tokens: ${optimized_stats.cost_per_1m_tokens_usd:.2f} (estimated)")
 
         # Show which stages are enabled
         stage_map = {
-            "conservative": "Stage 0",
-            "balanced": "Stages 0+1",
-            "high": "Stages 0+1+2",
-            "maximum": "Stages 0+1+2+3",
-            "ultra": "Stages 0+1+2+3+4 (ALL)",
+            "conservative": "Stage 0 (Paged KV Cache)",
+            "balanced": "Stages 0+1 (Cache + Flash Attention)",
+            "high": "Stages 0+1+2 (+ Continuous Batching)",
+            "maximum": "Stages 0+1+2+3 (+ Prefix Sharing)",
+            "ultra": "Stages 0+1+2+3+4 (+ Priority Scheduling)",
+            "speculative": "Stages 0+1+2+3+4+5b (ALL + Speculative Decoding)",
             "aggressive": "Stages 0+1+2+3 + INT8"
         }
         print(f"  Enabled stages:     {stage_map.get(args.optimization_level, args.optimization_level)}")
@@ -397,10 +405,13 @@ def main():
         )
         stall_reduction = baseline_stats.gpu_stall_pct - optimized_stats.gpu_stall_pct
         
-        print(f"  Speedup:            {speedup:.2f}x")
-        print(f"  Memory (peak):      {memory_reduction:.1f}%")
-        print(f"  Cost reduction:     {cost_reduction:.1f}%")
-        print(f"  Stall reduction:    {stall_reduction:.1f}%")
+        print(f"  Speedup:            {speedup:.2f}x (measured)")
+        if memory_reduction < 0:
+            print(f"  Memory (peak):      {memory_reduction:.1f}% (optimized uses MORE memory due to caching)")
+        else:
+            print(f"  Memory (peak):      {memory_reduction:.1f}% reduction (measured)")
+        print(f"  Cost reduction:     {cost_reduction:.1f}% (estimated)")
+        print(f"  Stall reduction:    {stall_reduction:.1f}% (estimated)")
         
         # Show detailed memory analysis
         if optimized_model:
@@ -418,7 +429,7 @@ def main():
         annual_savings = daily_savings * 365
         
         print("\n" + "="*70)
-        print("ROI ANALYSIS (10B tokens/day)")
+        print("ROI ANALYSIS (10B tokens/day) - ESTIMATED")
         print("="*70)
         print(f"  Daily baseline cost:   ${daily_baseline_cost:,.0f}")
         print(f"  Daily optimized cost:  ${daily_optimized_cost:,.0f}")
@@ -427,6 +438,8 @@ def main():
         print(f"\n  MemOpt price: $50,000/year")
         print(f"  Payback period: {(50000 / daily_savings):.1f} days")
         print(f"  First year ROI: {(annual_savings / 50000):.1f}x")
+        print(f"\n  ⚠️  Note: Cost estimates assume $0.002/1K tokens. Actual costs vary by provider.")
+        print(f"  ⚠️  ROI calculation assumes 10B tokens/day workload. Adjust for your use case.")
     
     # Save results
     results = {}
