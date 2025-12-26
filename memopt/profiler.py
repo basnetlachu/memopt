@@ -192,9 +192,12 @@ class MemoryProfiler:
         
         # Throughput metrics
         stats.total_tokens_generated = self.tokens_generated
-        if total_time > 0:
+        if total_time > 0 and self.tokens_generated > 0:
             stats.tokens_per_second = self.tokens_generated / total_time
             stats.latency_per_token_ms = (total_time / self.tokens_generated) * 1000
+        else:
+            stats.tokens_per_second = 0.0
+            stats.latency_per_token_ms = 0.0
         
         # Memory metrics
         stats.peak_memory_allocated_gb = self.peak_memory_allocated

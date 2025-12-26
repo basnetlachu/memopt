@@ -458,6 +458,11 @@ class OptimizedLLM:
                     do_sample=do_sample
                 )
 
+            # Track tokens for profiling
+            num_generated_tokens = output_ids.shape[-1] - input_ids.shape[-1]
+            if self.profiler:
+                self.profiler.tokens_generated += num_generated_tokens
+
             # End profiling
             if self.profiler:
                 self.profiler.end_profiling()
