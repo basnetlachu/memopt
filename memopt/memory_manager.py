@@ -95,16 +95,19 @@ class SmartMemoryManager:
         memory_per_block = bytes_per_block * num_layers / (1024**3)  # GB
         
         # Don't exceed reasonable memory limit
-        max_memory_for_cache = self.total_memory * 0.3 if self.enabled else 10.0  # 30% of GPU
+        # On CPU/Windows, use smaller default (1.0 GB) to avoid excessive pre-allocation
+        max_memory_for_cache = self.total_memory * 0.3 if self.enabled else 1.0  # 30% of GPU or 1GB for CPU
         max_blocks_by_memory = int(max_memory_for_cache / memory_per_block)
-        
+
         # Take minimum of workload-based and memory-based limits
         optimal_blocks = min(blocks_with_buffer, max_blocks_by_memory)
-        
+
         # Ensure at least minimum viable blocks
         min_blocks = max(64, blocks_needed)  # At least 64 blocks or actual need
-        
-        return max(min_blocks, min(optimal_blocks, 2048))  # Cap at 2048 for safety
+
+        # Conservative cap for CPU (128 blocks ~256-512MB), higher for GPU
+        max_cap = 128 if not self.enabled else 2048
+        return max(min_blocks, min(optimal_blocks, max_cap))
     
     def get_memory_efficient_config(
         self,
