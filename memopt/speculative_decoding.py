@@ -82,6 +82,10 @@ class SpeculativeDecoder:
             - draft_ids: [1, num_tokens] drafted token IDs
             - draft_logits: [1, num_tokens, vocab_size] logits for each position
         """
+        # Ensure input_ids is 2D [batch_size, seq_len]
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
         draft_ids = []
         draft_logits = []
 
@@ -166,6 +170,12 @@ class SpeculativeDecoder:
             - accepted_tokens: [1, N] where N <= K+1
             - num_accepted: Number of tokens accepted from draft
         """
+        # Ensure input_ids is 2D
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if draft_ids.dim() == 1:
+            draft_ids = draft_ids.unsqueeze(0)
+
         # Concatenate input with ALL draft tokens
         full_input = torch.cat([input_ids, draft_ids], dim=1)  # [1, seq_len + K]
 
@@ -192,7 +202,7 @@ class SpeculativeDecoder:
         num_accepted = 0
 
         for i in range(draft_ids.shape[1]):
-            draft_token = draft_ids[:, i]
+            draft_token = draft_ids[:, i:i+1]  # [1, 1] - keep 2D
             main_token_logits = main_logits[:, i, :]  # Logits at position i
 
             # Get main model's prediction
@@ -203,9 +213,9 @@ class SpeculativeDecoder:
 
             # Check if draft token is acceptable
             # Simple strategy: accept if it's in top-k of main model
-            main_token = torch.argmax(main_token_logits, dim=-1)
+            main_token = torch.argmax(main_token_logits, dim=-1, keepdim=True)  # [1]
 
-            if draft_token == main_token:
+            if draft_token.item() == main_token.item():
                 # Accept this token
                 accepted_tokens.append(draft_token)
                 num_accepted += 1
@@ -213,9 +223,9 @@ class SpeculativeDecoder:
                 # Reject this token and stop
                 # Use main model's prediction instead
                 if do_sample and temperature > 0:
-                    corrected_token = torch.multinomial(main_probs, num_samples=1)
+                    corrected_token = torch.multinomial(main_probs, num_samples=1).unsqueeze(0)  # [1, 1]
                 else:
-                    corrected_token = main_token.unsqueeze(0)
+                    corrected_token = main_token.unsqueeze(0)  # [1, 1]
 
                 accepted_tokens.append(corrected_token)
                 break
@@ -225,9 +235,9 @@ class SpeculativeDecoder:
             bonus_logits = main_logits[:, -1, :]
             if do_sample and temperature > 0:
                 bonus_probs = F.softmax(bonus_logits / temperature, dim=-1)
-                bonus_token = torch.multinomial(bonus_probs, num_samples=1)
+                bonus_token = torch.multinomial(bonus_probs, num_samples=1).unsqueeze(0)  # [1, 1]
             else:
-                bonus_token = torch.argmax(bonus_logits, dim=-1, keepdim=True)
+                bonus_token = torch.argmax(bonus_logits, dim=-1, keepdim=True).unsqueeze(0)  # [1, 1]
 
             accepted_tokens.append(bonus_token)
 
@@ -237,7 +247,7 @@ class SpeculativeDecoder:
         else:
             # Fallback: use first token from main model
             bonus_logits = main_logits[:, 0, :]
-            accepted_tokens = torch.argmax(bonus_logits, dim=-1, keepdim=True).unsqueeze(0)
+            accepted_tokens = torch.argmax(bonus_logits, dim=-1, keepdim=True).unsqueeze(0)  # [1, 1]
             num_accepted = 0
 
         self.total_draft_tokens += draft_ids.shape[1]
@@ -270,6 +280,10 @@ class SpeculativeDecoder:
         Returns:
             Generated token IDs [1, seq_len + N]
         """
+        # Ensure input_ids is 2D
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
         current_ids = input_ids
         generated_tokens = 0
 
