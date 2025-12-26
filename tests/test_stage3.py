@@ -176,11 +176,22 @@ class TestPrefixSharing:
 
         kv_cache.register_prefix(tokens, blocks)
 
-        # Find match (should increment ref count)
+        # Find match (should NOT increment ref count - just returns match)
         match = kv_cache.find_prefix_match(tokens)
         assert match is not None
 
-        # Check ref counts incremented
+        # Ref counts should still be 1 (find doesn't increment)
+        for block_id in blocks:
+            assert kv_cache.block_ref_counts[block_id] == 1
+
+        # Now actually use the prefix via allocate_with_prefix_sharing
+        seq_id = 1
+        allocated_blocks, shared_count = kv_cache.allocate_with_prefix_sharing(
+            seq_id, tokens, 4
+        )
+
+        # NOW ref counts should be incremented for shared blocks
+        assert shared_count == 4
         for block_id in blocks:
             assert kv_cache.block_ref_counts[block_id] == 2
 

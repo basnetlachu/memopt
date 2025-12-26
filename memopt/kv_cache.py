@@ -459,13 +459,8 @@ class PagedKVCache:
 
         prefix_hash = self.compute_prefix_hash(token_ids)
         if prefix_hash and prefix_hash not in self.prefix_cache:
-            # Store prefix mapping
+            # Store prefix mapping (just metadata, ref counts unchanged)
             self.prefix_cache[prefix_hash] = block_ids.copy()
-
-            # Increment ref counts for shared blocks
-            for block_id in block_ids:
-                if block_id in self.block_ref_counts:
-                    self.block_ref_counts[block_id] += 1
 
     def allocate_with_prefix_sharing(
         self,
