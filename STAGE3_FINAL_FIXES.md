@@ -177,11 +177,24 @@ for block_id in prefix_blocks:
     assert block_id not in kv_cache.block_ref_counts
 ```
 
+## Additional Fix: Test Fixture Isolation
+
+### Issue in Standalone Test Execution
+
+The standalone test runner (lines 434-453) was reusing the same `kv_cache_int` instance across multiple integration tests. This caused **state pollution** where blocks allocated in "Write and read with prefix sharing" affected "Free with shared blocks".
+
+**Updated test runner** (lines 451-452):
+```python
+# Each integration test gets a fresh cache instance
+("Write and read with prefix sharing", lambda: test_integration.test_write_and_read_with_prefix_sharing(test_integration.kv_cache())),
+("Free with shared blocks", lambda: test_integration.test_free_with_shared_blocks(test_integration.kv_cache())),
+```
+
 ## Impact
 
 ### Fixed Tests
 - ✅ `test_prefix_reference_counting`: Now tests correct behavior
-- ✅ `test_free_with_shared_blocks`: Fixed assertion (check deleted, not == 0)
+- ✅ `test_free_with_shared_blocks`: Fixed assertion (check deleted, not == 0) + fresh cache
 - ✅ All 11 Stage 3 tests should pass
 
 ### Memory Safety

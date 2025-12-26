@@ -433,7 +433,6 @@ if __name__ == "__main__":
 
         # Get fixtures
         kv_cache = test_prefix.kv_cache()
-        kv_cache_int = test_integration.kv_cache()
 
         # Run basic tests
         tests_run = 0
@@ -449,8 +448,8 @@ if __name__ == "__main__":
             ("No match for different prefix", lambda: test_prefix.test_find_prefix_no_match(kv_cache)),
             ("Multiple prefixes", lambda: test_prefix.test_multiple_prefixes(kv_cache)),
             ("Prefix sharing disabled when flag false", test_prefix.test_prefix_sharing_disabled_when_flag_false),
-            ("Write and read with prefix sharing", lambda: test_integration.test_write_and_read_with_prefix_sharing(kv_cache_int)),
-            ("Free with shared blocks", lambda: test_integration.test_free_with_shared_blocks(kv_cache_int)),
+            ("Write and read with prefix sharing", lambda: test_integration.test_write_and_read_with_prefix_sharing(test_integration.kv_cache())),
+            ("Free with shared blocks", lambda: test_integration.test_free_with_shared_blocks(test_integration.kv_cache())),
         ]
 
         for test_name, test_func in test_cases:
