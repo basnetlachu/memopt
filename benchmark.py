@@ -127,23 +127,25 @@ def run_optimized(
     model_name: str,
     prompts: list,
     max_tokens: int = 256,
-    optimization_level: str = "ultra"
+    optimization_level: str = "ultra",
+    max_kv_blocks: int = None
 ):
     """
     Run optimized inference with MemOpt.
-    
+
     Returns:
         ProfileStats
     """
     print("\n" + "="*70)
     print(f"RUNNING OPTIMIZED (MemOpt - {optimization_level})")
     print("="*70)
-    
+
     # Load with MemOpt
     model = OptimizedLLM(
         model=model_name,
         optimization_level=optimization_level,
-        enable_profiling=True
+        enable_profiling=True,
+        max_kv_blocks=max_kv_blocks  # Apply user override if specified
     )
     
     # CRITICAL FIX: Reset cache ONCE before the loop, not after each prompt
@@ -290,6 +292,12 @@ def main():
         default="speculative",
         help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative (default: speculative - Stage 5b)"
     )
+    parser.add_argument(
+        "--max-kv-blocks",
+        type=int,
+        default=None,
+        help="Maximum KV cache blocks (None=auto, 128 recommended for CPU/low memory)"
+    )
 
     args = parser.parse_args()
 
@@ -347,7 +355,7 @@ def main():
     if args.mode in ["optimized", "both"]:
         # Use specified optimization level (default: ultra = Stage 0+1+2+3+4)
         optimized_stats, optimized_model = run_optimized(
-            args.model, prompts, args.max_tokens, args.optimization_level
+            args.model, prompts, args.max_tokens, args.optimization_level, args.max_kv_blocks
         )
 
     # "Optimized" uses specified optimization level (default: ultra with all stages)

@@ -156,11 +156,12 @@ class OptimizedLLM:
         enable_profiling: bool = False,
         expected_batch_size: int = 8,
         expected_seq_len: int = 1000,
+        max_kv_blocks: int = None,  # Override KV cache block limit
         **kwargs
     ):
         """
         Initialize optimized LLM.
-        
+
         Args:
             model: HuggingFace model name or model instance
             optimization_level: "conservative", "balanced", "high", or "aggressive"
@@ -169,6 +170,7 @@ class OptimizedLLM:
             enable_profiling: Enable detailed profiling
             expected_batch_size: Expected number of concurrent prompts (for memory allocation)
             expected_seq_len: Expected max tokens per prompt (for memory allocation)
+            max_kv_blocks: Maximum KV cache blocks (None = auto, 128 recommended for CPU/low memory)
             **kwargs: Additional arguments for model loading
         """
         self.device = device
@@ -176,6 +178,7 @@ class OptimizedLLM:
         self.enable_profiling = enable_profiling
         self.expected_batch_size = expected_batch_size
         self.expected_seq_len = expected_seq_len
+        self.max_kv_blocks_override = max_kv_blocks  # Store override
         
         # Get optimization config
         if optimization_level not in self.OPTIMIZATION_PRESETS:
@@ -319,10 +322,22 @@ class OptimizedLLM:
             self.config,
             workload_config
         )
-        
+
+        # Apply user override if specified
+        if self.max_kv_blocks_override is not None:
+            optimal_config['max_blocks'] = self.max_kv_blocks_override
+            # Recalculate estimated memory
+            bytes_per_value = 1 if self.opt_config['quantize_kv'] else 2
+            bytes_per_block = (
+                self.opt_config['kv_block_size'] * self.num_kv_heads * self.head_dim * bytes_per_value * 2
+            )
+            optimal_config['estimated_memory_gb'] = (
+                bytes_per_block * self.max_kv_blocks_override * self.num_layers / (1024**3)
+            )
+
         print(f"  Smart KV allocation: {optimal_config['max_blocks']} blocks "
               f"(~{optimal_config['estimated_memory_gb']:.2f} GB)")
-        
+
         # Initialize KV cache with smart allocation
         self.kv_cache = PagedKVCache(
             num_layers=self.num_layers,
