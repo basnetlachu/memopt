@@ -21,6 +21,7 @@ from .scheduler import SimpleScheduler, ContinuousBatchScheduler, InferenceReque
 from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
 from .batch_utils import pad_sequences, update_attention_mask
+from .quantization import quantize_model_int8, estimate_memory_savings
 
 
 class OptimizedLLM:
@@ -124,6 +125,28 @@ class OptimizedLLM:
             "enable_priority_scheduling": True,   # Stage 4: Priority-aware scheduling
             "enable_dynamic_batching": True,      # Stage 4: Auto-tune batch size, smart grouping
             "max_batch_size": 32,                 # Stage 4: Larger batches
+        },
+        "extreme": {
+            "quantize_kv": False,  # FP16 for KV cache
+            "use_paged_cache": True,
+            "use_flash_attention": True,
+            "kv_block_size": 16,
+            # Stage 1 optimizations (enabled)
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
+            "use_torch_compile": True,
+            # Stage 2 optimizations (enabled)
+            "use_continuous_batching": True,
+            # Stage 3 optimizations (enabled)
+            "enable_prefix_sharing": True,
+            # Stage 4 optimizations (enabled)
+            "enable_priority_scheduling": True,
+            "enable_dynamic_batching": True,
+            "max_batch_size": 32,
+            # Stage 5a: Model quantization (NEW)
+            "quantize_model": True,              # Stage 5a: INT8 weight quantization
+            "quantization_bits": 8,              # Stage 5a: 8-bit quantization
+            "per_channel_quantization": True,    # Stage 5a: Per-channel for better accuracy
         }
     }
     
@@ -237,6 +260,36 @@ class OptimizedLLM:
                 self.tokenizer = None
         
         self.model.eval()
+
+        # Stage 5a: Apply model quantization if enabled
+        if self.opt_config.get('quantize_model', False):
+            try:
+                print("  Stage 5a: Applying INT8 weight quantization...")
+
+                # Estimate memory savings before quantization
+                savings = estimate_memory_savings(
+                    self.model,
+                    bits=self.opt_config.get('quantization_bits', 8)
+                )
+
+                print(f"    Original model memory: {savings['original_memory_mb']:.1f} MB")
+                print(f"    Quantized model memory: {savings['quantized_memory_mb']:.1f} MB")
+                print(f"    Expected savings: {savings['savings_mb']:.1f} MB ({savings['savings_pct']:.1f}%)")
+
+                # Quantize the model
+                quantize_model_int8(self.model, inplace=True)
+
+                print(f"  ✓ Model quantized to INT8 ({savings['quantized_params']:,} parameters)")
+                self.is_quantized = True
+                # Store savings for metrics
+                self._quantization_savings = savings
+            except Exception as e:
+                print(f"  ⚠️  Quantization failed ({e}), continuing without it")
+                self.is_quantized = False
+                self._quantization_savings = {}
+        else:
+            self.is_quantized = False
+            self._quantization_savings = {}
 
         # Stage 1/2: Apply torch.compile for speedup
         if self.opt_config.get('use_torch_compile', False):
@@ -837,6 +890,16 @@ class OptimizedLLM:
                         # Calculate efficiency gain percentage
                         if stats.total_tokens_generated > 0:
                             stats.memory_efficiency_gain_pct = (stats.padding_tokens_saved / stats.total_tokens_generated) * 100
+
+            # Add Stage 5a model quantization metrics
+            if stats and hasattr(self, 'is_quantized'):
+                stats.model_quantized = self.is_quantized
+                if self.is_quantized:
+                    stats.quantization_bits = self.opt_config.get('quantization_bits', 8)
+                    # Get memory savings from stored data
+                    if hasattr(self, '_quantization_savings'):
+                        stats.model_memory_savings_mb = self._quantization_savings.get('savings_mb', 0.0)
+                        stats.model_memory_savings_pct = self._quantization_savings.get('savings_pct', 0.0)
 
             return stats
         return None

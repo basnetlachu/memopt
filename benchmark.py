@@ -4,16 +4,18 @@ Benchmark script for MemOpt
 
 Compares baseline vs optimized inference and provides customer-ready metrics.
 
-The "optimized" mode uses the "ultra" preset by default (all stages including Stage 4):
-- Stage 0: FP16 inference, paged KV cache, flash attention
-- Stage 1: Adaptive allocation, workspace reuse, torch.compile
-- Stage 2: Continuous batching
-- Stage 3: KV cache prefix sharing
-- Stage 4: Priority scheduling (ultra preset)
+The "optimized" mode supports multiple presets:
+- conservative: Stage 0 (baseline with paged cache)
+- balanced: Stage 1 (adaptive allocation, workspace reuse, torch.compile)
+- high: Stage 2 (+ continuous batching)
+- maximum: Stage 3 (+ KV cache prefix sharing)
+- ultra: Stage 4 (+ priority scheduling, dynamic batching)
+- extreme: Stage 5a (+ INT8 model quantization) [NEW]
 
 Usage:
     python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
-    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level ultra
+    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level extreme  # Stage 5a with quantization
+    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level ultra    # Stage 4 without quantization
     python benchmark.py --model gpt2 --num-prompts 8 --optimization-level maximum  # Stage 3 only
 """
 
@@ -285,9 +287,9 @@ def main():
     parser.add_argument(
         "--optimization-level",
         type=str,
-        choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive"],
+        choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive", "extreme"],
         default="ultra",
-        help="Optimization level for optimized mode (default: ultra = all stages)"
+        help="Optimization level: conservative/balanced/high/maximum/ultra/extreme (default: ultra). Use 'extreme' for Stage 5a INT8 quantization"
     )
 
     args = parser.parse_args()

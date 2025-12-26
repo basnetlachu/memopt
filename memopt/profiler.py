@@ -61,7 +61,13 @@ class ProfileStats:
     effective_batch_size: float = 0.0  # Auto-tuned batch size
     padding_tokens_saved: int = 0      # Tokens saved by smart grouping
     memory_efficiency_gain_pct: float = 0.0  # Memory saved by better estimation
-    
+
+    # Stage 5a: Model quantization metrics
+    model_quantized: bool = False
+    quantization_bits: int = 16  # 16 for FP16, 8 for INT8, 4 for INT4
+    model_memory_savings_mb: float = 0.0
+    model_memory_savings_pct: float = 0.0
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
@@ -323,6 +329,12 @@ class MemoryProfiler:
             print(f"  Auto-tuned batch size:   {stats.effective_batch_size:.1f}")
             print(f"  Padding tokens saved:    {stats.padding_tokens_saved:,}")
             print(f"  Memory efficiency gain:  {stats.memory_efficiency_gain_pct:.1f}%")
+
+        # Stage 5a: Model quantization metrics
+        if stats.model_quantized:
+            print("\n⚡ STAGE 5a METRICS (Model Quantization)")
+            print(f"  Quantization:            INT{stats.quantization_bits}")
+            print(f"  Model memory savings:    {stats.model_memory_savings_mb:.1f} MB ({stats.model_memory_savings_pct:.1f}%)")
 
         print("\n" + "="*70 + "\n")
     
