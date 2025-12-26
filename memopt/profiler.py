@@ -45,7 +45,13 @@ class ProfileStats:
     kv_cache_memory_gb: float = 0.0
     kv_cache_hit_rate: float = 0.0
     memory_saved_by_quantization_gb: float = 0.0
-    
+
+    # Stage 3: Prefix sharing metrics
+    num_cached_prefixes: int = 0
+    prefix_sharing_enabled: bool = False
+    total_prefix_hits: int = 0
+    total_prefix_misses: int = 0
+
     # Batch metrics
     avg_batch_size: float = 0.0
     avg_sequence_length: float = 0.0

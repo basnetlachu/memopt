@@ -147,7 +147,12 @@ class OptimizedLLM:
         
         self.opt_config = self.OPTIMIZATION_PRESETS[optimization_level]
         self.optimization_level = optimization_level
-        
+
+        # Stage 3: Sequence counter for unique IDs and prefix tracking
+        self._next_seq_id = 0
+        self._prefix_hits = 0
+        self._prefix_misses = 0
+
         # Load model and tokenizer
         print(f"Loading model with {optimization_level} optimization...")
         self._load_model(model, **kwargs)
@@ -414,19 +419,26 @@ class OptimizedLLM:
         This is where the actual inference happens with all optimizations.
         """
         input_ids = request.input_ids
-        seq_id = 0
+
+        # Stage 3: Get unique sequence ID for this request
+        seq_id = self._next_seq_id
+        self._next_seq_id += 1
 
         # Stage 3: Attempt prefix sharing if enabled
         prefix_blocks_shared = 0
+        prefix_hash_matched = None
         if self.kv_cache and self.opt_config.get('enable_prefix_sharing', False):
             token_ids = input_ids[0].tolist()
             prefix_match = self.kv_cache.find_prefix_match(token_ids)
 
             if prefix_match:
-                prefix_hash, shared_blocks = prefix_match
+                prefix_hash_matched, shared_blocks = prefix_match
                 prefix_blocks_shared = len(shared_blocks)
+                self._prefix_hits += 1  # Track hit
                 # Reference count is already incremented by find_prefix_match
                 # Only need to allocate blocks for non-prefix tokens
+            else:
+                self._prefix_misses += 1  # Track miss
 
         # Prefill phase: process entire prompt
         with torch.no_grad():
@@ -556,7 +568,16 @@ class OptimizedLLM:
     def get_profiling_stats(self) -> Optional[ProfileStats]:
         """Get profiling statistics if profiling is enabled."""
         if self.profiler:
-            return self.profiler.get_stats()
+            stats = self.profiler.get_stats()
+
+            # Add Stage 3 prefix sharing metrics
+            if stats and self.kv_cache and hasattr(self.kv_cache, 'enable_prefix_sharing'):
+                stats.prefix_sharing_enabled = self.kv_cache.enable_prefix_sharing
+                stats.num_cached_prefixes = len(self.kv_cache.prefix_cache) if self.kv_cache.enable_prefix_sharing else 0
+                stats.total_prefix_hits = self._prefix_hits
+                stats.total_prefix_misses = self._prefix_misses
+
+            return stats
         return None
     
     def print_profiling_stats(self, baseline_stats: Optional[ProfileStats] = None):
@@ -566,10 +587,30 @@ class OptimizedLLM:
         else:
             print("Profiling not enabled. Set enable_profiling=True when creating model.")
     
-    def reset_kv_cache(self):
-        """Reset KV cache (call between unrelated generations)."""
+    def reset_kv_cache(self, keep_prefixes: bool = None):
+        """
+        Reset KV cache (call between unrelated generations).
+
+        Args:
+            keep_prefixes: If True, keep cached prefixes (Stage 3).
+                          If None, auto-detect based on prefix sharing setting.
+        """
         if self.kv_cache:
-            self.kv_cache.free_sequence(0)
+            # Auto-detect: keep prefixes if prefix sharing is enabled
+            if keep_prefixes is None:
+                keep_prefixes = self.opt_config.get('enable_prefix_sharing', False)
+
+            # Free all active sequences
+            sequences_to_free = list(self.kv_cache.sequences.keys())
+            for seq_id in sequences_to_free:
+                self.kv_cache.free(seq_id)
+
+            # Reset sequence counter
+            self._next_seq_id = 0
+
+            # Optionally clear prefix cache
+            if not keep_prefixes and hasattr(self.kv_cache, 'prefix_cache'):
+                self.kv_cache.prefix_cache.clear()
 
     def generate_batch(
         self,
