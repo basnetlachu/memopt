@@ -464,8 +464,10 @@ class OptimizedLLM:
                 if self.kv_cache:
                     self.profiler.set_kv_cache_stats(self.kv_cache.get_stats())
 
-            # Decode output
-            generated_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+            # Decode output - squeeze to 1D if needed
+            if output_ids.dim() > 1:
+                output_ids = output_ids.squeeze(0)
+            generated_text = self.tokenizer.decode(output_ids.tolist(), skip_special_tokens=True)
 
             # Print speculative decoding stats
             stats = self.speculative_decoder.get_stats()
