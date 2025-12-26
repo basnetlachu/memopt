@@ -21,7 +21,7 @@ from .scheduler import SimpleScheduler, ContinuousBatchScheduler, InferenceReque
 from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
 from .batch_utils import pad_sequences, update_attention_mask
-from .quantization import quantize_model_int8, estimate_memory_savings
+from .speculative_decoding import SpeculativeDecoder, create_draft_model
 
 
 class OptimizedLLM:
@@ -126,28 +126,25 @@ class OptimizedLLM:
             "enable_dynamic_batching": True,      # Stage 4: Auto-tune batch size, smart grouping
             "max_batch_size": 32,                 # Stage 4: Larger batches
         },
-        "extreme": {
-            "quantize_kv": False,  # FP16 for KV cache
+        "speculative": {
+            "quantize_kv": False,
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
-            # Stage 1 optimizations (enabled)
+            # Stage 1-4 optimizations (all enabled)
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
             "use_torch_compile": True,
-            # Stage 2 optimizations (enabled)
             "use_continuous_batching": True,
-            # Stage 3 optimizations (enabled)
             "enable_prefix_sharing": True,
-            # Stage 4 optimizations (enabled)
             "enable_priority_scheduling": True,
             "enable_dynamic_batching": True,
             "max_batch_size": 32,
-            # Stage 5a: Model quantization (NEW)
-            "quantize_model": True,              # Stage 5a: INT8 weight quantization
-            "quantization_bits": 8,              # Stage 5a: 8-bit quantization
-            "per_channel_quantization": True,    # Stage 5a: Per-channel for better accuracy
-        }
+            # Stage 5b: Speculative decoding (NEW)
+            "enable_speculative_decoding": True,       # Stage 5b: Use draft model
+            "num_speculative_tokens": 4,               # Stage 5b: Draft K=4 tokens at a time
+            "draft_model": "auto",                     # Stage 5b: Auto-select draft model
+        },
     }
     
     def __init__(
@@ -203,10 +200,13 @@ class OptimizedLLM:
         self._initialize_kv_cache()
         self._initialize_attention()
         self._initialize_scheduler()
-        
+
+        # Stage 5b: Initialize speculative decoding if enabled
+        self._initialize_speculative_decoding()
+
         # Profiler
         self.profiler = MemoryProfiler(device=device) if enable_profiling else None
-        
+
         print(f"✓ Model loaded and optimized")
         print(f"  - KV cache quantization: {self.opt_config['quantize_kv']}")
         print(f"  - Paged KV cache: {self.opt_config['use_paged_cache']}")
@@ -216,8 +216,11 @@ class OptimizedLLM:
         stage1_active = (self.opt_config.get('enable_adaptive_allocation', False) or
                         self.opt_config.get('enable_workspace_reuse', False))
         stage2_active = self.opt_config.get('use_continuous_batching', False)
+        stage5b_active = self.opt_config.get('enable_speculative_decoding', False)
 
-        if stage2_active:
+        if stage5b_active:
+            print(f"  - Optimization stage: Stage 5b (Speculative Decoding)")
+        elif stage2_active:
             print(f"  - Optimization stage: Stage 2 (Continuous Batching)")
         elif stage1_active:
             print(f"  - Optimization stage: Stage 1 (Memory Allocation)")
@@ -260,36 +263,6 @@ class OptimizedLLM:
                 self.tokenizer = None
         
         self.model.eval()
-
-        # Stage 5a: Apply model quantization if enabled
-        if self.opt_config.get('quantize_model', False):
-            try:
-                print("  Stage 5a: Applying INT8 weight quantization...")
-
-                # Estimate memory savings before quantization
-                savings = estimate_memory_savings(
-                    self.model,
-                    bits=self.opt_config.get('quantization_bits', 8)
-                )
-
-                print(f"    Original model memory: {savings['original_memory_mb']:.1f} MB")
-                print(f"    Quantized model memory: {savings['quantized_memory_mb']:.1f} MB")
-                print(f"    Expected savings: {savings['savings_mb']:.1f} MB ({savings['savings_pct']:.1f}%)")
-
-                # Quantize the model
-                quantize_model_int8(self.model, inplace=True)
-
-                print(f"  ✓ Model quantized to INT8 ({savings['quantized_params']:,} parameters)")
-                self.is_quantized = True
-                # Store savings for metrics
-                self._quantization_savings = savings
-            except Exception as e:
-                print(f"  ⚠️  Quantization failed ({e}), continuing without it")
-                self.is_quantized = False
-                self._quantization_savings = {}
-        else:
-            self.is_quantized = False
-            self._quantization_savings = {}
 
         # Stage 1/2: Apply torch.compile for speedup
         if self.opt_config.get('use_torch_compile', False):
@@ -395,7 +368,36 @@ class OptimizedLLM:
         else:
             # Stage 0/1: Use SimpleScheduler (original behavior)
             self.scheduler = SimpleScheduler(device=self.device)
-    
+
+    def _initialize_speculative_decoding(self):
+        """Initialize speculative decoding if enabled (Stage 5b)."""
+        if self.opt_config.get('enable_speculative_decoding', False):
+            print("\n=== Initializing Speculative Decoding (Stage 5b) ===")
+
+            # Create draft model
+            print(f"Loading draft model for '{self.model_name}'...")
+            draft_model, draft_tokenizer = create_draft_model(
+                self.model_name,
+                device=self.device
+            )
+
+            # Get number of speculative tokens (K)
+            num_speculative_tokens = self.opt_config.get('num_speculative_tokens', 4)
+
+            # Create speculative decoder
+            self.speculative_decoder = SpeculativeDecoder(
+                draft_model=draft_model,
+                draft_tokenizer=draft_tokenizer,
+                num_speculative_tokens=num_speculative_tokens,
+                device=self.device
+            )
+
+            print(f"✓ Draft model: {draft_model.config._name_or_path}")
+            print(f"✓ Speculative tokens (K): {num_speculative_tokens}")
+            print(f"✓ Expected speedup: 2-3x over current best (6.2x)")
+        else:
+            self.speculative_decoder = None
+
     @torch.no_grad()
     def generate(
         self,
@@ -438,11 +440,43 @@ class OptimizedLLM:
         ).to(self.device)
         
         input_ids = encoded['input_ids']
-        
+
         # Start profiling
         if self.profiler:
             self.profiler.start_profiling()
-        
+
+        # Stage 5b: Use speculative decoding if enabled
+        if self.speculative_decoder is not None:
+            # Use speculative decoding path
+            with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
+                output_ids = self.speculative_decoder.generate(
+                    main_model=self.model,
+                    input_ids=input_ids[0],  # Single prompt for now
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample
+                )
+
+            # End profiling
+            if self.profiler:
+                self.profiler.end_profiling()
+                if self.kv_cache:
+                    self.profiler.set_kv_cache_stats(self.kv_cache.get_stats())
+
+            # Decode output
+            generated_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+
+            # Print speculative decoding stats
+            stats = self.speculative_decoder.get_stats()
+            if stats['total_draft_tokens'] > 0:
+                print(f"\n[Speculative Decoding Stats]")
+                print(f"  Acceptance rate: {stats['acceptance_rate']:.1%}")
+                print(f"  Theoretical speedup: {stats['theoretical_speedup']:.2f}x")
+
+            return generated_text if not is_batch else [generated_text]
+
+        # Original generation path (Stages 0-4)
         # Create inference request
         request = InferenceRequest(
             request_id="gen_0",
@@ -450,9 +484,9 @@ class OptimizedLLM:
             input_ids=input_ids,
             max_tokens=max_tokens
         )
-        
+
         self.scheduler.add_request(request)
-        
+
         # Generation loop
         with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
             outputs = self._generate_loop(
@@ -461,20 +495,20 @@ class OptimizedLLM:
                 top_p=top_p,
                 do_sample=do_sample
             )
-        
+
         # End profiling
         if self.profiler:
             self.profiler.end_profiling()
             if self.kv_cache:
                 self.profiler.set_kv_cache_stats(self.kv_cache.get_stats())
-        
+
         # Decode outputs
         generated_ids = request.generated_ids
         full_ids = torch.cat([
             input_ids[0],
             torch.tensor(generated_ids, device=self.device)
         ])
-        
+
         generated_text = self.tokenizer.decode(full_ids, skip_special_tokens=True)
 
         return generated_text if not is_batch else [generated_text]

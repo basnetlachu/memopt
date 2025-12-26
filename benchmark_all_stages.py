@@ -9,12 +9,11 @@ Compares ALL optimization stages in a single run:
 - Stage 2: High (continuous batching)
 - Stage 3: Maximum (prefix sharing for common prompts)
 - Stage 4: Ultra (priority scheduling and dynamic batching)
-- Stage 5a: Extreme (INT8 model quantization) [NEW]
 
 Usage:
     python benchmark_all_stages.py --model gpt2-xl --num-prompts 8
-    python benchmark_all_stages.py --model gpt2 --stages "0,1,2,3,4,5a" --skip-baseline
-    python benchmark_all_stages.py --model gpt2 --stages "baseline,3,5a"  # Compare specific stages
+    python benchmark_all_stages.py --model gpt2 --stages "0,1,2,3,4" --skip-baseline
+    python benchmark_all_stages.py --model gpt2 --stages "baseline,2,3"  # Compare specific stages
 """
 
 import argparse
@@ -407,8 +406,8 @@ def main():
     parser.add_argument(
         "--stages",
         type=str,
-        default="baseline,0,1,2,3,4,5a",
-        help="Stages to test (comma-separated: baseline,0,1,2,3,4,5a). Use 5a for INT8 quantization"
+        default="baseline,0,1,2,3,4",
+        help="Stages to test (comma-separated: baseline,0,1,2,3,4)"
     )
     parser.add_argument(
         "--skip-baseline",
@@ -468,7 +467,7 @@ def main():
         '2': ("STAGE 2 (High)", "high"),
         '3': ("STAGE 3 (Maximum - Prefix Sharing)", "maximum"),
         '4': ("STAGE 4 (Ultra - Priority Scheduling)", "ultra"),
-        '5a': ("STAGE 5a (Extreme - INT8 Quantization)", "extreme"),
+        '5b': ("STAGE 5b (Speculative Decoding)", "speculative"),
     }
 
     for stage_id in stage_list:

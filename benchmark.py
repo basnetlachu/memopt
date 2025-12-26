@@ -10,13 +10,11 @@ The "optimized" mode supports multiple presets:
 - high: Stage 2 (+ continuous batching)
 - maximum: Stage 3 (+ KV cache prefix sharing)
 - ultra: Stage 4 (+ priority scheduling, dynamic batching)
-- extreme: Stage 5a (+ INT8 model quantization) [NEW]
 
 Usage:
     python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
-    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level extreme  # Stage 5a with quantization
-    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level ultra    # Stage 4 without quantization
-    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level maximum  # Stage 3 only
+    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level ultra    # Stage 4 (best)
+    python benchmark.py --model gpt2 --num-prompts 8 --optimization-level maximum  # Stage 3
 """
 
 import argparse
@@ -287,9 +285,9 @@ def main():
     parser.add_argument(
         "--optimization-level",
         type=str,
-        choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive", "extreme"],
+        choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive", "speculative"],
         default="ultra",
-        help="Optimization level: conservative/balanced/high/maximum/ultra/extreme (default: ultra). Use 'extreme' for Stage 5a INT8 quantization"
+        help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative (default: ultra)"
     )
 
     args = parser.parse_args()
