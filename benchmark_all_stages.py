@@ -7,9 +7,11 @@ Compares ALL optimization stages in a single run:
 - Stage 0: Conservative (MemOpt with basic optimizations)
 - Stage 1: Balanced (memory allocation optimizations)
 - Stage 2: High (continuous batching)
+- Stage 3: Maximum (prefix sharing for common prompts)
 
 Usage:
     python benchmark_all_stages.py --model gpt2-xl --num-prompts 8
+    python benchmark_all_stages.py --model gpt2 --stages "0,1,2,3" --skip-baseline
 """
 
 import argparse
@@ -402,8 +404,8 @@ def main():
     parser.add_argument(
         "--stages",
         type=str,
-        default="baseline,0,1,2",
-        help="Stages to test (comma-separated: baseline,0,1,2)"
+        default="baseline,0,1,2,3",
+        help="Stages to test (comma-separated: baseline,0,1,2,3)"
     )
     parser.add_argument(
         "--skip-baseline",
@@ -450,6 +452,7 @@ def main():
         '0': ("STAGE 0 (Conservative)", "conservative"),
         '1': ("STAGE 1 (Balanced)", "balanced"),
         '2': ("STAGE 2 (High)", "high"),
+        '3': ("STAGE 3 (Maximum - Prefix Sharing)", "maximum"),
     }
 
     for stage_id in stage_list:

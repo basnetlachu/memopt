@@ -59,7 +59,8 @@ class PagedKVCache:
         max_blocks: int = 4096,
         device: str = "cuda",
         quantize: bool = True,
-        layer_retention_strategy: str = "keep_early"
+        layer_retention_strategy: str = "keep_early",
+        enable_prefix_sharing: bool = False
     ):
         """
         Args:
@@ -71,6 +72,7 @@ class PagedKVCache:
             device: torch device
             quantize: Whether to use INT8 quantization
             layer_retention_strategy: "keep_early" or "keep_all"
+            enable_prefix_sharing: Enable KV cache prefix sharing (Stage 3)
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -80,6 +82,7 @@ class PagedKVCache:
         self.device = device
         self.quantize = quantize
         self.layer_retention_strategy = layer_retention_strategy
+        self.enable_prefix_sharing = enable_prefix_sharing
         
         # Determine which layers to keep in HBM vs stream
         # Early layers (first 25%) stay resident - they're accessed most
@@ -125,7 +128,11 @@ class PagedKVCache:
         self.free_blocks = set(range(max_blocks))
         self.block_tables: Dict[int, List[int]] = {}  # seq_id -> list of block indices
         self.block_ref_counts: Dict[int, int] = {}  # block_id -> ref count
-        
+
+        # Prefix sharing (Stage 3)
+        self.prefix_cache: Dict[str, List[int]] = {}  # prefix_hash -> block_ids
+        self.prefix_min_length = 32  # Minimum tokens for prefix sharing
+
         # Statistics
         self.stats = CacheStats(total_pages=max_blocks)
         
@@ -386,8 +393,138 @@ class PagedKVCache:
     def get_stats(self) -> CacheStats:
         """Return current cache statistics."""
         return self.stats
-    
+
     def reset_stats(self):
         """Reset statistics counters."""
         self.stats.cache_hits = 0
         self.stats.cache_misses = 0
+
+    # ========================================================================
+    # Stage 3: Prefix Sharing Methods
+    # ========================================================================
+
+    def compute_prefix_hash(self, token_ids: List[int]) -> str:
+        """
+        Compute hash of token sequence for prefix matching.
+
+        Args:
+            token_ids: List of token IDs
+
+        Returns:
+            Hash string for prefix lookup
+        """
+        if not self.enable_prefix_sharing:
+            return ""
+
+        # Use only first N tokens as prefix
+        prefix_len = min(len(token_ids), self.prefix_min_length * 2)
+        prefix_tokens = tuple(token_ids[:prefix_len])
+
+        # Simple hash based on token sequence
+        return str(hash(prefix_tokens))
+
+    def find_prefix_match(self, token_ids: List[int]) -> Optional[Tuple[str, List[int]]]:
+        """
+        Find longest matching prefix in cache.
+
+        Args:
+            token_ids: Token IDs to find prefix for
+
+        Returns:
+            (prefix_hash, shared_block_ids) if match found, None otherwise
+        """
+        if not self.enable_prefix_sharing or len(token_ids) < self.prefix_min_length:
+            return None
+
+        # Try progressively shorter prefixes
+        for prefix_len in range(len(token_ids), self.prefix_min_length - 1, -1):
+            prefix_tokens = tuple(token_ids[:prefix_len])
+            prefix_hash = str(hash(prefix_tokens))
+
+            if prefix_hash in self.prefix_cache:
+                return (prefix_hash, self.prefix_cache[prefix_hash])
+
+        return None
+
+    def register_prefix(self, token_ids: List[int], block_ids: List[int]):
+        """
+        Register a new prefix for future sharing.
+
+        Args:
+            token_ids: Token IDs of the prefix
+            block_ids: Block IDs containing the prefix KV cache
+        """
+        if not self.enable_prefix_sharing or len(token_ids) < self.prefix_min_length:
+            return
+
+        prefix_hash = self.compute_prefix_hash(token_ids)
+        if prefix_hash and prefix_hash not in self.prefix_cache:
+            # Store prefix mapping
+            self.prefix_cache[prefix_hash] = block_ids.copy()
+
+            # Increment ref counts for shared blocks
+            for block_id in block_ids:
+                if block_id in self.block_ref_counts:
+                    self.block_ref_counts[block_id] += 1
+
+    def allocate_with_prefix_sharing(
+        self,
+        seq_id: int,
+        token_ids: List[int],
+        num_blocks: int
+    ) -> Tuple[List[int], int]:
+        """
+        Allocate blocks with prefix sharing if possible.
+
+        Args:
+            seq_id: Sequence ID
+            token_ids: Token IDs for prefix matching
+            num_blocks: Total blocks needed
+
+        Returns:
+            (block_ids, num_shared_blocks)
+        """
+        if not self.enable_prefix_sharing:
+            blocks = self.allocate_blocks(seq_id, num_blocks)
+            return blocks, 0
+
+        # Try to find matching prefix
+        prefix_match = self.find_prefix_match(token_ids)
+
+        if prefix_match is None:
+            # No prefix match, allocate normally
+            blocks = self.allocate_blocks(seq_id, num_blocks)
+            return blocks, 0
+
+        prefix_hash, shared_blocks = prefix_match
+        num_shared = len(shared_blocks)
+
+        # Allocate only remaining blocks
+        remaining_blocks_needed = max(0, num_blocks - num_shared)
+
+        if remaining_blocks_needed > 0:
+            new_blocks = []
+            if len(self.free_blocks) >= remaining_blocks_needed:
+                for _ in range(remaining_blocks_needed):
+                    block_id = self.free_blocks.pop()
+                    new_blocks.append(block_id)
+                    self.block_ref_counts[block_id] = 1
+            else:
+                # Not enough blocks, allocate normally without sharing
+                blocks = self.allocate_blocks(seq_id, num_blocks)
+                return blocks, 0
+        else:
+            new_blocks = []
+
+        # Combine shared + new blocks
+        all_blocks = shared_blocks[:num_shared] + new_blocks
+
+        # Increment ref counts for shared blocks
+        for block_id in shared_blocks[:num_shared]:
+            if block_id in self.block_ref_counts:
+                self.block_ref_counts[block_id] += 1
+
+        self.block_tables[seq_id] = all_blocks
+        self.stats.used_pages += len(new_blocks)
+
+        return all_blocks, num_shared

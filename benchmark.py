@@ -4,9 +4,16 @@ Benchmark script for MemOpt
 
 Compares baseline vs optimized inference and provides customer-ready metrics.
 
+The "optimized" mode uses the "maximum" preset which includes all stages:
+- Stage 0: FP16 inference, paged KV cache, flash attention
+- Stage 1: Adaptive allocation, workspace reuse, torch.compile
+- Stage 2: Continuous batching
+- Stage 3: KV cache prefix sharing
+
 Usage:
     python benchmark.py --model meta-llama/Llama-2-7b-hf --mode both
     python benchmark.py --model mistralai/Mistral-7B-v0.1 --mode optimized
+    python benchmark.py --model gpt2 --num-prompts 8
 """
 
 import argparse
@@ -198,6 +205,14 @@ def print_memory_analysis(optimized_model, baseline_memory_gb, optimized_peak_gb
         print(f"  Allocated: {kv.max_blocks} blocks (max capacity)")
         print(f"  Used: {blocks_used} blocks ({stats.utilization*100:.1f}% utilization)")
         print(f"  Quantization: {'INT8' if kv.quantize else 'FP16'}")
+
+        # Show prefix sharing stats if enabled
+        if hasattr(kv, 'enable_prefix_sharing') and kv.enable_prefix_sharing:
+            num_prefixes = len(kv.prefix_cache)
+            print(f"  Prefix sharing: ENABLED ({num_prefixes} cached prefixes)")
+        else:
+            print(f"  Prefix sharing: DISABLED")
+
         print(f"  Memory (baseline would use): {baseline_kv_gb:.2f} GB")
         print(f"  Memory (optimized actual): {actual_kv_gb:.2f} GB")
         
@@ -272,7 +287,7 @@ def main():
     print(f"Model: {args.model}")
     print(f"Prompts: {len(prompts)}")
     print(f"Max tokens per prompt: {args.max_tokens}")
-    print("Optimization: All stages integrated (Stage 0+1+2)")
+    print("Optimization: All stages integrated (Stage 0+1+2+3)")
 
     if not torch.cuda.is_available():
         print("\n⚠️  WARNING: CUDA not available, running on CPU (will be slow)")
@@ -286,13 +301,12 @@ def main():
         baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
 
     if args.mode in ["optimized", "both"]:
-        # Use "high" which integrates Stage 0 + Stage 1 + Stage 2
+        # Use "maximum" which integrates Stage 0 + Stage 1 + Stage 2 + Stage 3
         optimized_stats, optimized_model = run_optimized(
-            args.model, prompts, args.max_tokens, "high"
+            args.model, prompts, args.max_tokens, "maximum"
         )
 
-    # Note: Previously ran stages 0,1,2 separately, but that's not correct
-    # "Optimized" should be a single run with "high" mode that has all optimizations integrated
+    # "Optimized" uses "maximum" mode with all optimizations integrated (Stage 0+1+2+3)
     
     # Print results
     print("\n" + "="*70)

@@ -47,6 +47,8 @@ class OptimizedLLM:
             "use_torch_compile": False,  # Disabled in conservative
             # Stage 2 optimizations (disabled in conservative mode)
             "use_continuous_batching": False,
+            # Stage 3 optimizations (disabled in conservative mode)
+            "enable_prefix_sharing": False,
         },
         "balanced": {
             "quantize_kv": False,  # FP16 for maximum speed (Stage 1)
@@ -59,6 +61,8 @@ class OptimizedLLM:
             "use_torch_compile": True,  # Stage 1: torch.compile for speedup
             # Stage 2 optimizations (disabled in balanced, enabled in high+)
             "use_continuous_batching": False,
+            # Stage 3 optimizations (disabled in balanced, enabled in maximum+)
+            "enable_prefix_sharing": False,
         },
         "high": {
             "quantize_kv": False,  # FP16 for maximum speed (Stage 2)
@@ -71,6 +75,22 @@ class OptimizedLLM:
             "use_torch_compile": True,  # Stage 2: torch.compile enabled
             # Stage 2 optimizations (enabled in high+)
             "use_continuous_batching": True,
+            # Stage 3 optimizations (disabled in high, enabled in maximum+)
+            "enable_prefix_sharing": False,
+        },
+        "maximum": {
+            "quantize_kv": False,  # FP16 for maximum speed (Stage 3)
+            "use_paged_cache": True,
+            "use_flash_attention": True,
+            "kv_block_size": 16,
+            # Stage 1 optimizations (enabled)
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
+            "use_torch_compile": True,  # Stage 3: torch.compile enabled
+            # Stage 2 optimizations (enabled)
+            "use_continuous_batching": True,
+            # Stage 3 optimizations (enabled in maximum+)
+            "enable_prefix_sharing": True,  # Stage 3: KV cache prefix sharing
         },
         "aggressive": {
             "quantize_kv": True,
@@ -83,6 +103,8 @@ class OptimizedLLM:
             "use_torch_compile": True,  # Enabled in aggressive
             # Stage 2 optimizations (enabled)
             "use_continuous_batching": True,
+            # Stage 3 optimizations (enabled)
+            "enable_prefix_sharing": True,
         }
     }
     
@@ -259,7 +281,8 @@ class OptimizedLLM:
             block_size=self.opt_config['kv_block_size'],
             max_blocks=optimal_config['max_blocks'],  # Smart allocation!
             device=self.device,
-            quantize=self.opt_config['quantize_kv']
+            quantize=self.opt_config['quantize_kv'],
+            enable_prefix_sharing=self.opt_config.get('enable_prefix_sharing', False)  # Stage 3
         )
         
         # Store memory manager for potential dynamic adjustments
@@ -387,12 +410,24 @@ class OptimizedLLM:
     ):
         """
         Main generation loop.
-        
+
         This is where the actual inference happens with all optimizations.
         """
         input_ids = request.input_ids
         seq_id = 0
-        
+
+        # Stage 3: Attempt prefix sharing if enabled
+        prefix_blocks_shared = 0
+        if self.kv_cache and self.opt_config.get('enable_prefix_sharing', False):
+            token_ids = input_ids[0].tolist()
+            prefix_match = self.kv_cache.find_prefix_match(token_ids)
+
+            if prefix_match:
+                prefix_hash, shared_blocks = prefix_match
+                prefix_blocks_shared = len(shared_blocks)
+                # Reference count is already incremented by find_prefix_match
+                # Only need to allocate blocks for non-prefix tokens
+
         # Prefill phase: process entire prompt
         with torch.no_grad():
             outputs = self.model(
@@ -411,7 +446,16 @@ class OptimizedLLM:
                     v=v,
                     start_pos=0
                 )
-        
+
+            # Stage 3: Register prefix for future sharing if no match was found
+            if self.opt_config.get('enable_prefix_sharing', False) and prefix_blocks_shared == 0:
+                token_ids = input_ids[0].tolist()
+                if len(token_ids) >= self.kv_cache.prefix_min_length:
+                    # Get the blocks allocated for this sequence
+                    if seq_id in self.kv_cache.sequences:
+                        seq_blocks = self.kv_cache.sequences[seq_id]
+                        self.kv_cache.register_prefix(token_ids, seq_blocks)
+
         # Get first token
         logits = outputs.logits[:, -1, :]
         next_token = self._sample_token(logits, temperature, top_p, do_sample)
