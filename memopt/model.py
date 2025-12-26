@@ -464,8 +464,8 @@ class OptimizedLLM:
                 token_ids = input_ids[0].tolist()
                 if len(token_ids) >= self.kv_cache.prefix_min_length:
                     # Get the blocks allocated for this sequence
-                    if seq_id in self.kv_cache.sequences:
-                        seq_blocks = self.kv_cache.sequences[seq_id]
+                    if seq_id in self.kv_cache.block_tables:
+                        seq_blocks = self.kv_cache.block_tables[seq_id]
                         self.kv_cache.register_prefix(token_ids, seq_blocks)
 
         # Get first token
@@ -601,9 +601,9 @@ class OptimizedLLM:
                 keep_prefixes = self.opt_config.get('enable_prefix_sharing', False)
 
             # Free all active sequences
-            sequences_to_free = list(self.kv_cache.sequences.keys())
+            sequences_to_free = list(self.kv_cache.block_tables.keys())
             for seq_id in sequences_to_free:
-                self.kv_cache.free(seq_id)
+                self.kv_cache.free_sequence(seq_id)
 
             # Reset sequence counter
             self._next_seq_id = 0

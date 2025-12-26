@@ -365,7 +365,8 @@ class TestPrefixSharingIntegration:
         k_read, v_read = kv_cache.read_cache(
             layer_idx=0,
             seq_id=seq_id_2,
-            max_length=8
+            start_pos=0,
+            length=8
         )
 
         # Prefix portion should match original
@@ -391,7 +392,7 @@ class TestPrefixSharingIntegration:
         )
 
         # Free first sequence
-        kv_cache.free(seq_id_1)
+        kv_cache.free_sequence(seq_id_1)
 
         # Shared blocks should NOT be freed (ref count > 0)
         for block_id in prefix_blocks:
@@ -399,7 +400,7 @@ class TestPrefixSharingIntegration:
             assert kv_cache.block_ref_counts[block_id] == 1
 
         # Free second sequence
-        kv_cache.free(seq_id_2)
+        kv_cache.free_sequence(seq_id_2)
 
         # NOW shared blocks should be freed
         for block_id in prefix_blocks:
