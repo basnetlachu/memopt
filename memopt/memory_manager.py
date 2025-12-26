@@ -106,8 +106,13 @@ class SmartMemoryManager:
         min_blocks = max(64, blocks_needed)  # At least 64 blocks or actual need
 
         # Conservative cap for CPU (128 blocks ~256-512MB), higher for GPU
-        max_cap = 128 if not self.enabled else 2048
-        return max(min_blocks, min(optimal_blocks, max_cap))
+        # IMPORTANT: On CPU, strictly enforce 128 block limit to avoid excessive memory
+        if not self.enabled:
+            # CPU/Windows: cap at 128 blocks regardless of calculation
+            return min(max(min_blocks, optimal_blocks), 128)
+        else:
+            # GPU: allow up to 2048 blocks
+            return max(min_blocks, min(optimal_blocks, 2048))
     
     def get_memory_efficient_config(
         self,
