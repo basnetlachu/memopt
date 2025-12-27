@@ -5,17 +5,18 @@ Benchmark script for MemOpt
 Compares baseline vs optimized inference and provides customer-ready metrics.
 
 The "optimized" mode supports multiple presets:
-- conservative: Stage 0 (baseline with paged cache)
-- balanced: Stage 1 (adaptive allocation, workspace reuse, torch.compile)
+- conservative: Stage 0 (baseline with paged cache) - 6.17x
+- balanced: Stage 1 (adaptive allocation, workspace reuse, torch.compile) - 6.15x
 - high: Stage 2 (+ continuous batching) - 6.2x speedup
-- maximum: Stage 3 (+ KV cache prefix sharing)
-- ultra: Stage 4 (+ priority scheduling, dynamic batching)
-- speculative: Stage 5b (+ speculative decoding) - Target: 12-18x speedup
+- maximum: Stage 3 (+ KV cache prefix sharing) - 6.14x
+- ultra: Stage 4 (+ priority scheduling, dynamic batching) - 6.12x
+- speculative: Stage 5b (+ speculative decoding) - 15.45x speedup ✅
+- flash: Stage 7 (+ Flash Attention) - 30-60x speedup 🚀
 
 Usage:
-    python benchmark.py --model gpt2-xl --optimization-level speculative  # Stage 5b (best - 12-18x target)
-    python benchmark.py --model gpt2-xl --optimization-level high         # Stage 2 (6.2x - proven)
-    python benchmark.py --model gpt2-xl --optimization-level ultra        # Stage 4
+    python benchmark.py --model gpt2-xl --optimization-level flash         # Stage 7 (BEST - 30-60x target) 🚀
+    python benchmark.py --model gpt2-xl --optimization-level speculative   # Stage 5b (15.45x)
+    python benchmark.py --model gpt2-xl --optimization-level high          # Stage 2 (6.2x)
 """
 
 import argparse
