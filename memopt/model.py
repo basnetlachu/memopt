@@ -22,6 +22,7 @@ from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
 from .batch_utils import pad_sequences, update_attention_mask
 from .speculative_decoding import SpeculativeDecoder, create_draft_model
+from .model_parallel import init_model_parallel
 
 
 class OptimizedLLM:
@@ -157,6 +158,7 @@ class OptimizedLLM:
         expected_batch_size: int = 8,
         expected_seq_len: int = 1000,
         max_kv_blocks: int = None,  # Override KV cache block limit
+        num_gpus: int = None,  # Number of GPUs for Stage 6 (None = auto-detect)
         **kwargs
     ):
         """
@@ -171,6 +173,7 @@ class OptimizedLLM:
             expected_batch_size: Expected number of concurrent prompts (for memory allocation)
             expected_seq_len: Expected max tokens per prompt (for memory allocation)
             max_kv_blocks: Maximum KV cache blocks (None = auto, 128 recommended for CPU/low memory)
+            num_gpus: Number of GPUs for tensor parallelism (None = auto-detect, 1 = disabled)
             **kwargs: Additional arguments for model loading
         """
         self.device = device
@@ -179,6 +182,28 @@ class OptimizedLLM:
         self.expected_batch_size = expected_batch_size
         self.expected_seq_len = expected_seq_len
         self.max_kv_blocks_override = max_kv_blocks  # Store override
+
+        # Stage 6: Model parallelism setup
+        self.num_gpus = num_gpus
+        self.model_parallel = None
+
+        # Auto-detect GPUs if not specified
+        if self.num_gpus is None:
+            self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+        # Initialize model parallelism if multi-GPU
+        if self.num_gpus > 1:
+            import os
+            # Check if running in distributed mode
+            if "LOCAL_RANK" in os.environ:
+                self.model_parallel = init_model_parallel(world_size=self.num_gpus)
+                self.device = self.model_parallel.device
+                print(f"[GPU {self.model_parallel.rank}] Stage 6: Tensor parallelism enabled ({self.num_gpus} GPUs)")
+            else:
+                print(f"⚠️  Warning: {self.num_gpus} GPUs detected but not running in distributed mode.")
+                print(f"    Use: torchrun --nproc_per_node={self.num_gpus} your_script.py")
+                print(f"    Falling back to single GPU.")
+                self.num_gpus = 1
         
         # Get optimization config
         if optimization_level not in self.OPTIMIZATION_PRESETS:
@@ -266,6 +291,12 @@ class OptimizedLLM:
                 self.tokenizer = None
         
         self.model.eval()
+
+        # Stage 6: Apply model parallelism if multi-GPU
+        if self.model_parallel is not None:
+            print(f"[GPU {self.model_parallel.rank}] Parallelizing model across {self.num_gpus} GPUs...")
+            self.model = self.model_parallel.parallelize_model(self.model)
+            print(f"[GPU {self.model_parallel.rank}] ✓ Model parallelization complete")
 
         # Stage 1/2: Apply torch.compile for speedup
         if self.opt_config.get('use_torch_compile', False):
