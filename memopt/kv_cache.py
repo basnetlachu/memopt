@@ -10,9 +10,13 @@ Key optimizations:
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
 import math
+import time
+
+# Phase 1: Import exceptions for crash prevention
+from .exceptions import CacheEvictionError
 
 
 @dataclass
@@ -60,7 +64,8 @@ class PagedKVCache:
         device: str = "cuda",
         quantize: bool = True,
         layer_retention_strategy: str = "keep_early",
-        enable_prefix_sharing: bool = False
+        enable_prefix_sharing: bool = False,
+        eviction_policy: str = "lru"
     ):
         """
         Args:
@@ -73,6 +78,7 @@ class PagedKVCache:
             quantize: Whether to use INT8 quantization
             layer_retention_strategy: "keep_early" or "keep_all"
             enable_prefix_sharing: Enable KV cache prefix sharing (Stage 3)
+            eviction_policy: Cache eviction policy - "lru" (Phase 1)
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -83,6 +89,7 @@ class PagedKVCache:
         self.quantize = quantize
         self.layer_retention_strategy = layer_retention_strategy
         self.enable_prefix_sharing = enable_prefix_sharing
+        self.eviction_policy = eviction_policy
         
         # Determine which layers to keep in HBM vs stream
         # Early layers (first 25%) stay resident - they're accessed most
@@ -129,6 +136,11 @@ class PagedKVCache:
         self.block_tables: Dict[int, List[int]] = {}  # seq_id -> list of block indices
         self.block_ref_counts: Dict[int, int] = {}  # block_id -> ref count
 
+        # Phase 1: Eviction tracking (LRU)
+        self.block_last_used: Dict[int, float] = {}  # block_id -> timestamp
+        self.block_owner: Dict[int, int] = {}  # block_id -> seq_id
+        self.active_requests: Set[int] = set()  # seq_ids currently in inference
+
         # Prefix sharing (Stage 3)
         self.prefix_cache: Dict[str, List[int]] = {}  # prefix_hash -> block_ids
         self.prefix_min_length = 32  # Minimum tokens for prefix sharing
@@ -141,34 +153,127 @@ class PagedKVCache:
             fp16_size = num_layers * max_blocks * block_size * num_heads * head_dim * 2 * 2  # K+V in bytes
             int8_size = num_layers * max_blocks * block_size * num_heads * head_dim * 1 * 2  # K+V in bytes
             self.stats.memory_saved_gb = (fp16_size - int8_size) / (1024**3)
-    
+
+    def _evict_lru_blocks(self, num_blocks_needed: int) -> int:
+        """
+        Phase 1: Evict least recently used blocks to free space.
+
+        Only evicts blocks from COMPLETED requests (not in active_requests).
+        This ensures we never evict cache for running inference.
+
+        Args:
+            num_blocks_needed: Number of blocks to free
+
+        Returns:
+            Number of blocks successfully freed
+
+        Raises:
+            CacheEvictionError: If cannot free enough blocks
+        """
+        if self.eviction_policy != "lru":
+            return 0
+
+        # Find eviction candidates: blocks not owned by active requests
+        candidates = []
+        for block_id, seq_id in self.block_owner.items():
+            # Only evict from completed requests (not active)
+            if seq_id not in self.active_requests:
+                # Only evict blocks with ref_count == 1 (not shared via prefix caching)
+                if self.block_ref_counts.get(block_id, 0) == 1:
+                    last_used = self.block_last_used.get(block_id, 0.0)
+                    candidates.append((last_used, block_id, seq_id))
+
+        if not candidates:
+            raise CacheEvictionError(
+                f"Cannot evict {num_blocks_needed} blocks: "
+                f"all {len(self.block_owner)} blocks in active use"
+            )
+
+        # Sort by LRU (oldest first)
+        candidates.sort()
+
+        # Evict oldest blocks
+        evicted_count = 0
+        evicted_sequences = set()
+
+        for _, block_id, seq_id in candidates:
+            if evicted_count >= num_blocks_needed:
+                break
+
+            # Free this block
+            self.block_ref_counts[block_id] -= 1
+            if self.block_ref_counts[block_id] == 0:
+                self.free_blocks.add(block_id)
+                self.stats.used_pages -= 1
+                del self.block_ref_counts[block_id]
+                del self.block_owner[block_id]
+                if block_id in self.block_last_used:
+                    del self.block_last_used[block_id]
+                evicted_count += 1
+                evicted_sequences.add(seq_id)
+
+        # Clean up block_tables for evicted sequences
+        for seq_id in evicted_sequences:
+            if seq_id in self.block_tables:
+                # Remove evicted blocks from sequence's block table
+                self.block_tables[seq_id] = [
+                    b for b in self.block_tables[seq_id]
+                    if b in self.block_ref_counts
+                ]
+                # If sequence has no blocks left, remove it entirely
+                if not self.block_tables[seq_id]:
+                    del self.block_tables[seq_id]
+
+        if evicted_count < num_blocks_needed:
+            raise CacheEvictionError(
+                f"Only freed {evicted_count}/{num_blocks_needed} blocks. "
+                f"Need to reject request or wait for capacity."
+            )
+
+        return evicted_count
+
     def allocate_blocks(self, seq_id: int, num_blocks: int) -> List[int]:
         """
         Allocate physical blocks for a sequence.
-        
+
+        Phase 1: Now attempts LRU eviction before failing.
+
         Args:
             seq_id: Sequence identifier
             num_blocks: Number of blocks needed
-            
+
         Returns:
             List of allocated block indices
+
+        Raises:
+            CacheEvictionError: If cannot allocate even after eviction
         """
+        # Phase 1: Attempt eviction if out of memory
         if len(self.free_blocks) < num_blocks:
-            # Eviction policy: LRU (for now, just fail)
-            raise RuntimeError(
-                f"Out of memory: need {num_blocks} blocks, "
-                f"only {len(self.free_blocks)} available"
-            )
-        
+            blocks_needed = num_blocks - len(self.free_blocks)
+            try:
+                self._evict_lru_blocks(blocks_needed)
+            except CacheEvictionError:
+                # Eviction failed, propagate as CacheEvictionError
+                raise CacheEvictionError(
+                    f"Out of memory: need {num_blocks} blocks, "
+                    f"only {len(self.free_blocks)} available, "
+                    f"eviction failed (all blocks in active use)"
+                )
+
+        # Allocate blocks (same logic as before)
         blocks = []
         for _ in range(num_blocks):
             block_id = self.free_blocks.pop()
             blocks.append(block_id)
             self.block_ref_counts[block_id] = 1
-        
+            # Phase 1: Track ownership for eviction
+            self.block_owner[block_id] = seq_id
+            self.block_last_used[block_id] = time.time()
+
         self.block_tables[seq_id] = blocks
         self.stats.used_pages += num_blocks
-        
+
         return blocks
     
     def free_sequence(self, seq_id: int):
@@ -220,7 +325,9 @@ class PagedKVCache:
     ):
         """
         Write KV cache for a layer and sequence.
-        
+
+        Phase 1: Updates LRU timestamps (O(1) overhead).
+
         Args:
             layer_idx: Layer index
             seq_id: Sequence ID
@@ -228,6 +335,8 @@ class PagedKVCache:
             v: Value tensor [batch=1, num_heads, seq_len, head_dim]
             start_pos: Starting position in sequence
         """
+        # Phase 1: Update LRU timestamp for all blocks touched (O(1) per block)
+        current_time = time.time()
         # Handle different input shapes
         if k.dim() == 3:
             # [num_heads, seq_len, head_dim] -> add batch dimension
@@ -264,13 +373,17 @@ class PagedKVCache:
         
         # Write to blocks
         blocks = self.block_tables[seq_id][start_block:end_block]
-        
+
+        # Phase 1: Update LRU timestamps for blocks being written
+        for block_id in blocks:
+            self.block_last_used[block_id] = current_time
+
         # Remove batch dimension: [batch, num_heads, seq_len, head_dim] -> [num_heads, seq_len, head_dim]
         k_flat = k.squeeze(0)
         v_flat = v.squeeze(0)
-        
+
         offset = start_pos % self.block_size
-        
+
         for i, block_id in enumerate(blocks):
             # Calculate how much to write to this block
             block_start = i * self.block_size - offset
@@ -319,27 +432,34 @@ class PagedKVCache:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Read KV cache for a layer and sequence.
-        
+
+        Phase 1: Updates LRU timestamps (O(1) overhead).
+
         Args:
             layer_idx: Layer index
             seq_id: Sequence ID
             start_pos: Starting position
             length: Number of tokens to read
-            
+
         Returns:
             (k, v) tensors [1, num_heads, length, head_dim]
         """
         if seq_id not in self.block_tables:
             self.stats.cache_misses += 1
             return None, None
-        
+
         self.stats.cache_hits += 1
-        
+
         end_pos = start_pos + length
         start_block = start_pos // self.block_size
         end_block = (end_pos - 1) // self.block_size + 1
-        
+
         blocks = self.block_tables[seq_id][start_block:end_block]
+
+        # Phase 1: Update LRU timestamps for blocks being read (O(1) per block)
+        current_time = time.time()
+        for block_id in blocks:
+            self.block_last_used[block_id] = current_time
         
         # Allocate output tensors
         k_out = torch.zeros(
@@ -398,6 +518,34 @@ class PagedKVCache:
         """Reset statistics counters."""
         self.stats.cache_hits = 0
         self.stats.cache_misses = 0
+
+    # ========================================================================
+    # Phase 1: Request Lifecycle Management (for eviction safety)
+    # ========================================================================
+
+    def mark_request_active(self, seq_id: int):
+        """
+        Mark a request as actively running inference.
+
+        Blocks owned by active requests will NEVER be evicted.
+        Call this when starting inference for a sequence.
+
+        Args:
+            seq_id: Sequence ID to mark active
+        """
+        self.active_requests.add(seq_id)
+
+    def mark_request_complete(self, seq_id: int):
+        """
+        Mark a request as completed.
+
+        Blocks owned by completed requests become eviction candidates.
+        Call this when inference finishes for a sequence.
+
+        Args:
+            seq_id: Sequence ID to mark complete
+        """
+        self.active_requests.discard(seq_id)
 
     # ========================================================================
     # Stage 3: Prefix Sharing Methods

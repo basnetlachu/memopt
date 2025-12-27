@@ -15,8 +15,11 @@ import torch
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 import heapq
+
+# Phase 1: Import exceptions for crash prevention
+from .exceptions import QueueFullError
 
 
 # Stage 4: Priority levels
@@ -98,7 +101,8 @@ class ContinuousBatchScheduler:
         memory_limit_gb: float = 40.0,
         enable_affinity: bool = True,
         enable_dynamic_batching: bool = False,  # Stage 4: Dynamic batching
-        device: str = "cuda"
+        device: str = "cuda",
+        max_queue_depth: int = 1000,  # Phase 1: Bounded queue for crash prevention
     ):
         """
         Args:
@@ -108,6 +112,7 @@ class ContinuousBatchScheduler:
             enable_affinity: Enable request affinity routing
             enable_dynamic_batching: Enable Stage 4 optimizations
             device: torch device
+            max_queue_depth: Maximum pending requests (Phase 1: prevents OOM)
         """
         self.max_batch_size = max_batch_size
         self.max_total_tokens = max_total_tokens
@@ -115,8 +120,11 @@ class ContinuousBatchScheduler:
         self.enable_affinity = enable_affinity
         self.enable_dynamic_batching = enable_dynamic_batching
         self.device = device
+        self.max_queue_depth = max_queue_depth  # Phase 1
 
         # Request queues
+        # Phase 1: Keep as list for heapq (heapq requires list, not deque)
+        # Depth limit enforced in add_request()
         self.waiting_queue: List[Tuple[int, float, int, InferenceRequest]] = []  # Priority queue
         self.running_batch: List[InferenceRequest] = []
         self._request_counter = 0  # Tie-breaker for heap queue
@@ -138,9 +146,25 @@ class ContinuousBatchScheduler:
         """
         Add a new inference request to the queue.
 
+        Phase 1: Now enforces queue depth limit to prevent unbounded growth.
+
         Args:
             request: Inference request to add
+
+        Raises:
+            QueueFullError: If queue is at capacity (backpressure signal)
+
+        Performance: O(1) length check + O(log n) heappush (unchanged)
         """
+        # Phase 1: Check queue depth limit BEFORE adding
+        # This prevents unbounded memory growth under overload
+        if len(self.waiting_queue) >= self.max_queue_depth:
+            raise QueueFullError(
+                f"Scheduler queue full ({len(self.waiting_queue)}/{self.max_queue_depth}). "
+                f"System overloaded - reject with HTTP 429."
+            )
+
+        # UNCHANGED: Same priority queue logic
         # Priority queue: (negative priority, timestamp, counter, request)
         # Negative priority so higher priority comes first
         # Counter acts as tie-breaker to avoid comparing InferenceRequest objects
@@ -150,7 +174,7 @@ class ContinuousBatchScheduler:
         )
         self._request_counter += 1
 
-        # Track affinity group (first 50 chars of prompt)
+        # UNCHANGED: Track affinity group (first 50 chars of prompt)
         if self.enable_affinity:
             prefix = request.prompt[:50]
             self.affinity_groups[prefix].append(request.request_id)

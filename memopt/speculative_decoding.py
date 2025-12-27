@@ -58,6 +58,70 @@ class SpeculativeDecoder:
         self.total_accepted_tokens = 0
         self.total_forward_passes = 0
 
+        # Phase 1: Fallback tracking
+        self.consecutive_failures = 0
+        self.total_fallbacks = 0
+        self.max_consecutive_failures = 3  # Disable speculative after 3 failures
+
+    @torch.no_grad()
+    def _generate_standard(
+        self,
+        main_model,
+        input_ids: torch.Tensor,
+        num_tokens: int = 1,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        do_sample: bool = False
+    ) -> torch.Tensor:
+        """
+        Phase 1: Fallback to standard generation when speculative fails.
+
+        This ensures system never crashes from draft model failures.
+        Generates tokens one-at-a-time with main model only.
+
+        Args:
+            main_model: Main model for generation
+            input_ids: Input token IDs [1, seq_len]
+            num_tokens: Number of tokens to generate (default 1)
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            do_sample: Whether to sample
+
+        Returns:
+            Generated tokens [1, num_tokens]
+        """
+        # Ensure input_ids is 2D
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        generated = []
+
+        for _ in range(num_tokens):
+            outputs = main_model(
+                input_ids=input_ids,
+                use_cache=True,
+                return_dict=True
+            )
+
+            logits = outputs.logits
+            if logits.dim() == 2:
+                next_token_logits = logits[-1:, :]
+            else:
+                next_token_logits = logits[:, -1, :]
+
+            # Sample or greedy
+            if do_sample and temperature > 0:
+                next_token_logits = next_token_logits / temperature
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            generated.append(next_token)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+
+        return torch.cat(generated, dim=1) if generated else torch.empty((1, 0), device=input_ids.device)
+
     @torch.no_grad()
     def draft_tokens(
         self,
@@ -274,6 +338,8 @@ class SpeculativeDecoder:
         """
         Generate tokens using speculative decoding.
 
+        Phase 1: Added fallback to standard generation on draft failure.
+
         Args:
             main_model: Main model for verification
             input_ids: Input token IDs [1, seq_len]
@@ -294,25 +360,60 @@ class SpeculativeDecoder:
         generated_tokens = 0
 
         while generated_tokens < max_new_tokens:
-            # Step 1: Draft K tokens with small model
-            draft_ids, draft_logits = self.draft_tokens(
-                current_ids,
-                num_tokens=min(self.num_speculative_tokens, max_new_tokens - generated_tokens),
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample
-            )
+            # Phase 1: Check if speculative decoding should be disabled
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                # Too many failures, use standard generation for this request
+                num_tokens = min(1, max_new_tokens - generated_tokens)
+                accepted_tokens = self._generate_standard(
+                    main_model,
+                    current_ids,
+                    num_tokens=num_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample
+                )
+                current_ids = torch.cat([current_ids, accepted_tokens], dim=1)
+                generated_tokens += accepted_tokens.shape[1]
+                continue
 
-            # Step 2: Verify and correct with main model
-            accepted_tokens, num_accepted = self.verify_and_correct(
-                main_model,
-                current_ids,
-                draft_ids,
-                draft_logits,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample
-            )
+            try:
+                # Step 1: Draft K tokens with small model
+                draft_ids, draft_logits = self.draft_tokens(
+                    current_ids,
+                    num_tokens=min(self.num_speculative_tokens, max_new_tokens - generated_tokens),
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample
+                )
+
+                # Step 2: Verify and correct with main model
+                accepted_tokens, num_accepted = self.verify_and_correct(
+                    main_model,
+                    current_ids,
+                    draft_ids,
+                    draft_logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample
+                )
+
+                # Success - reset failure counter
+                self.consecutive_failures = 0
+
+            except Exception as e:
+                # Phase 1: Draft model failed, fallback to standard generation
+                self.consecutive_failures += 1
+                self.total_fallbacks += 1
+
+                # Generate 1 token with main model only
+                accepted_tokens = self._generate_standard(
+                    main_model,
+                    current_ids,
+                    num_tokens=1,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample
+                )
 
             # Step 3: Append accepted tokens
             current_ids = torch.cat([current_ids, accepted_tokens], dim=1)
@@ -331,6 +432,8 @@ class SpeculativeDecoder:
     def get_stats(self) -> dict:
         """
         Get speculative decoding statistics.
+
+        Phase 1: Now includes fallback tracking.
 
         Returns:
             Dict with acceptance rate and speedup metrics
@@ -353,7 +456,11 @@ class SpeculativeDecoder:
             'total_accepted_tokens': self.total_accepted_tokens,
             'acceptance_rate': acceptance_rate,
             'total_forward_passes': self.total_forward_passes,
-            'theoretical_speedup': theoretical_speedup
+            'theoretical_speedup': theoretical_speedup,
+            # Phase 1: Fallback statistics
+            'consecutive_failures': self.consecutive_failures,
+            'total_fallbacks': self.total_fallbacks,
+            'speculative_enabled': self.consecutive_failures < self.max_consecutive_failures
         }
 
     def reset_stats(self):
