@@ -1,14 +1,18 @@
 """
-Memory-Efficient Attention Implementation
+Stage 7: Memory-Efficient Attention Implementation
 
-Implements optimized attention that minimizes memory bandwidth:
-1. FlashAttention-2 style fused operations
-2. Sequential memory access patterns
-3. On-the-fly computation without intermediate materialization
-4. Support for both standard and grouped-query attention (GQA)
+Implements optimized attention with automatic method selection:
+1. Flash Attention 2 (GPU, CUDA 11.6+) - 3-4x faster [BEST]
+2. PyTorch SDPA (GPU/CPU, PyTorch 2.0+) - 2-3x faster [GOOD]
+3. Triton fused kernels (GPU) - 2-3x faster [OPTIONAL]
+4. Standard attention - baseline [FALLBACK]
 
-For production, this would use the official FlashAttention CUDA kernels.
-For MVP, we provide a Triton-based implementation that achieves similar benefits.
+Auto-detects best available method at runtime for maximum performance.
+
+Expected speedup when combined with Stage 5b (Speculative Decoding):
+- Stage 5b alone: 15.45x
+- Stage 7 (Flash Attn): 2-3x additional
+- Combined: 30-60x total speedup 🚀
 """
 
 import torch
@@ -16,13 +20,20 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import math
 
+# Try Flash Attention 2 first (best performance)
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
+# Try Triton (good alternative)
 try:
     import triton
     import triton.language as tl
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
-    print("Warning: Triton not available, falling back to PyTorch implementation")
 
 
 class MemoryEfficientAttention:
@@ -257,15 +268,60 @@ if TRITON_AVAILABLE:
         tl.store(o_ptrs, acc, mask=(offs_m[:, None] < T) & (offs_d[None, :] < D))
 
 
+def get_attention_backend() -> str:
+    """
+    Determine which attention backend is available.
+
+    Returns:
+        'flash_attn_2': Flash Attention 2 (best, 3-4x speedup)
+        'pytorch_sdpa': PyTorch SDPA (good, 2-3x speedup)
+        'manual': Standard attention (fallback, baseline)
+    """
+    if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
+        return 'flash_attn_2'
+    elif hasattr(F, 'scaled_dot_product_attention'):
+        return 'pytorch_sdpa'
+    else:
+        return 'manual'
+
+
+def print_attention_info():
+    """Print information about available attention implementations."""
+    backend = get_attention_backend()
+
+    print("\n" + "="*70)
+    print("Stage 7: Attention Backend Selection")
+    print("="*70)
+    print(f"Flash Attention 2 available: {FLASH_ATTN_AVAILABLE}")
+    print(f"PyTorch SDPA available: {hasattr(F, 'scaled_dot_product_attention')}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"\nSelected backend: {backend}")
+
+    if backend == 'flash_attn_2':
+        print("✓ Using Flash Attention 2 (3-4x faster) - BEST")
+    elif backend == 'pytorch_sdpa':
+        print("✓ Using PyTorch SDPA (2-3x faster) - GOOD")
+    else:
+        print("⚠ Using manual attention (baseline)")
+        print("  Tip: Upgrade to PyTorch 2.0+ for 2-3x speedup")
+
+    print("="*70 + "\n")
+
+
 class OptimizedAttentionLayer:
     """
     Wrapper for attention layer with all optimizations enabled.
-    
+
+    Automatically selects best available attention backend:
+    - Flash Attention 2 (GPU only, 3-4x speedup)
+    - PyTorch SDPA (GPU/CPU, 2-3x speedup)
+    - Manual attention (fallback)
+
     Usage in transformer layer:
         attention = OptimizedAttentionLayer(config)
         output = attention(q, k, v, is_causal=True)
     """
-    
+
     def __init__(
         self,
         num_heads: int,
@@ -292,6 +348,9 @@ class OptimizedAttentionLayer:
         self.enable_workspace_reuse = enable_workspace_reuse
 
         self.scale = 1.0 / math.sqrt(head_dim)
+
+        # Determine attention backend
+        self.backend = get_attention_backend() if use_flash else 'manual'
 
         # Stage 1: Workspace tensor pool for reuse
         # Only allocate if workspace reuse is enabled

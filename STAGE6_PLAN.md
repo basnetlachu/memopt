@@ -227,7 +227,7 @@ python benchmark_stage6.py --model gpt2-xl --num-gpus 2
 ### Level 2: Large Model
 ```bash
 # Test with Llama-2-13B (requires Stage 6)
-python benchmark_stage6.py --model meta-llama/Llama-2-13b-hf --num-gpus 2
+python benchmark_stage6.py --model meta-llama/Llama-2-13b-hf --num-gpus 
 ```
 
 ### Level 3: Very Large Model
