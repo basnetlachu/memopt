@@ -8,6 +8,7 @@ and automatic rollback on failure.
 import time
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass, field
+from collections import deque
 from enum import Enum
 from threading import Lock
 import json
@@ -120,7 +121,8 @@ class DeploymentController:
         self._lock = Lock()
         self._current_deployment: Optional[DeploymentProgress] = None
         self._node_states: Dict[str, NodeDeploymentState] = {}
-        self._deployment_history: List[DeploymentProgress] = []
+        # Phase 1: Bounded history to prevent memory leak (max 1000 deployments)
+        self._deployment_history: deque = deque(maxlen=1000)
 
     def start_deployment(
         self,

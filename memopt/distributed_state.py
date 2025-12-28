@@ -420,7 +420,7 @@ def init_state_manager(
 
     Args:
         node_id: Unique node identifier
-        backend: State backend (defaults to InMemory)
+        backend: State backend (defaults to runtime-selected backend)
         gpu_count: Number of GPUs on this node
         memory_gb: Total memory in GB
 
@@ -430,7 +430,14 @@ def init_state_manager(
     global _global_state_manager
 
     if backend is None:
-        backend = InMemoryBackend()
+        # Production readiness: Use runtime factory to select backend
+        # Dev mode → InMemoryBackend, Prod mode → RedisBackend
+        try:
+            from memopt.runtime import create_distributed_state_backend
+            backend = create_distributed_state_backend()
+        except ImportError:
+            # Fallback for standalone usage without runtime module
+            backend = InMemoryBackend()
 
     _global_state_manager = DistributedStateManager(
         node_id=node_id,
