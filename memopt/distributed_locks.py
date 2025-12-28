@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Optional
 from threading import Lock as ThreadLock
-from memopt.distributed_state import DistributedStateBackend
+from Memopt.distributed_state import DistributedStateBackend
 
 
 class DistributedLockError(Exception):
@@ -143,7 +143,7 @@ class DistributedLock:
 
     def _get_lock_key(self) -> str:
         """Get distributed state key for this lock."""
-        return f"/memopt/locks/{self.name}"
+        return f"/Memopt/locks/{self.name}"
 
     def is_locked(self) -> bool:
         """Check if lock is currently held."""
@@ -297,7 +297,7 @@ class DistributedReadWriteLock:
         """Try to acquire read lock."""
         with self._local_lock:
             # Check if write lock exists
-            write_key = f"/memopt/locks/{self.name}/write"
+            write_key = f"/Memopt/locks/{self.name}/write"
             write_lock = self.backend.get(write_key)
 
             if write_lock is not None:
@@ -306,7 +306,7 @@ class DistributedReadWriteLock:
 
             # Add to readers set
             lock_id = f"{self.node_id}_{uuid.uuid4().hex[:8]}"
-            read_key = f"/memopt/locks/{self.name}/readers/{lock_id}"
+            read_key = f"/Memopt/locks/{self.name}/readers/{lock_id}"
 
             success = self.backend.set(read_key, lock_id, ttl=self.lock_timeout)
 
@@ -321,7 +321,7 @@ class DistributedReadWriteLock:
         """Try to acquire write lock."""
         with self._local_lock:
             # Check if any readers exist
-            readers_prefix = f"/memopt/locks/{self.name}/readers/"
+            readers_prefix = f"/Memopt/locks/{self.name}/readers/"
             readers = self.backend.list_keys(readers_prefix)
 
             if len(readers) > 0:
@@ -329,7 +329,7 @@ class DistributedReadWriteLock:
                 return False
 
             # Check if write lock exists
-            write_key = f"/memopt/locks/{self.name}/write"
+            write_key = f"/Memopt/locks/{self.name}/write"
             write_lock = self.backend.get(write_key)
 
             if write_lock is not None:
@@ -349,12 +349,12 @@ class DistributedReadWriteLock:
 
     def _release_read(self):
         """Release read lock."""
-        read_key = f"/memopt/locks/{self.name}/readers/{self._lock_id}"
+        read_key = f"/Memopt/locks/{self.name}/readers/{self._lock_id}"
         self.backend.delete(read_key)
 
     def _release_write(self):
         """Release write lock."""
-        write_key = f"/memopt/locks/{self.name}/write"
+        write_key = f"/Memopt/locks/{self.name}/write"
         self.backend.delete(write_key)
 
 

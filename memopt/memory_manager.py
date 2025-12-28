@@ -1,5 +1,5 @@
 """
-Smart Memory Manager for MemOpt
+Smart Memory Manager for Memopt
 Reduces memory usage by 4-5x through intelligent allocation
 WITHOUT affecting performance (6.4x speedup maintained)
 """

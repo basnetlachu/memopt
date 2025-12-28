@@ -34,7 +34,7 @@ except ImportError:
             pass
 
 import torch
-from memopt.kv_cache import PagedKVCache
+from Memopt.kv_cache import PagedKVCache
 
 
 class TestPrefixSharing:

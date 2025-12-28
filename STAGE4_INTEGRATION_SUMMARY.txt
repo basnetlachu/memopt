@@ -16,11 +16,11 @@ FILES MODIFIED:
    - Updated default stages to include "4"
    - Updated docstring
 
-3. memopt/scheduler.py
+3. Memopt/scheduler.py
    - Added Priority class (URGENT, HIGH, NORMAL, LOW, BACKGROUND)
    - Updated InferenceRequest default priority to Priority.NORMAL
 
-4. memopt/model.py
+4. Memopt/model.py
    - Added "ultra" optimization preset
    - Added generate_with_priority() method
 

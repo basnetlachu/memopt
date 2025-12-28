@@ -1,3 +1,3 @@
 """
-MemOpt Test Suite
+Memopt Test Suite
 """

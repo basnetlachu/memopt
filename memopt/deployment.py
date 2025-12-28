@@ -325,8 +325,8 @@ class DeploymentController:
         Stub - integrate with Kubernetes, Docker, etc.
         """
         # TODO: Implement actual deployment
-        # kubectl set image deployment/memopt memopt=memopt:v2.0
-        # Or: docker pull memopt:v2.0 && docker restart memopt
+        # kubectl set image deployment/Memopt Memopt=Memopt:v2.0
+        # Or: docker pull Memopt:v2.0 && docker restart Memopt
         time.sleep(1)  # Simulate deployment
 
     def _check_node_health(self, node_id: str) -> HealthCheckResult:
@@ -406,7 +406,7 @@ class DeploymentController:
     def _rollback_node(self, node_id: str):
         """Rollback a single node to previous version."""
         # TODO: Implement actual rollback
-        # kubectl rollout undo deployment/memopt
+        # kubectl rollout undo deployment/Memopt
         pass
 
     def get_deployment_status(self) -> Optional[Dict]:

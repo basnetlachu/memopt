@@ -9,7 +9,7 @@ import time
 from typing import Optional, Dict
 from dataclasses import dataclass
 from threading import Lock
-from memopt.distributed_state import DistributedStateBackend
+from Memopt.distributed_state import DistributedStateBackend
 import json
 
 
@@ -185,7 +185,7 @@ class DistributedRateLimiter:
 
     def _get_global_state(self) -> Optional[RateLimitState]:
         """Get global rate limit state."""
-        key = f"/memopt/ratelimit/{self.name}"
+        key = f"/Memopt/ratelimit/{self.name}"
         value = self.backend.get(key)
 
         if value:
@@ -199,7 +199,7 @@ class DistributedRateLimiter:
 
     def _set_global_state(self, state: RateLimitState):
         """Set global rate limit state."""
-        key = f"/memopt/ratelimit/{self.name}"
+        key = f"/Memopt/ratelimit/{self.name}"
         value = json.dumps(state.to_dict())
         self.backend.set(key, value, ttl=5)  # 5 second TTL
 

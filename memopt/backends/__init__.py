@@ -1,5 +1,5 @@
 """
-MemOpt Production Backends
+Memopt Production Backends
 
 This package contains production-ready implementations of:
 - Redis-based distributed state (RedisBackend)
@@ -14,19 +14,19 @@ All backends are production-hardened with:
 - Comprehensive error handling
 """
 
-from memopt.backends.redis_backend import (
+from Memopt.backends.redis_backend import (
     RedisBackend,
     RedisConfig,
     create_redis_backend
 )
 
-from memopt.backends.redis_queue import (
+from Memopt.backends.redis_queue import (
     RedisRequestQueue,
     RedisQueueConfig,
     consume_requests
 )
 
-from memopt.backends.vllm_adapter import (
+from Memopt.backends.vllm_adapter import (
     VLLMAdapter,
     VLLMConfig,
     VLLMSyncAdapter,

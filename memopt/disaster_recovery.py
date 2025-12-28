@@ -87,7 +87,7 @@ class DisasterRecoveryManager:
 
     def __init__(
         self,
-        backup_location: str = "/var/lib/memopt/backups",
+        backup_location: str = "/var/lib/Memopt/backups",
         retention_days: int = 30
     ):
         """

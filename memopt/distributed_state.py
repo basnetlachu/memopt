@@ -240,7 +240,7 @@ class DistributedStateManager:
         )
 
         # Store in distributed state
-        key = f"/memopt/nodes/{self.node_id}"
+        key = f"/Memopt/nodes/{self.node_id}"
         value = json.dumps(self.node_info.to_dict())
 
         return self.backend.set(key, value, ttl=self.heartbeat_timeout)
@@ -255,7 +255,7 @@ class DistributedStateManager:
         self._heartbeat_running = False
         self._heartbeat_event.set()
 
-        key = f"/memopt/nodes/{self.node_id}"
+        key = f"/Memopt/nodes/{self.node_id}"
         return self.backend.delete(key)
 
     def heartbeat(self) -> bool:
@@ -270,7 +270,7 @@ class DistributedStateManager:
 
         self.node_info.last_heartbeat = time.time()
 
-        key = f"/memopt/nodes/{self.node_id}"
+        key = f"/Memopt/nodes/{self.node_id}"
         value = json.dumps(self.node_info.to_dict())
 
         return self.backend.set(key, value, ttl=self.heartbeat_timeout)
@@ -302,7 +302,7 @@ class DistributedStateManager:
             ClusterState with all node information
         """
         # List all nodes
-        node_keys = self.backend.list_keys("/memopt/nodes/")
+        node_keys = self.backend.list_keys("/Memopt/nodes/")
 
         nodes: Dict[str, NodeInfo] = {}
         total_gpus = 0
@@ -353,7 +353,7 @@ class DistributedStateManager:
 
         self.node_info.state = state
 
-        key = f"/memopt/nodes/{self.node_id}"
+        key = f"/Memopt/nodes/{self.node_id}"
         value = json.dumps(self.node_info.to_dict())
 
         return self.backend.set(key, value, ttl=self.heartbeat_timeout)
@@ -373,7 +373,7 @@ class DistributedStateManager:
 
         self.node_info.role = role
 
-        key = f"/memopt/nodes/{self.node_id}"
+        key = f"/Memopt/nodes/{self.node_id}"
         value = json.dumps(self.node_info.to_dict())
 
         return self.backend.set(key, value, ttl=self.heartbeat_timeout)
@@ -433,7 +433,7 @@ def init_state_manager(
         # Production readiness: Use runtime factory to select backend
         # Dev mode → InMemoryBackend, Prod mode → RedisBackend
         try:
-            from memopt.runtime import create_distributed_state_backend
+            from Memopt.runtime import create_distributed_state_backend
             backend = create_distributed_state_backend()
         except ImportError:
             # Fallback for standalone usage without runtime module

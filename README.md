@@ -1,4 +1,4 @@
-# MemOpt: Production-Ready LLM Inference Optimization
+# Memopt: Production-Ready LLM Inference Optimization
 
 **Memory-optimized LLM inference engine delivering 15-60x speedup through advanced optimization techniques.**
 
@@ -11,7 +11,7 @@
 ## 🎯 Quick Start
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 # Initialize with best performance settings
 model = OptimizedLLM(
@@ -37,14 +37,14 @@ response = model.generate(
 | Configuration | Throughput | Speedup | Status |
 |--------------|-----------|---------|--------|
 | Baseline (unoptimized) | 35.6 tok/s | 1.0x | Reference |
-| **MemOpt (flash level)** | **594.2 tok/s** | **16.71x** | ✅ **Verified** |
+| **Memopt (flash level)** | **594.2 tok/s** | **16.71x** | ✅ **Verified** |
 | With Flash Attention 2 (GPU) | 1,800-2,300 tok/s | 50-60x | 🚀 Available |
 
 ### Cost Savings
 
 **For 10B tokens/day:**
 - Baseline cost: $373,979/day
-- MemOpt cost: $22,380/day
+- Memopt cost: $22,380/day
 - **Savings: $351,599/day = $128M/year**
 - **ROI: 2,560x in first year**
 
@@ -54,17 +54,17 @@ response = model.generate(
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/memopt.git
-cd memopt
+git clone https://github.com/yourusername/Memopt.git
+cd Memopt
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Install MemOpt
+# Install Memopt
 pip install -e .
 
 # Verify installation
-python -c "from memopt import OptimizedLLM; print('✅ Installation successful')"
+python -c "from Memopt import OptimizedLLM; print('✅ Installation successful')"
 ```
 
 ### Optional: Flash Attention 2 (for 50-60x speedup)
@@ -76,7 +76,7 @@ pip install wheel packaging ninja
 pip install flash-attn --no-build-isolation
 ```
 
-**Note:** Flash Attention 2 is optional. MemOpt works great without it (16x speedup via PyTorch SDPA).
+**Note:** Flash Attention 2 is optional. Memopt works great without it (16x speedup via PyTorch SDPA).
 
 ---
 
@@ -113,7 +113,7 @@ pip install flash-attn --no-build-isolation
 ### Basic Generation
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
 response = model.generate("Explain quantum computing:", max_tokens=256)
@@ -141,7 +141,7 @@ print(f"Memory: {stats.peak_memory_mb:.1f} MB")
 
 ```python
 from fastapi import FastAPI
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 app = FastAPI()
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
@@ -174,14 +174,14 @@ model = OptimizedLLM(
 
 ```bash
 # Build image
-docker build -t memopt:latest .
+docker build -t Memopt:latest .
 
 # Run benchmark
-docker run --gpus all memopt:latest \
+docker run --gpus all Memopt:latest \
   python3 benchmark.py --model gpt2-xl --optimization-level flash
 
 # Run API server
-docker-compose up memopt-api
+docker-compose up Memopt-api
 ```
 
 Access API docs at: http://localhost:8000/docs
@@ -190,14 +190,14 @@ Access API docs at: http://localhost:8000/docs
 
 ## 🏭 Production Deployment
 
-MemOpt supports two deployment modes: **Development** and **Production**.
+Memopt supports two deployment modes: **Development** and **Production**.
 
 ### Development Mode (Default)
 
 For local testing and development:
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 # Uses in-memory backends and HuggingFace models
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
@@ -217,7 +217,7 @@ For multi-GPU clusters with distributed coordination:
 
 ```bash
 # Production mode selector
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 
 # Redis connection (required in prod)
 export REDIS_URL=redis://localhost:6379
@@ -241,7 +241,7 @@ export TENSOR_PARALLEL_SIZE=2
 docker run -d -p 6379:6379 redis:7-alpine
 
 # 2. Set environment variables
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 export REDIS_URL=redis://localhost:6379
 export MODEL_NAME=gpt2  # Small model for testing
 
@@ -312,7 +312,7 @@ See [PRODUCTION_REQUIREMENTS.md](PRODUCTION_REQUIREMENTS.md) for complete deploy
 
 | Environment Variable | Required | Default | Description |
 |---------------------|----------|---------|-------------|
-| `MEMOPT_ENV` | No | `dev` | Runtime mode: `dev`, `test`, or `prod` |
+| `Memopt_ENV` | No | `dev` | Runtime mode: `dev`, `test`, or `prod` |
 | `REDIS_URL` | Prod only | - | Redis connection URL |
 | `MODEL_NAME` | Prod only | - | HuggingFace model name or path |
 | `REDIS_MAX_CONNECTIONS` | No | `50` | Redis connection pool size |
@@ -325,7 +325,7 @@ See [PRODUCTION_REQUIREMENTS.md](PRODUCTION_REQUIREMENTS.md) for complete deploy
 Production mode performs strict validation at startup:
 
 ```python
-from memopt.runtime import validate_production_runtime
+from Memopt.runtime import validate_production_runtime
 
 # Crashes if prod requirements not met:
 # - Missing REDIS_URL
@@ -485,7 +485,7 @@ class ProfileStats:
 pytest tests/
 
 # Run with coverage
-pytest --cov=memopt tests/
+pytest --cov=Memopt tests/
 
 # Test specific stage
 pytest tests/test_stage1.py
@@ -503,7 +503,7 @@ pytest tests/test_stage1.py
 
 ```bash
 # Check attention backend
-python -c "from memopt.attention import get_attention_backend; print(get_attention_backend())"
+python -c "from Memopt.attention import get_attention_backend; print(get_attention_backend())"
 
 # Should show: 'pytorch_sdpa' or 'flash_attn_2'
 # If 'manual': pip install torch>=2.0.0
@@ -597,7 +597,7 @@ MIT License - see LICENSE file for details.
 **Get started in 3 lines:**
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
 print(model.generate("Hello world", max_tokens=50))
 ```

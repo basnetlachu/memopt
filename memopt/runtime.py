@@ -2,8 +2,8 @@
 Runtime Configuration and Backend Selection
 
 Provides factory functions that select appropriate backends based on environment:
-- MEMOPT_ENV=dev → In-memory, simulated (for testing)
-- MEMOPT_ENV=prod → Redis, vLLM (for production)
+- Memopt_ENV=dev → In-memory, simulated (for testing)
+- Memopt_ENV=prod → Redis, vLLM (for production)
 
 In production mode, fails fast if required configuration is missing.
 """
@@ -28,7 +28,7 @@ class RuntimeConfig:
     Runtime configuration from environment variables.
 
     Required for prod:
-    - MEMOPT_ENV=prod
+    - Memopt_ENV=prod
     - REDIS_URL=redis://host:port
     - MODEL_NAME=meta-llama/Llama-2-7b-hf (or model path)
 
@@ -40,12 +40,12 @@ class RuntimeConfig:
 
     def __init__(self):
         # Runtime mode
-        env_mode = os.getenv("MEMOPT_ENV", "dev").lower()
+        env_mode = os.getenv("Memopt_ENV", "dev").lower()
         try:
             self.mode = RuntimeMode(env_mode)
         except ValueError:
             raise ValueError(
-                f"Invalid MEMOPT_ENV='{env_mode}'. "
+                f"Invalid Memopt_ENV='{env_mode}'. "
                 f"Must be one of: {[m.value for m in RuntimeMode]}"
             )
 
@@ -77,7 +77,7 @@ class RuntimeConfig:
                 "Production configuration incomplete:\n" +
                 "\n".join(f"  - {e}" for e in errors) +
                 "\n\nRequired environment variables:\n"
-                "  export MEMOPT_ENV=prod\n"
+                "  export Memopt_ENV=prod\n"
                 "  export REDIS_URL=redis://localhost:6379\n"
                 "  export MODEL_NAME=meta-llama/Llama-2-7b-hf\n"
             )
@@ -127,7 +127,7 @@ def create_inference_engine(model_name: Optional[str] = None):
     if config.is_prod:
         # Production: Use vLLM
         try:
-            from memopt.backends.vllm_adapter import create_vllm_adapter
+            from Memopt.backends.vllm_adapter import create_vllm_adapter
         except ImportError:
             raise RuntimeError(
                 "vLLM not installed. Required for production mode.\n"
@@ -149,7 +149,7 @@ def create_inference_engine(model_name: Optional[str] = None):
 
     else:
         # Dev/Test: Use HuggingFace model
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         model = model or "gpt2"  # Default for dev
         logger.info(f"Creating HuggingFace model (dev mode): {model}")
@@ -175,7 +175,7 @@ def create_distributed_state_backend():
     if config.is_prod:
         # Production: Use Redis
         try:
-            from memopt.backends.redis_backend import create_redis_backend
+            from Memopt.backends.redis_backend import create_redis_backend
         except ImportError:
             raise RuntimeError(
                 "redis-py not installed. Required for production mode.\n"
@@ -208,7 +208,7 @@ def create_distributed_state_backend():
 
     else:
         # Dev/Test: Use in-memory
-        from memopt.distributed_state import InMemoryBackend
+        from Memopt.distributed_state import InMemoryBackend
 
         logger.info("Creating in-memory backend (dev mode)")
         return InMemoryBackend()
@@ -233,7 +233,7 @@ def create_request_queue():
         # Production: Use Redis Streams
         try:
             import redis
-            from memopt.backends.redis_queue import RedisRequestQueue
+            from Memopt.backends.redis_queue import RedisRequestQueue
         except ImportError:
             raise RuntimeError(
                 "redis-py not installed. Required for production mode.\n"

@@ -32,7 +32,7 @@ See `PRODUCTION_REQUIREMENTS.md` for complete integration guide.
 
 ## 📂 FILES IMPLEMENTED
 
-### 1. `memopt/backends/redis_backend.py` ✅ (430 lines)
+### 1. `Memopt/backends/redis_backend.py` ✅ (430 lines)
 **Production Redis backend for distributed state**
 
 Features:
@@ -52,7 +52,7 @@ Dependencies: `redis>=4.5.0`
 
 ---
 
-### 2. `memopt/backends/redis_queue.py` ✅ (450 lines)
+### 2. `Memopt/backends/redis_queue.py` ✅ (450 lines)
 **Production request queue using Redis Streams**
 
 Features:
@@ -78,7 +78,7 @@ Dependencies: `redis>=4.5.0`
 
 ---
 
-### 3. `memopt/backends/vllm_adapter.py` ✅ (380 lines)
+### 3. `Memopt/backends/vllm_adapter.py` ✅ (380 lines)
 **vLLM inference engine integration**
 
 Features:
@@ -181,22 +181,22 @@ pip install prometheus-client
 ## 🗄️ REDIS SCHEMA
 
 ### Distributed State Keys
-- `/memopt/leader/lease` - Leader election lease (JSON, TTL 10s)
-- `/memopt/locks/<name>` - Distributed lock IDs
-- `/memopt/ratelimit/<name>` - Rate limit state (JSON, TTL 5s)
-- `/memopt/nodes/<node_id>` - Node registration (JSON, TTL based on heartbeat)
+- `/Memopt/leader/lease` - Leader election lease (JSON, TTL 10s)
+- `/Memopt/locks/<name>` - Distributed lock IDs
+- `/Memopt/ratelimit/<name>` - Rate limit state (JSON, TTL 5s)
+- `/Memopt/nodes/<node_id>` - Node registration (JSON, TTL based on heartbeat)
 
 ### Request Queue Streams
-- `memopt:requests` - Main request queue (max 100k messages)
-- `memopt:requests:dlq` - Dead-letter queue
-- Consumer group: `memopt-workers`
+- `Memopt:requests` - Main request queue (max 100k messages)
+- `Memopt:requests:dlq` - Dead-letter queue
+- Consumer group: `Memopt-workers`
 
 Operations:
 ```bash
 # Monitor queue
-redis-cli XLEN memopt:requests
-redis-cli XPENDING memopt:requests memopt-workers
-redis-cli XLEN memopt:requests:dlq
+redis-cli XLEN Memopt:requests
+redis-cli XPENDING Memopt:requests Memopt-workers
+redis-cli XLEN Memopt:requests:dlq
 ```
 
 ---

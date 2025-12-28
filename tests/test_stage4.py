@@ -16,7 +16,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from memopt.scheduler import Priority, InferenceRequest, ContinuousBatchScheduler
+from Memopt.scheduler import Priority, InferenceRequest, ContinuousBatchScheduler
 import torch
 
 
@@ -234,7 +234,7 @@ class TestStage4Integration:
 
     def test_ultra_preset_exists(self):
         """Test that 'ultra' optimization preset exists."""
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         presets = OptimizedLLM.OPTIMIZATION_PRESETS
         assert "ultra" in presets, "'ultra' preset should exist for Stage 4"
@@ -242,7 +242,7 @@ class TestStage4Integration:
 
     def test_ultra_preset_config(self):
         """Test that 'ultra' preset has Stage 4 features."""
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         ultra_config = OptimizedLLM.OPTIMIZATION_PRESETS["ultra"]
 
@@ -260,7 +260,7 @@ class TestStage4Integration:
 
     def test_generate_with_priority_method_exists(self):
         """Test that generate_with_priority method exists."""
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         # Check method exists
         assert hasattr(OptimizedLLM, 'generate_with_priority'), "generate_with_priority method should exist"
@@ -268,7 +268,7 @@ class TestStage4Integration:
 
     def test_scheduler_has_dynamic_batching_flag(self):
         """Test that scheduler receives dynamic batching flag."""
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         # This would require model loading, so just check the parameter exists
         scheduler = ContinuousBatchScheduler(enable_dynamic_batching=True, device="cpu")

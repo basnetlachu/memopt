@@ -1,7 +1,7 @@
 """
 vLLM Integration Adapter
 
-Integrates vLLM inference engine with MemOpt's distributed control plane.
+Integrates vLLM inference engine with Memopt's distributed control plane.
 
 CRITICAL ARCHITECTURE NOTES:
 ============================
@@ -15,12 +15,12 @@ vLLM is a complete inference engine that owns:
 
 This adapter:
 - Wraps vLLM's AsyncLLMEngine
-- Exposes MemOpt's InferenceRequest/Response API
+- Exposes Memopt's InferenceRequest/Response API
 - Delegates ALL GPU work to vLLM
 - Preserves existing API compatibility
 
 WHAT THIS ADAPTER DOES:
-- Request format conversion (MemOpt ↔ vLLM)
+- Request format conversion (Memopt ↔ vLLM)
 - Async request submission
 - Response streaming
 - Error handling and retries
@@ -55,8 +55,8 @@ except ImportError:
     AsyncEngineArgs = None
     RequestOutput = None
 
-from memopt.scheduler import InferenceRequest
-from memopt.inference import InferenceResponse
+from Memopt.scheduler import InferenceRequest
+from Memopt.inference import InferenceResponse
 
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ class VLLMAdapter:
     """
     Production adapter for vLLM inference engine.
 
-    Integrates vLLM with MemOpt's distributed control plane while
+    Integrates vLLM with Memopt's distributed control plane while
     preserving all vLLM optimizations (PagedAttention, continuous batching).
 
     This is a THIN adapter - all heavy lifting done by vLLM.
@@ -165,16 +165,16 @@ class VLLMAdapter:
         Generate tokens for request (streaming).
 
         Args:
-            request: MemOpt inference request
+            request: Memopt inference request
 
         Yields:
             InferenceResponse objects as tokens are generated
 
         This method:
-        1. Converts MemOpt request to vLLM SamplingParams
+        1. Converts Memopt request to vLLM SamplingParams
         2. Submits to vLLM engine
         3. Streams tokens as they're generated
-        4. Converts vLLM output to MemOpt response
+        4. Converts vLLM output to Memopt response
         """
         if self._engine is None:
             raise RuntimeError("vLLM engine not initialized. Call initialize() first.")

@@ -1,11 +1,11 @@
 #!/bin/bash
-# MemOpt Quick Setup Script
-# Builds and runs MemOpt in Docker
+# Memopt Quick Setup Script
+# Builds and runs Memopt in Docker
 
 set -e
 
 echo "========================================"
-echo "MemOpt Docker Quick Setup"
+echo "Memopt Docker Quick Setup"
 echo "========================================"
 
 # Colors
@@ -37,7 +37,7 @@ mkdir -p models outputs examples
 # Build image
 echo ""
 echo "Building Docker image..."
-docker build -t memopt:latest .
+docker build -t Memopt:latest .
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ Image built successfully${NC}"
@@ -49,7 +49,7 @@ fi
 # Run quick test
 echo ""
 echo "Running quick test..."
-docker run --rm --gpus all memopt:latest \
+docker run --rm --gpus all Memopt:latest \
     python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 
 # Prompt for benchmark
@@ -62,7 +62,7 @@ if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
     echo "Running benchmark (this may take a few minutes)..."
     docker run --gpus all \
         -v $(pwd)/outputs:/app/outputs \
-        memopt:latest \
+        Memopt:latest \
         python3 benchmark.py --model gpt2 --mode both --num-prompts 3
     
     echo ""
@@ -79,14 +79,14 @@ echo ""
 echo "Quick commands:"
 echo ""
 echo "  # Run benchmark"
-echo "  docker run --gpus all -v \$(pwd)/outputs:/app/outputs memopt:latest \\"
+echo "  docker run --gpus all -v \$(pwd)/outputs:/app/outputs Memopt:latest \\"
 echo "    python3 benchmark.py --model gpt2-xl --mode both"
 echo ""
 echo "  # Start API server"
 echo "  docker-compose up -d"
 echo ""
 echo "  # Interactive shell"
-echo "  docker run --gpus all -it memopt:latest bash"
+echo "  docker run --gpus all -it Memopt:latest bash"
 echo ""
 echo "For more info, see DOCKER_README.md"
 echo ""

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production MemOpt Worker
+Production Memopt Worker
 
 Complete end-to-end example of a production inference worker using:
 - Redis Streams for request queue
@@ -42,14 +42,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import redis
 
-from memopt.backends import (
+from Memopt.backends import (
     create_redis_backend,
     RedisRequestQueue,
     create_vllm_adapter
 )
-from memopt.leader_election import LeaderElection
-from memopt.metrics import MetricsCollector
-from memopt.scheduler import InferenceRequest
+from Memopt.leader_election import LeaderElection
+from Memopt.metrics import MetricsCollector
+from Memopt.scheduler import InferenceRequest
 
 
 # Configure logging
@@ -310,7 +310,7 @@ class ProductionWorker:
 
 async def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='MemOpt Production Worker')
+    parser = argparse.ArgumentParser(description='Memopt Production Worker')
     parser.add_argument('--redis-host', default=os.getenv('REDIS_HOST', 'localhost'),
                         help='Redis hostname')
     parser.add_argument('--redis-port', type=int, default=int(os.getenv('REDIS_PORT', 6379)),

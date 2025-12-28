@@ -266,7 +266,7 @@ class MemoryProfiler:
         stats = self.get_stats()
         
         print("\n" + "="*70)
-        print("MEMOPT PROFILING RESULTS")
+        print("Memopt PROFILING RESULTS")
         print("="*70)
         
         print("\n📊 PERFORMANCE METRICS")

@@ -1,5 +1,5 @@
 """
-MemOpt FastAPI Server
+Memopt FastAPI Server
 Production-ready API for optimized LLM inference
 """
 
@@ -9,11 +9,11 @@ from typing import Optional, List
 import torch
 import uvicorn
 
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 # Initialize FastAPI
 app = FastAPI(
-    title="MemOpt API",
+    title="Memopt API",
     description="Memory-optimized LLM inference API - 6x faster, 82% cheaper",
     version="1.0.0"
 )
@@ -71,7 +71,7 @@ def get_model(model_name: str, optimization_level: str) -> OptimizedLLM:
 async def root():
     """Root endpoint"""
     return {
-        "name": "MemOpt API",
+        "name": "Memopt API",
         "version": "1.0.0",
         "description": "Memory-optimized LLM inference - 6x faster, 82% cheaper",
         "endpoints": {
@@ -105,7 +105,7 @@ async def health():
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
     """
-    Generate text using MemOpt optimized inference
+    Generate text using Memopt optimized inference
     
     Example:
     ```
@@ -187,7 +187,7 @@ async def get_stats():
 
 if __name__ == "__main__":
     print("="*70)
-    print("MemOpt API Server")
+    print("Memopt API Server")
     print("="*70)
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():

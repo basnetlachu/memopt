@@ -1,4 +1,4 @@
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 # Before (Stage 0)
 model = OptimizedLLM("gpt2", optimization_level="conservative")

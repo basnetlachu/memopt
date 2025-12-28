@@ -9,7 +9,7 @@ import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from threading import Lock
-from memopt.distributed_state import DistributedStateBackend, NodeInfo
+from Memopt.distributed_state import DistributedStateBackend, NodeInfo
 import json
 
 
@@ -178,7 +178,7 @@ class ClusterResourceTracker:
         Args:
             resources: Current resource state
         """
-        key = f"/memopt/resources/nodes/{self.node_id}"
+        key = f"/Memopt/resources/nodes/{self.node_id}"
         value = json.dumps(resources.to_dict())
 
         # Store with TTL (2x update interval for fault tolerance)
@@ -195,7 +195,7 @@ class ClusterResourceTracker:
             ClusterResources with all node information
         """
         # List all node resource keys
-        node_keys = self.backend.list_keys("/memopt/resources/nodes/")
+        node_keys = self.backend.list_keys("/Memopt/resources/nodes/")
 
         nodes: Dict[str, NodeResources] = {}
         total_gpus = 0
@@ -265,7 +265,7 @@ class ClusterResourceTracker:
         Returns:
             NodeResources or None if not found
         """
-        key = f"/memopt/resources/nodes/{node_id}"
+        key = f"/Memopt/resources/nodes/{node_id}"
         value = self.backend.get(key)
 
         if value:

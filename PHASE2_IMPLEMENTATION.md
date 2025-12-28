@@ -9,7 +9,7 @@
 
 ## Overview
 
-Phase 2 transforms MemOpt from a crash-resistant system into an observable, self-healing hyperscale platform. It provides the monitoring, alerting, and degradation capabilities required to operate 10,000 GPU clusters.
+Phase 2 transforms Memopt from a crash-resistant system into an observable, self-healing hyperscale platform. It provides the monitoring, alerting, and degradation capabilities required to operate 10,000 GPU clusters.
 
 ### Key Capabilities Added:
 
@@ -23,7 +23,7 @@ Phase 2 transforms MemOpt from a crash-resistant system into an observable, self
 
 ## Components Implemented
 
-### 1. Metrics Collection System (`memopt/metrics.py`)
+### 1. Metrics Collection System (`Memopt/metrics.py`)
 
 **Status:** ✅ Complete (390 lines)
 
@@ -37,31 +37,31 @@ Phase 2 transforms MemOpt from a crash-resistant system into an observable, self
 - **Standard Metrics**:
   ```python
   # Request metrics
-  memopt_requests_total
-  memopt_requests_active
-  memopt_requests_rejected_total
+  Memopt_requests_total
+  Memopt_requests_active
+  Memopt_requests_rejected_total
 
   # Performance metrics
-  memopt_latency_ms (p50/p95/p99)
-  memopt_throughput_tokens_per_sec
-  memopt_tokens_generated_total
+  Memopt_latency_ms (p50/p95/p99)
+  Memopt_throughput_tokens_per_sec
+  Memopt_tokens_generated_total
 
   # Resource metrics
-  memopt_queue_depth
-  memopt_queue_utilization
-  memopt_kv_cache_utilization
-  memopt_memory_used_gb
+  Memopt_queue_depth
+  Memopt_queue_utilization
+  Memopt_kv_cache_utilization
+  Memopt_memory_used_gb
 
   # Degradation metrics
-  memopt_evictions_total
-  memopt_eviction_latency_ms
-  memopt_speculative_fallbacks_total
-  memopt_circuit_breaker_state
+  Memopt_evictions_total
+  Memopt_eviction_latency_ms
+  Memopt_speculative_fallbacks_total
+  Memopt_circuit_breaker_state
 
   # SLO metrics
-  memopt_slo_latency_target_ms
-  memopt_slo_violations_total
-  memopt_slo_compliance_ratio
+  Memopt_slo_latency_target_ms
+  Memopt_slo_violations_total
+  Memopt_slo_compliance_ratio
   ```
 
 - **Export Formats**:
@@ -70,7 +70,7 @@ Phase 2 transforms MemOpt from a crash-resistant system into an observable, self
 
 **Usage:**
 ```python
-from memopt.metrics import get_metrics, record_request_start
+from Memopt.metrics import get_metrics, record_request_start
 
 metrics = get_metrics()
 
@@ -78,7 +78,7 @@ metrics = get_metrics()
 record_request_start(metrics, request_id="req_123")
 
 # Record latency
-metrics.histogram("memopt_latency_ms", 45.2)
+metrics.histogram("Memopt_latency_ms", 45.2)
 
 # Export for Prometheus
 print(metrics.export_prometheus())
@@ -88,7 +88,7 @@ print(metrics.export_prometheus())
 
 ---
 
-### 2. Circuit Breaker (`memopt/circuit_breaker.py`)
+### 2. Circuit Breaker (`Memopt/circuit_breaker.py`)
 
 **Status:** ✅ Complete (380 lines)
 
@@ -116,7 +116,7 @@ print(metrics.export_prometheus())
 
 **Usage:**
 ```python
-from memopt.circuit_breaker import CircuitBreaker
+from Memopt.circuit_breaker import CircuitBreaker
 
 breaker = CircuitBreaker()
 
@@ -147,7 +147,7 @@ HALF_OPEN --[failure]--> OPEN
 
 ---
 
-### 3. Structured Logging (`memopt/logging_utils.py`)
+### 3. Structured Logging (`Memopt/logging_utils.py`)
 
 **Status:** ✅ Complete (345 lines)
 
@@ -170,7 +170,7 @@ HALF_OPEN --[failure]--> OPEN
 
 **Usage:**
 ```python
-from memopt.logging_utils import get_logger, RequestContext
+from Memopt.logging_utils import get_logger, RequestContext
 
 logger = get_logger(__name__)
 
@@ -193,7 +193,7 @@ with RequestContext(correlation_id="req_123") as ctx:
   "level": "info",
   "message": "Request completed",
   "correlation_id": "req_123",
-  "component": "memopt.engine",
+  "component": "Memopt.engine",
   "duration_ms": 45.2,
   "metadata": {
     "tokens": 256,
@@ -206,7 +206,7 @@ with RequestContext(correlation_id="req_123") as ctx:
 
 ---
 
-### 4. Health Checks (`memopt/health.py`)
+### 4. Health Checks (`Memopt/health.py`)
 
 **Status:** ✅ Complete (410 lines)
 
@@ -231,7 +231,7 @@ with RequestContext(correlation_id="req_123") as ctx:
 
 **Usage:**
 ```python
-from memopt.health import get_health_checker, check_queue_health
+from Memopt.health import get_health_checker, check_queue_health
 
 health = get_health_checker()
 
@@ -288,7 +288,7 @@ def readiness():
 
 ---
 
-### 5. Request Tracing (`memopt/tracing.py`)
+### 5. Request Tracing (`Memopt/tracing.py`)
 
 **Status:** ✅ Complete (440 lines)
 
@@ -316,7 +316,7 @@ def readiness():
 
 **Usage:**
 ```python
-from memopt.tracing import get_tracer, TracedOperation, SpanKind
+from Memopt.tracing import get_tracer, TracedOperation, SpanKind
 
 tracer = get_tracer()
 
@@ -374,12 +374,12 @@ print(tracer.export_trace("req_123"))
 
 ```python
 from fastapi import FastAPI, Request
-from memopt import OptimizedLLM
-from memopt.metrics import get_metrics, record_request_start, record_request_complete
-from memopt.logging_utils import get_logger, RequestContext
-from memopt.circuit_breaker import CircuitBreaker, CircuitBreakerError
-from memopt.health import get_health_checker, check_queue_health
-from memopt.tracing import get_tracer, TracedOperation, SpanKind
+from Memopt import OptimizedLLM
+from Memopt.metrics import get_metrics, record_request_start, record_request_complete
+from Memopt.logging_utils import get_logger, RequestContext
+from Memopt.circuit_breaker import CircuitBreaker, CircuitBreakerError
+from Memopt.health import get_health_checker, check_queue_health
+from Memopt.tracing import get_tracer, TracedOperation, SpanKind
 
 app = FastAPI()
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
@@ -429,12 +429,12 @@ async def generate(request: Request):
 
         except CircuitBreakerError:
             logger.warning("Request rejected by circuit breaker")
-            metrics.counter("memopt_requests_rejected_total", labels={"reason": "circuit_breaker"})
+            metrics.counter("Memopt_requests_rejected_total", labels={"reason": "circuit_breaker"})
             return {"error": "Service overloaded"}, 503
 
         except Exception as e:
             logger.error("Request failed", error=str(e))
-            metrics.counter("memopt_requests_rejected_total", labels={"reason": "error"})
+            metrics.counter("Memopt_requests_rejected_total", labels={"reason": "error"})
             raise
 
 @app.get("/metrics")
@@ -456,42 +456,42 @@ def readiness():
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: memopt-dashboard
+  name: Memopt-dashboard
 data:
   dashboard.json: |
     {
-      "title": "MemOpt Performance",
+      "title": "Memopt Performance",
       "panels": [
         {
           "title": "Request Rate",
           "targets": [
-            {"expr": "rate(memopt_requests_total[5m])"}
+            {"expr": "rate(Memopt_requests_total[5m])"}
           ]
         },
         {
           "title": "Latency Percentiles",
           "targets": [
-            {"expr": "memopt_latency_ms{quantile=\"0.5\"}"},
-            {"expr": "memopt_latency_ms{quantile=\"0.95\"}"},
-            {"expr": "memopt_latency_ms{quantile=\"0.99\"}"}
+            {"expr": "Memopt_latency_ms{quantile=\"0.5\"}"},
+            {"expr": "Memopt_latency_ms{quantile=\"0.95\"}"},
+            {"expr": "Memopt_latency_ms{quantile=\"0.99\"}"}
           ]
         },
         {
           "title": "Queue Utilization",
           "targets": [
-            {"expr": "memopt_queue_utilization"}
+            {"expr": "Memopt_queue_utilization"}
           ]
         },
         {
           "title": "Cache Utilization",
           "targets": [
-            {"expr": "memopt_kv_cache_utilization"}
+            {"expr": "Memopt_kv_cache_utilization"}
           ]
         },
         {
           "title": "Circuit Breaker State",
           "targets": [
-            {"expr": "memopt_circuit_breaker_state"}
+            {"expr": "Memopt_circuit_breaker_state"}
           ]
         }
       ]
@@ -502,28 +502,28 @@ data:
 
 ```yaml
 groups:
-  - name: memopt_alerts
+  - name: Memopt_alerts
     rules:
       - alert: HighLatency
-        expr: memopt_latency_ms{quantile="0.95"} > 200
+        expr: Memopt_latency_ms{quantile="0.95"} > 200
         for: 5m
         annotations:
           summary: "P95 latency exceeds 200ms"
 
       - alert: QueueFull
-        expr: memopt_queue_utilization > 0.9
+        expr: Memopt_queue_utilization > 0.9
         for: 2m
         annotations:
           summary: "Request queue >90% full"
 
       - alert: CacheExhaustion
-        expr: memopt_kv_cache_utilization > 0.95
+        expr: Memopt_kv_cache_utilization > 0.95
         for: 5m
         annotations:
           summary: "KV cache >95% full, eviction imminent"
 
       - alert: CircuitBreakerOpen
-        expr: memopt_circuit_breaker_state == 1  # 1 = OPEN
+        expr: Memopt_circuit_breaker_state == 1  # 1 = OPEN
         for: 1m
         annotations:
           summary: "Circuit breaker is OPEN"
@@ -539,14 +539,14 @@ groups:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: memopt-inference
+  name: Memopt-inference
 spec:
   replicas: 10
   template:
     spec:
       containers:
-      - name: memopt
-        image: memopt:latest
+      - name: Memopt
+        image: Memopt:latest
         ports:
         - containerPort: 8000
           name: http
@@ -589,11 +589,11 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: memopt-metrics
+  name: Memopt-metrics
 spec:
   selector:
     matchLabels:
-      app: memopt
+      app: Memopt
   endpoints:
   - port: metrics
     interval: 30s
@@ -705,6 +705,6 @@ The system now provides:
 4. **Orchestration**: Kubernetes-compatible health probes
 5. **Alerting**: Prometheus metrics for proactive monitoring
 
-Combined with Phase 1 crash prevention, MemOpt is now production-ready for 10,000 GPU deployments.
+Combined with Phase 1 crash prevention, Memopt is now production-ready for 10,000 GPU deployments.
 
 **Ready for Phase 2 validation and deployment.**

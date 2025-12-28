@@ -1,4 +1,4 @@
-# MemOpt Production Deployment Guide
+# Memopt Production Deployment Guide
 
 **Version:** 1.0
 **Date:** 2025-12-28
@@ -77,7 +77,7 @@
 docker run -d -p 6379:6379 redis:7-alpine
 
 # 2. Set environment
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 export REDIS_URL=redis://localhost:6379
 export MODEL_NAME=gpt2
 
@@ -101,7 +101,7 @@ Production system is ready!
 # See Infrastructure Requirements section
 
 # 2. Set production environment
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 export REDIS_URL=redis://redis-sentinel.default.svc.cluster.local:6379
 export MODEL_NAME=meta-llama/Llama-2-7b-hf
 export TENSOR_PARALLEL_SIZE=2
@@ -186,7 +186,7 @@ Per-token Python: 0ms ✅
 
 ## Deployment Modes
 
-MemOpt supports two deployment modes controlled by the `MEMOPT_ENV` environment variable.
+Memopt supports two deployment modes controlled by the `Memopt_ENV` environment variable.
 
 ### Development Mode (Default)
 
@@ -194,7 +194,7 @@ MemOpt supports two deployment modes controlled by the `MEMOPT_ENV` environment 
 
 ```python
 # No configuration needed
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
 response = model.generate("Test", max_tokens=100)
@@ -210,7 +210,7 @@ response = model.generate("Test", max_tokens=100)
 **Use for:** Multi-GPU clusters, distributed systems
 
 ```bash
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 export REDIS_URL=redis://localhost:6379
 export MODEL_NAME=meta-llama/Llama-2-7b-hf
 ```
@@ -262,10 +262,10 @@ metadata:
   name: redis-sentinel
 data:
   sentinel.conf: |
-    sentinel monitor memopt-master redis-0 6379 2
-    sentinel down-after-milliseconds memopt-master 5000
-    sentinel parallel-syncs memopt-master 1
-    sentinel failover-timeout memopt-master 10000
+    sentinel monitor Memopt-master redis-0 6379 2
+    sentinel down-after-milliseconds Memopt-master 5000
+    sentinel parallel-syncs Memopt-master 1
+    sentinel failover-timeout Memopt-master 10000
 ```
 
 **Redis Configuration:**
@@ -304,7 +304,7 @@ export MODEL_NAME=meta-llama/Llama-2-7b-hf
 
 ```bash
 # Production mode
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 
 # Redis connection
 export REDIS_URL=redis://redis-sentinel.default.svc.cluster.local:6379
@@ -326,7 +326,7 @@ export REDIS_MAX_CONNECTIONS=50      # Redis connection pool
 ```bash
 # Test configuration
 python3 -c "
-from memopt.runtime import validate_production_runtime
+from Memopt.runtime import validate_production_runtime
 validate_production_runtime()
 print('✅ Production configuration valid')
 "
@@ -343,7 +343,7 @@ python tests/smoke_test_production.py
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MEMOPT_ENV` | No | `dev` | Runtime mode: `dev`, `test`, or `prod` |
+| `Memopt_ENV` | No | `dev` | Runtime mode: `dev`, `test`, or `prod` |
 | `REDIS_URL` | Prod only | - | Redis connection URL |
 | `MODEL_NAME` | Prod only | - | HuggingFace model name or path |
 | `REDIS_MAX_CONNECTIONS` | No | `50` | Redis connection pool size |
@@ -356,7 +356,7 @@ python tests/smoke_test_production.py
 Production mode performs strict validation at startup:
 
 ```python
-from memopt.runtime import validate_production_runtime
+from Memopt.runtime import validate_production_runtime
 
 # Crashes if:
 # - Missing REDIS_URL
@@ -368,10 +368,10 @@ validate_production_runtime()
 
 ### Backend Selection
 
-The runtime automatically selects backends based on `MEMOPT_ENV`:
+The runtime automatically selects backends based on `Memopt_ENV`:
 
 ```python
-from memopt.runtime import (
+from Memopt.runtime import (
     create_inference_engine,
     create_distributed_state_backend,
     create_request_queue
@@ -469,19 +469,19 @@ start_http_server(8000)
 ### Key Metrics
 
 **Request Metrics:**
-- `memopt_requests_total{status="completed|failed"}`
-- `memopt_request_duration_seconds{quantile="0.5|0.95|0.99"}`
-- `memopt_tokens_generated_total`
+- `Memopt_requests_total{status="completed|failed"}`
+- `Memopt_request_duration_seconds{quantile="0.5|0.95|0.99"}`
+- `Memopt_tokens_generated_total`
 
 **Queue Metrics:**
-- `memopt_queue_depth`
-- `memopt_queue_pending_count`
-- `memopt_queue_dlq_depth`
+- `Memopt_queue_depth`
+- `Memopt_queue_pending_count`
+- `Memopt_queue_dlq_depth`
 
 **System Metrics:**
-- `memopt_worker_is_leader{node_id="..."}`
-- `memopt_gpu_utilization`
-- `memopt_redis_connection_pool_size`
+- `Memopt_worker_is_leader{node_id="..."}`
+- `Memopt_gpu_utilization`
+- `Memopt_redis_connection_pool_size`
 
 ### Grafana Dashboards
 
@@ -632,7 +632,7 @@ export REDIS_CA=/path/to/ca-cert.pem
 export REDIS_URL=redis://:password@redis-host:6379
 
 # Or use ACLs
-redis-cli ACL SETUSER memopt-worker on >password ~memopt:* +@all
+redis-cli ACL SETUSER Memopt-worker on >password ~Memopt:* +@all
 ```
 
 ### Model Security
@@ -650,7 +650,7 @@ Use Kubernetes Secrets or similar:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: memopt-secrets
+  name: Memopt-secrets
 type: Opaque
 stringData:
   redis-url: redis://:password@redis-sentinel:6379
@@ -667,7 +667,7 @@ stringData:
 
 ```bash
 # Missing environment variables
-export MEMOPT_ENV=prod
+export Memopt_ENV=prod
 export REDIS_URL=redis://localhost:6379
 export MODEL_NAME=meta-llama/Llama-2-7b-hf
 ```
@@ -714,7 +714,7 @@ export VLLM_BATCH_SIZE=16
 
 ```bash
 # Check Redis connectivity
-redis-cli GET /memopt/leader/lease
+redis-cli GET /Memopt/leader/lease
 
 # Verify atomic operations work
 redis-cli WATCH test
@@ -742,8 +742,8 @@ curl http://worker-host:8000/metrics
 redis-cli INFO replication
 
 # Check queue health
-redis-cli XLEN memopt:requests
-redis-cli XPENDING memopt:requests memopt-workers
+redis-cli XLEN Memopt:requests
+redis-cli XPENDING Memopt:requests Memopt-workers
 ```
 
 ---
@@ -773,7 +773,7 @@ redis-cli XPENDING memopt:requests memopt-workers
 
 **Bug #1: Incorrect Import Paths (CRITICAL)**
 - Files: redis_queue.py, vllm_adapter.py, production_worker.py
-- Fix: Changed `memopt.request_queue` → `memopt.scheduler`
+- Fix: Changed `Memopt.request_queue` → `Memopt.scheduler`
 
 **Bug #2: Type Annotation Runtime Crash (CRITICAL)**
 - Files: redis_queue.py, redis_backend.py
@@ -842,8 +842,8 @@ redis-cli XPENDING memopt:requests memopt-workers
 
 ### Code
 
-- [memopt/runtime.py](memopt/runtime.py) - Runtime configuration and backend selection
-- [memopt/backends/](memopt/backends/) - Production backends (Redis, vLLM)
+- [Memopt/runtime.py](Memopt/runtime.py) - Runtime configuration and backend selection
+- [Memopt/backends/](Memopt/backends/) - Production backends (Redis, vLLM)
 - [examples/production_worker.py](examples/production_worker.py) - Complete worker example
 
 ### External Resources

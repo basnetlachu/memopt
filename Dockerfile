@@ -1,10 +1,10 @@
-# MemOpt Production Dockerfile
+# Memopt Production Dockerfile
 # Optimized for NVIDIA GPUs (Ampere/Hopper - A100, H100, RTX 3090/4090)
 
 FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 # Metadata
-LABEL maintainer="MemOpt Team"
+LABEL maintainer="Memopt Team"
 LABEL description="Memory-optimized LLM inference engine"
 LABEL version="1.0.0"
 
@@ -32,8 +32,8 @@ COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# Copy MemOpt package
-COPY memopt/ /app/memopt/
+# Copy Memopt package
+COPY Memopt/ /app/Memopt/
 
 # Copy benchmark and examples
 COPY benchmark.py /app/

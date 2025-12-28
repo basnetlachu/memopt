@@ -16,16 +16,16 @@ from unittest.mock import patch, MagicMock
 @pytest.fixture
 def clean_env(monkeypatch):
     """Clean environment before each test."""
-    # Remove all MEMOPT env vars
+    # Remove all Memopt env vars
     for key in list(os.environ.keys()):
-        if key.startswith("MEMOPT") or key in ("REDIS_URL", "MODEL_NAME"):
+        if key.startswith("Memopt") or key in ("REDIS_URL", "MODEL_NAME"):
             monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
 def prod_env(monkeypatch):
     """Set production environment variables."""
-    monkeypatch.setenv("MEMOPT_ENV", "prod")
+    monkeypatch.setenv("Memopt_ENV", "prod")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
     monkeypatch.setenv("MODEL_NAME", "gpt2")  # Use small model for tests
 
@@ -33,7 +33,7 @@ def prod_env(monkeypatch):
 @pytest.fixture
 def dev_env(monkeypatch):
     """Set development environment variables."""
-    monkeypatch.setenv("MEMOPT_ENV", "dev")
+    monkeypatch.setenv("Memopt_ENV", "dev")
 
 
 class TestRuntimeMode:
@@ -41,7 +41,7 @@ class TestRuntimeMode:
 
     def test_default_is_dev(self, clean_env):
         """Default mode should be dev."""
-        from memopt.runtime import RuntimeConfig
+        from Memopt.runtime import RuntimeConfig
 
         config = RuntimeConfig()
         assert config.mode.value == "dev"
@@ -50,7 +50,7 @@ class TestRuntimeMode:
 
     def test_prod_mode_detected(self, prod_env):
         """Production mode should be detected."""
-        from memopt.runtime import RuntimeConfig
+        from Memopt.runtime import RuntimeConfig
 
         config = RuntimeConfig()
         assert config.mode.value == "prod"
@@ -59,11 +59,11 @@ class TestRuntimeMode:
 
     def test_invalid_mode_raises(self, monkeypatch):
         """Invalid mode should raise error."""
-        monkeypatch.setenv("MEMOPT_ENV", "invalid")
+        monkeypatch.setenv("Memopt_ENV", "invalid")
 
-        from memopt.runtime import RuntimeConfig
+        from Memopt.runtime import RuntimeConfig
 
-        with pytest.raises(ValueError, match="Invalid MEMOPT_ENV"):
+        with pytest.raises(ValueError, match="Invalid Memopt_ENV"):
             RuntimeConfig()
 
 
@@ -72,29 +72,29 @@ class TestProductionValidation:
 
     def test_prod_requires_redis_url(self, monkeypatch):
         """Production mode requires REDIS_URL."""
-        monkeypatch.setenv("MEMOPT_ENV", "prod")
+        monkeypatch.setenv("Memopt_ENV", "prod")
         monkeypatch.setenv("MODEL_NAME", "gpt2")
         # No REDIS_URL
 
-        from memopt.runtime import RuntimeConfig
+        from Memopt.runtime import RuntimeConfig
 
         with pytest.raises(RuntimeError, match="REDIS_URL.*required"):
             RuntimeConfig()
 
     def test_prod_requires_model_name(self, monkeypatch):
         """Production mode requires MODEL_NAME."""
-        monkeypatch.setenv("MEMOPT_ENV", "prod")
+        monkeypatch.setenv("Memopt_ENV", "prod")
         monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
         # No MODEL_NAME
 
-        from memopt.runtime import RuntimeConfig
+        from Memopt.runtime import RuntimeConfig
 
         with pytest.raises(RuntimeError, match="MODEL_NAME.*required"):
             RuntimeConfig()
 
     def test_prod_with_all_config_succeeds(self, prod_env):
         """Production mode with all config should succeed."""
-        from memopt.runtime import RuntimeConfig
+        from Memopt.runtime import RuntimeConfig
 
         config = RuntimeConfig()
         assert config.is_prod
@@ -107,7 +107,7 @@ class TestInferenceEngineSelection:
 
     def test_dev_mode_uses_huggingface(self, dev_env):
         """Dev mode should use HuggingFace OptimizedLLM."""
-        from memopt.runtime import create_inference_engine
+        from Memopt.runtime import create_inference_engine
 
         engine = create_inference_engine()
         engine_type = type(engine).__name__
@@ -115,10 +115,10 @@ class TestInferenceEngineSelection:
         # Should be OptimizedLLM (HuggingFace-based)
         assert engine_type == "OptimizedLLM"
 
-    @patch("memopt.runtime.create_vllm_adapter")
+    @patch("Memopt.runtime.create_vllm_adapter")
     def test_prod_mode_uses_vllm(self, mock_vllm, prod_env):
         """Production mode should use vLLM adapter."""
-        from memopt.runtime import create_inference_engine
+        from Memopt.runtime import create_inference_engine
 
         # Mock vLLM adapter
         mock_adapter = MagicMock()
@@ -133,7 +133,7 @@ class TestInferenceEngineSelection:
 
     def test_prod_mode_without_vllm_raises(self, prod_env, monkeypatch):
         """Production mode without vLLM should fail fast."""
-        from memopt.runtime import create_inference_engine
+        from Memopt.runtime import create_inference_engine
 
         # Mock import failure
         import sys
@@ -155,17 +155,17 @@ class TestStateBackendSelection:
 
     def test_dev_mode_uses_inmemory(self, dev_env):
         """Dev mode should use InMemoryBackend."""
-        from memopt.runtime import create_distributed_state_backend
+        from Memopt.runtime import create_distributed_state_backend
 
         backend = create_distributed_state_backend()
         backend_type = type(backend).__name__
 
         assert backend_type == "InMemoryBackend"
 
-    @patch("memopt.runtime.create_redis_backend")
+    @patch("Memopt.runtime.create_redis_backend")
     def test_prod_mode_uses_redis(self, mock_redis, prod_env):
         """Production mode should use RedisBackend."""
-        from memopt.runtime import create_distributed_state_backend
+        from Memopt.runtime import create_distributed_state_backend
 
         # Mock Redis backend
         mock_backend = MagicMock()
@@ -180,10 +180,10 @@ class TestStateBackendSelection:
         assert backend == mock_backend
         mock_backend.health_check.assert_called_once()
 
-    @patch("memopt.runtime.create_redis_backend")
+    @patch("Memopt.runtime.create_redis_backend")
     def test_prod_mode_redis_health_check_fails(self, mock_redis, prod_env):
         """Production mode should fail if Redis unreachable."""
-        from memopt.runtime import create_distributed_state_backend
+        from Memopt.runtime import create_distributed_state_backend
 
         # Mock unhealthy Redis
         mock_backend = MagicMock()
@@ -199,18 +199,18 @@ class TestRequestQueueSelection:
 
     def test_dev_mode_uses_inmemory(self, dev_env):
         """Dev mode should use in-memory queue."""
-        from memopt.runtime import create_request_queue
+        from Memopt.runtime import create_request_queue
 
         queue = create_request_queue()
         queue_type = type(queue).__name__
 
         assert queue_type == "InMemoryQueue"
 
-    @patch("memopt.backends.redis_queue.RedisRequestQueue")
+    @patch("Memopt.backends.redis_queue.RedisRequestQueue")
     @patch("redis.Redis")
     def test_prod_mode_uses_redis_streams(self, mock_redis_client, mock_queue, prod_env):
         """Production mode should use RedisRequestQueue."""
-        from memopt.runtime import create_request_queue
+        from Memopt.runtime import create_request_queue
 
         # Mock Redis client
         mock_client = MagicMock()
@@ -236,14 +236,14 @@ class TestRequestQueueSelection:
 class TestProductionRuntimeValidation:
     """Test complete production runtime validation."""
 
-    @patch("memopt.runtime.create_inference_engine")
-    @patch("memopt.runtime.create_distributed_state_backend")
-    @patch("memopt.runtime.create_request_queue")
+    @patch("Memopt.runtime.create_inference_engine")
+    @patch("Memopt.runtime.create_distributed_state_backend")
+    @patch("Memopt.runtime.create_request_queue")
     def test_validation_passes_with_correct_backends(
         self, mock_queue, mock_backend, mock_engine, prod_env
     ):
         """Validation should pass when all backends are correct."""
-        from memopt.runtime import validate_production_runtime
+        from Memopt.runtime import validate_production_runtime
 
         # Mock correct backends
         mock_engine.return_value = MagicMock(__class__=type("VLLMAdapter", (), {}))
@@ -253,14 +253,14 @@ class TestProductionRuntimeValidation:
         # Should not raise
         validate_production_runtime()
 
-    @patch("memopt.runtime.create_inference_engine")
-    @patch("memopt.runtime.create_distributed_state_backend")
-    @patch("memopt.runtime.create_request_queue")
+    @patch("Memopt.runtime.create_inference_engine")
+    @patch("Memopt.runtime.create_distributed_state_backend")
+    @patch("Memopt.runtime.create_request_queue")
     def test_validation_fails_with_inmemory_backend(
         self, mock_queue, mock_backend, mock_engine, prod_env
     ):
         """Validation should fail if InMemoryBackend used in prod."""
-        from memopt.runtime import validate_production_runtime
+        from Memopt.runtime import validate_production_runtime
 
         # Mock wrong backend
         mock_engine.return_value = MagicMock(__class__=type("VLLMAdapter", (), {}))
@@ -272,7 +272,7 @@ class TestProductionRuntimeValidation:
 
     def test_validation_skipped_in_dev(self, dev_env):
         """Validation should be skipped in dev mode."""
-        from memopt.runtime import validate_production_runtime
+        from Memopt.runtime import validate_production_runtime
 
         # Should not raise (skipped in dev)
         validate_production_runtime()
@@ -283,7 +283,7 @@ class TestMemoryLeakFix:
 
     def test_deployment_history_is_bounded(self):
         """Deployment history should be bounded."""
-        from memopt.deployment import DeploymentController, DeploymentConfig
+        from Memopt.deployment import DeploymentController, DeploymentConfig
         from collections import deque
 
         controller = DeploymentController(DeploymentConfig())

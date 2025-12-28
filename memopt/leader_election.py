@@ -10,7 +10,7 @@ import threading
 from typing import Optional, Callable
 from dataclasses import dataclass
 from threading import Lock, Event
-from memopt.distributed_state import DistributedStateBackend, NodeRole
+from Memopt.distributed_state import DistributedStateBackend, NodeRole
 
 
 @dataclass
@@ -188,7 +188,7 @@ class LeaderElection:
         self._lease.expires_at = time.time() + self.lease_duration
 
         # Write to backend
-        key = "/memopt/leader/lease"
+        key = "/Memopt/leader/lease"
         value = self._serialize_lease(self._lease)
 
         success = self.backend.set(key, value, ttl=self.lease_duration)
@@ -212,7 +212,7 @@ class LeaderElection:
         Returns:
             True if leadership acquired
         """
-        key = "/memopt/leader/lease"
+        key = "/Memopt/leader/lease"
         new_value = self._serialize_lease(new_lease)
 
         if old_lease is None:
@@ -233,7 +233,7 @@ class LeaderElection:
             self._lease = None
 
         # Delete lease from backend
-        self.backend.delete("/memopt/leader/lease")
+        self.backend.delete("/Memopt/leader/lease")
 
         # Trigger callback
         if self._on_lost_leadership:
@@ -257,7 +257,7 @@ class LeaderElection:
 
     def _get_current_lease(self) -> Optional[LeadershipLease]:
         """Get current leadership lease from backend."""
-        value = self.backend.get("/memopt/leader/lease")
+        value = self.backend.get("/Memopt/leader/lease")
         if value:
             return self._deserialize_lease(value)
         return None

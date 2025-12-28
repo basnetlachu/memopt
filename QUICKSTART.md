@@ -1,6 +1,6 @@
-# MemOpt Production Quick Start
+# Memopt Production Quick Start
 
-Get MemOpt running with vLLM in under 30 minutes.
+Get Memopt running with vLLM in under 30 minutes.
 
 ---
 
@@ -52,7 +52,7 @@ redis-cli ping
 ## Step 2: Install Python Dependencies
 
 ```bash
-cd memopt
+cd Memopt
 
 # Install core dependencies
 pip install redis>=4.5.0
@@ -113,8 +113,8 @@ In another terminal:
 import redis
 import json
 import time
-from memopt.backends.redis_queue import RedisRequestQueue, RedisQueueConfig
-from memopt.request_queue import InferenceRequest
+from Memopt.backends.redis_queue import RedisRequestQueue, RedisQueueConfig
+from Memopt.request_queue import InferenceRequest
 
 # Connect to Redis
 redis_client = redis.Redis(host='localhost', port=6379, decode_responses=False)
@@ -153,19 +153,19 @@ INFO - ✓ Request test-001 completed: 45 tokens in 2.3s
 
 ```bash
 # Check queue depth
-redis-cli XLEN memopt:requests
+redis-cli XLEN Memopt:requests
 
 # Check pending messages
-redis-cli XPENDING memopt:requests memopt-workers
+redis-cli XPENDING Memopt:requests Memopt-workers
 
 # Check dead-letter queue
-redis-cli XLEN memopt:requests:dlq
+redis-cli XLEN Memopt:requests:dlq
 
 # View leader
-redis-cli GET /memopt/leader/lease
+redis-cli GET /Memopt/leader/lease
 
 # View all nodes
-redis-cli KEYS "/memopt/nodes/*"
+redis-cli KEYS "/Memopt/nodes/*"
 ```
 
 ---
@@ -222,8 +222,8 @@ Restart worker and send requests. Failed requests will retry (max 3x) then move 
 
 Check DLQ:
 ```bash
-redis-cli XLEN memopt:requests:dlq
-redis-cli XRANGE memopt:requests:dlq - +
+redis-cli XLEN Memopt:requests:dlq
+redis-cli XRANGE Memopt:requests:dlq - +
 ```
 
 ---
@@ -288,8 +288,8 @@ Create `api_server.py`:
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import redis
-from memopt.backends.redis_queue import RedisRequestQueue
-from memopt.request_queue import InferenceRequest
+from Memopt.backends.redis_queue import RedisRequestQueue
+from Memopt.request_queue import InferenceRequest
 import uuid
 
 app = FastAPI()

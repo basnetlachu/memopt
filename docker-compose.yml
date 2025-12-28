@@ -1,12 +1,12 @@
 version: '3.8'
 
 services:
-  memopt:
+  Memopt:
     build:
       context: .
       dockerfile: Dockerfile
-    image: memopt:latest
-    container_name: memopt-inference
+    image: Memopt:latest
+    container_name: Memopt-inference
     
     # GPU configuration
     deploy:
@@ -47,12 +47,12 @@ services:
     command: python3 benchmark.py --model gpt2-xl --mode both --num-prompts 8
 
 # Optional: Add API server service
-  memopt-api:
+  Memopt-api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: memopt:latest
-    container_name: memopt-api
+    image: Memopt:latest
+    container_name: Memopt-api
     
     deploy:
       resources:
@@ -80,4 +80,4 @@ services:
 
 networks:
   default:
-    name: memopt-network
+    name: Memopt-network

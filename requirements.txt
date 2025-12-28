@@ -1,4 +1,4 @@
-# MemOpt Requirements
+# Memopt Requirements
 # Production-ready LLM inference optimization
 
 # ============================================================================

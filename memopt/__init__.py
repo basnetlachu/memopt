@@ -1,5 +1,5 @@
 """
-MemOpt - GPU Memory Bandwidth Optimization Engine for LLM Inference
+Memopt - GPU Memory Bandwidth Optimization Engine for LLM Inference
 
 Reduces memory bandwidth usage by 40-60% through:
 - INT8 KV cache quantization
@@ -9,7 +9,7 @@ Reduces memory bandwidth usage by 40-60% through:
 - Real-time profiling and cost tracking
 
 Usage:
-    from memopt import OptimizedLLM
+    from Memopt import OptimizedLLM
     
     model = OptimizedLLM(
         model="meta-llama/Llama-2-13b-hf",
@@ -20,7 +20,7 @@ Usage:
 """
 
 __version__ = "0.1.0"
-__author__ = "MemOpt Team"
+__author__ = "Memopt Team"
 
 from .model import OptimizedLLM
 from .profiler import MemoryProfiler, ProfileStats

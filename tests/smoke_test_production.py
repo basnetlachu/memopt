@@ -12,13 +12,13 @@ Runs an end-to-end test of the production system:
 
 Usage:
     # With local Redis and small model (for testing)
-    export MEMOPT_ENV=prod
+    export Memopt_ENV=prod
     export REDIS_URL=redis://localhost:6379
     export MODEL_NAME=gpt2  # Small model for quick test
     python tests/smoke_test_production.py
 
     # With production config
-    export MEMOPT_ENV=prod
+    export Memopt_ENV=prod
     export REDIS_URL=redis://your-redis:6379
     export MODEL_NAME=meta-llama/Llama-2-7b-hf
     python tests/smoke_test_production.py
@@ -45,19 +45,19 @@ def check_prerequisites():
     logger.info("Checking prerequisites...")
 
     # Check environment variables
-    required_vars = ["MEMOPT_ENV", "REDIS_URL", "MODEL_NAME"]
+    required_vars = ["Memopt_ENV", "REDIS_URL", "MODEL_NAME"]
     missing = [v for v in required_vars if not os.getenv(v)]
 
     if missing:
         logger.error(f"Missing environment variables: {missing}")
         logger.error("Required:")
-        logger.error("  export MEMOPT_ENV=prod")
+        logger.error("  export Memopt_ENV=prod")
         logger.error("  export REDIS_URL=redis://localhost:6379")
         logger.error("  export MODEL_NAME=gpt2")
         return False
 
-    if os.getenv("MEMOPT_ENV") != "prod":
-        logger.error("MEMOPT_ENV must be 'prod' for smoke test")
+    if os.getenv("Memopt_ENV") != "prod":
+        logger.error("Memopt_ENV must be 'prod' for smoke test")
         return False
 
     logger.info("✓ Environment variables set")
@@ -68,7 +68,7 @@ def test_runtime_config():
     """Test runtime configuration."""
     logger.info("Testing runtime configuration...")
 
-    from memopt.runtime import get_config
+    from Memopt.runtime import get_config
 
     config = get_config()
 
@@ -84,7 +84,7 @@ def test_redis_connection():
     """Test Redis connectivity."""
     logger.info("Testing Redis connection...")
 
-    from memopt.runtime import get_config
+    from Memopt.runtime import get_config
     import redis
     import urllib.parse
 
@@ -110,7 +110,7 @@ def test_backend_creation():
     """Test that production backends are created."""
     logger.info("Testing backend creation...")
 
-    from memopt.runtime import (
+    from Memopt.runtime import (
         create_distributed_state_backend,
         create_request_queue
     )
@@ -143,7 +143,7 @@ def test_production_validation():
     """Test production runtime validation."""
     logger.info("Testing production validation...")
 
-    from memopt.runtime import validate_production_runtime
+    from Memopt.runtime import validate_production_runtime
 
     try:
         validate_production_runtime()
@@ -157,7 +157,7 @@ async def test_inference_engine():
     """Test inference engine creation and basic operation."""
     logger.info("Testing inference engine...")
 
-    from memopt.runtime import create_inference_engine, get_config
+    from Memopt.runtime import create_inference_engine, get_config
 
     config = get_config()
 
@@ -202,7 +202,7 @@ async def test_end_to_end_inference(engine, is_vllm):
     try:
         if is_vllm:
             # vLLM adapter
-            from memopt.scheduler import InferenceRequest
+            from Memopt.scheduler import InferenceRequest
 
             request = InferenceRequest(
                 request_id="smoke-test-001",
@@ -246,7 +246,7 @@ async def test_end_to_end_inference(engine, is_vllm):
 async def main():
     """Run all smoke tests."""
     logger.info("=" * 60)
-    logger.info("MEMOPT PRODUCTION SMOKE TEST")
+    logger.info("Memopt PRODUCTION SMOKE TEST")
     logger.info("=" * 60)
 
     try:

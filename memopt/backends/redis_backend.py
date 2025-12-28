@@ -37,7 +37,7 @@ except ImportError:
         ConnectionError = Exception
         TimeoutError = Exception
 
-from memopt.distributed_state import DistributedStateBackend
+from Memopt.distributed_state import DistributedStateBackend
 
 
 logger = logging.getLogger(__name__)

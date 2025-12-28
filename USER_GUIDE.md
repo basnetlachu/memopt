@@ -1,6 +1,6 @@
-# MemOpt User Guide
+# Memopt User Guide
 
-Complete guide for using MemOpt in production environments.
+Complete guide for using Memopt in production environments.
 
 **Table of Contents**
 - [Installation](#installation)
@@ -20,17 +20,17 @@ Complete guide for using MemOpt in production environments.
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/memopt.git
-cd memopt
+git clone https://github.com/yourusername/Memopt.git
+cd Memopt
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Install MemOpt in editable mode
+# Install Memopt in editable mode
 pip install -e .
 
 # Verify installation
-python -c "from memopt import OptimizedLLM; print('✅ Success')"
+python -c "from Memopt import OptimizedLLM; print('✅ Success')"
 ```
 
 ### Dependencies
@@ -62,7 +62,7 @@ pip install flash-attn --no-build-isolation
 **Verification:**
 ```bash
 python -c "
-from memopt.attention import get_attention_backend
+from Memopt.attention import get_attention_backend
 print(f'Backend: {get_attention_backend()}')
 "
 # Expected: 'pytorch_sdpa' or 'flash_attn_2'
@@ -75,7 +75,7 @@ print(f'Backend: {get_attention_backend()}')
 ### Minimal Example
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 # Load model with best optimization
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
@@ -94,7 +94,7 @@ That's it! You're now getting 15-60x speedup.
 ### Example 1: Basic Text Generation
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 model = OptimizedLLM(
     model="gpt2-xl",
@@ -116,7 +116,7 @@ for prompt in prompts:
 ### Example 2: Performance Monitoring
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 model = OptimizedLLM(
     model="gpt2-xl",
@@ -138,7 +138,7 @@ print(f"Total tokens: {stats.total_tokens}")
 ### Example 3: Sampling Configuration
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
 
@@ -172,10 +172,10 @@ response_focused = model.generate(
 ```python
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 import uvicorn
 
-app = FastAPI(title="MemOpt API")
+app = FastAPI(title="Memopt API")
 
 # Load model at startup
 model = OptimizedLLM(
@@ -220,7 +220,7 @@ curl -X POST http://localhost:8000/generate \
 ### Example 5: Multi-GPU Deployment
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 # Automatic GPU detection
 model = OptimizedLLM(
@@ -245,7 +245,7 @@ torchrun --nproc_per_node=4 your_script.py
 ### Example 6: Batch Processing
 
 ```python
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 import time
 
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
@@ -343,28 +343,28 @@ max_kv_blocks = (batch_size × max_tokens_per_request) ÷ 16
 
 **Build Image:**
 ```bash
-docker build -t memopt:latest .
+docker build -t Memopt:latest .
 ```
 
 **Run Benchmark:**
 ```bash
-docker run --gpus all memopt:latest \
+docker run --gpus all Memopt:latest \
   python3 benchmark.py --model gpt2-xl --optimization-level flash
 ```
 
 **Run API Server:**
 ```bash
 # Using docker-compose
-docker-compose up memopt-api
+docker-compose up Memopt-api
 
 # Or direct docker run
-docker run --gpus 1 -p 8000:8000 memopt:latest \
+docker run --gpus 1 -p 8000:8000 Memopt:latest \
   python3 examples/api.py
 ```
 
 **Multi-GPU:**
 ```bash
-docker run --gpus 2 memopt:latest \
+docker run --gpus 2 Memopt:latest \
   bash -c "torchrun --nproc_per_node=2 your_script.py"
 ```
 
@@ -373,7 +373,7 @@ docker run --gpus 2 memopt:latest \
 **Single GPU Configuration:**
 ```python
 # production_server.py
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 model = OptimizedLLM(
     model="gpt2-xl",
@@ -422,7 +422,7 @@ print(f"Elapsed Time: {stats.elapsed_time:.2f}s")
 
 ```python
 import logging
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -462,7 +462,7 @@ curl http://localhost:8000/models
 **Diagnosis:**
 ```bash
 python -c "
-from memopt.attention import get_attention_backend
+from Memopt.attention import get_attention_backend
 print(f'Backend: {get_attention_backend()}')
 "
 ```
@@ -501,24 +501,24 @@ pip install wheel packaging ninja
 pip install flash-attn --no-build-isolation
 
 # Or use Docker (easier on Windows)
-docker build -t memopt:latest .
-docker run --gpus all memopt:latest python3 benchmark.py
+docker build -t Memopt:latest .
+docker run --gpus all Memopt:latest python3 benchmark.py
 ```
 
 **Note:** Flash Attention 2 has limited Windows support. Use WSL2, Docker, or Linux.
 
 ### Issue 4: Import Error
 
-**Symptom:** `ModuleNotFoundError: No module named 'memopt'`
+**Symptom:** `ModuleNotFoundError: No module named 'Memopt'`
 
 **Solutions:**
 ```bash
 # Install in editable mode
-cd memopt
+cd Memopt
 pip install -e .
 
 # Or set PYTHONPATH
-export PYTHONPATH=$PYTHONPATH:/path/to/memopt
+export PYTHONPATH=$PYTHONPATH:/path/to/Memopt
 ```
 
 ### Issue 5: Incorrect Outputs

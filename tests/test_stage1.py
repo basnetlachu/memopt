@@ -25,8 +25,8 @@ except ImportError:
                 return decorator
 
 import torch
-from memopt.memory_manager import SmartMemoryManager
-from memopt.attention import OptimizedAttentionLayer
+from Memopt.memory_manager import SmartMemoryManager
+from Memopt.attention import OptimizedAttentionLayer
 
 
 class TestAdaptiveAllocation:
@@ -242,7 +242,7 @@ class TestStage1Integration:
 
     def test_optimization_presets_have_stage1_flags(self):
         """Ensure all optimization presets define Stage 1 flags"""
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         presets = OptimizedLLM.OPTIMIZATION_PRESETS
 
@@ -265,8 +265,8 @@ class TestStage1Integration:
 
     def test_backward_compatibility(self):
         """Ensure Stage 1 flags have safe defaults"""
-        from memopt.memory_manager import SmartMemoryManager
-        from memopt.attention import OptimizedAttentionLayer
+        from Memopt.memory_manager import SmartMemoryManager
+        from Memopt.attention import OptimizedAttentionLayer
 
         # Should work without specifying Stage 1 flags (backward compatible)
         manager = SmartMemoryManager(device="cuda")

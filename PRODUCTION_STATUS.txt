@@ -1,5 +1,5 @@
 ================================================================================
-                    MEMOPT PRODUCTION READINESS REPORT
+                    Memopt PRODUCTION READINESS REPORT
                          Date: 2025-12-27
 ================================================================================
 
@@ -78,8 +78,8 @@ Option 1: Local Development
    Expected: 16.71x speedup ✅
 
 Option 2: Docker
-   docker build -t memopt:latest .
-   docker run --gpus all memopt:latest python3 benchmark.py
+   docker build -t Memopt:latest .
+   docker run --gpus all Memopt:latest python3 benchmark.py
    Expected: 16.71x speedup ✅
 
 Option 3: API Server
@@ -113,11 +113,11 @@ ROI ANALYSIS
 
 For 10B tokens/day workload:
 
-Without MemOpt:
+Without Memopt:
   Cost: $373,979/day
   Throughput: 35.6 tok/s
 
-With MemOpt (16.71x):
+With Memopt (16.71x):
   Cost: $22,380/day
   Throughput: 594.2 tok/s
   
@@ -161,7 +161,7 @@ QUICK START
 
 3 lines to get 16x speedup:
 
-  from memopt import OptimizedLLM
+  from Memopt import OptimizedLLM
   model = OptimizedLLM("gpt2-xl", optimization_level="flash")
   print(model.generate("Hello world", max_tokens=50))
 
@@ -182,7 +182,7 @@ Tests:          tests/
 FINAL VERDICT
 ================================================================================
 
-MemOpt is PRODUCTION-READY with:
+Memopt is PRODUCTION-READY with:
 
   ✅ 16.71x verified speedup
   ✅ 100% correctness

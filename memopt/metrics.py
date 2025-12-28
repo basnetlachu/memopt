@@ -274,34 +274,34 @@ class SystemMetrics:
     """
 
     # Request metrics
-    REQUESTS_TOTAL = "memopt_requests_total"
-    REQUESTS_ACTIVE = "memopt_requests_active"
-    REQUESTS_QUEUED = "memopt_requests_queued"
-    REQUESTS_REJECTED = "memopt_requests_rejected_total"
+    REQUESTS_TOTAL = "Memopt_requests_total"
+    REQUESTS_ACTIVE = "Memopt_requests_active"
+    REQUESTS_QUEUED = "Memopt_requests_queued"
+    REQUESTS_REJECTED = "Memopt_requests_rejected_total"
 
     # Performance metrics
-    LATENCY_MS = "memopt_latency_ms"
-    THROUGHPUT_TOKENS_PER_SEC = "memopt_throughput_tokens_per_sec"
-    TOKENS_GENERATED = "memopt_tokens_generated_total"
+    LATENCY_MS = "Memopt_latency_ms"
+    THROUGHPUT_TOKENS_PER_SEC = "Memopt_throughput_tokens_per_sec"
+    TOKENS_GENERATED = "Memopt_tokens_generated_total"
 
     # Resource metrics
-    QUEUE_DEPTH = "memopt_queue_depth"
-    QUEUE_UTILIZATION = "memopt_queue_utilization"
-    KV_CACHE_BLOCKS_USED = "memopt_kv_cache_blocks_used"
-    KV_CACHE_BLOCKS_FREE = "memopt_kv_cache_blocks_free"
-    KV_CACHE_UTILIZATION = "memopt_kv_cache_utilization"
-    MEMORY_USED_GB = "memopt_memory_used_gb"
+    QUEUE_DEPTH = "Memopt_queue_depth"
+    QUEUE_UTILIZATION = "Memopt_queue_utilization"
+    KV_CACHE_BLOCKS_USED = "Memopt_kv_cache_blocks_used"
+    KV_CACHE_BLOCKS_FREE = "Memopt_kv_cache_blocks_free"
+    KV_CACHE_UTILIZATION = "Memopt_kv_cache_utilization"
+    MEMORY_USED_GB = "Memopt_memory_used_gb"
 
     # Degradation metrics
-    EVICTIONS_TOTAL = "memopt_evictions_total"
-    EVICTION_LATENCY_MS = "memopt_eviction_latency_ms"
-    SPECULATIVE_FALLBACKS = "memopt_speculative_fallbacks_total"
-    CIRCUIT_BREAKER_STATE = "memopt_circuit_breaker_state"
+    EVICTIONS_TOTAL = "Memopt_evictions_total"
+    EVICTION_LATENCY_MS = "Memopt_eviction_latency_ms"
+    SPECULATIVE_FALLBACKS = "Memopt_speculative_fallbacks_total"
+    CIRCUIT_BREAKER_STATE = "Memopt_circuit_breaker_state"
 
     # SLO metrics
-    SLO_LATENCY_TARGET_MS = "memopt_slo_latency_target_ms"
-    SLO_VIOLATIONS_TOTAL = "memopt_slo_violations_total"
-    SLO_COMPLIANCE_RATIO = "memopt_slo_compliance_ratio"
+    SLO_LATENCY_TARGET_MS = "Memopt_slo_latency_target_ms"
+    SLO_VIOLATIONS_TOTAL = "Memopt_slo_violations_total"
+    SLO_COMPLIANCE_RATIO = "Memopt_slo_compliance_ratio"
 
 
 def record_request_start(metrics: MetricsCollector, request_id: str):

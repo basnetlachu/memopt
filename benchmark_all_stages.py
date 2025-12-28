@@ -3,8 +3,8 @@
 Comprehensive Multi-Stage Benchmark
 
 Compares ALL optimization stages in a single run:
-- Baseline: No MemOpt optimizations (plain transformers)
-- Stage 0: Conservative (MemOpt with basic optimizations)
+- Baseline: No Memopt optimizations (plain transformers)
+- Stage 0: Conservative (Memopt with basic optimizations)
 - Stage 1: Balanced (memory allocation optimizations)
 - Stage 2: High (continuous batching)
 - Stage 3: Maximum (prefix sharing for common prompts)
@@ -21,13 +21,13 @@ import torch
 import json
 import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 
 def run_baseline(model_name: str, prompts: list, max_tokens: int):
-    """Run baseline inference without MemOpt optimizations"""
+    """Run baseline inference without Memopt optimizations"""
     print(f"\n{'='*70}")
-    print("RUNNING BASELINE (No MemOpt Optimizations)")
+    print("RUNNING BASELINE (No Memopt Optimizations)")
     print(f"{'='*70}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -131,7 +131,7 @@ def run_baseline(model_name: str, prompts: list, max_tokens: int):
     stats = BaselineStats(throughput, latency, total_time)
 
     return {
-        'stage_name': 'BASELINE (No MemOpt)',
+        'stage_name': 'BASELINE (No Memopt)',
         'optimization_level': 'none',
         'outputs': outputs,
         'stats': stats,
@@ -412,7 +412,7 @@ def main():
     parser.add_argument(
         "--skip-baseline",
         action="store_true",
-        help="Skip baseline test (only run MemOpt stages)"
+        help="Skip baseline test (only run Memopt stages)"
     )
     parser.add_argument(
         "--use-system-prompt",

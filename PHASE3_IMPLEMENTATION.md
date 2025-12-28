@@ -9,7 +9,7 @@
 
 ## Overview
 
-Phase 3 transforms MemOpt from a single-node system into a fully distributed platform capable of coordinating thousands of GPU nodes. It provides the distributed control plane needed for hyperscale deployments.
+Phase 3 transforms Memopt from a single-node system into a fully distributed platform capable of coordinating thousands of GPU nodes. It provides the distributed control plane needed for hyperscale deployments.
 
 ### Key Capabilities Added:
 
@@ -62,7 +62,7 @@ Phase 3 transforms MemOpt from a single-node system into a fully distributed pla
 
 ## Components Implemented
 
-### 1. Distributed State Management (`memopt/distributed_state.py`)
+### 1. Distributed State Management (`Memopt/distributed_state.py`)
 
 **Status:** ✅ Complete (420 lines)
 
@@ -81,7 +81,7 @@ Phase 3 transforms MemOpt from a single-node system into a fully distributed pla
 
 **Usage:**
 ```python
-from memopt.distributed_state import init_state_manager, InMemoryBackend
+from Memopt.distributed_state import init_state_manager, InMemoryBackend
 
 # Initialize state manager
 backend = InMemoryBackend()  # or EtcdBackend in production
@@ -107,7 +107,7 @@ state_mgr.set_node_state("draining")  # Graceful shutdown
 
 ---
 
-### 2. Leader Election (`memopt/leader_election.py`)
+### 2. Leader Election (`Memopt/leader_election.py`)
 
 **Status:** ✅ Complete (360 lines)
 
@@ -125,8 +125,8 @@ state_mgr.set_node_state("draining")  # Graceful shutdown
 
 **Usage:**
 ```python
-from memopt.leader_election import LeaderElection, LeadershipCoordinator
-from memopt.distributed_state import InMemoryBackend
+from Memopt.leader_election import LeaderElection, LeadershipCoordinator
+from Memopt.distributed_state import InMemoryBackend
 
 backend = InMemoryBackend()
 election = LeaderElection(
@@ -161,7 +161,7 @@ election.stop()
 
 ---
 
-### 3. Distributed Locks (`memopt/distributed_locks.py`)
+### 3. Distributed Locks (`Memopt/distributed_locks.py`)
 
 **Status:** ✅ Complete (420 lines)
 
@@ -182,8 +182,8 @@ election.stop()
 
 **Usage:**
 ```python
-from memopt.distributed_locks import LockManager
-from memopt.distributed_state import InMemoryBackend
+from Memopt.distributed_locks import LockManager
+from Memopt.distributed_state import InMemoryBackend
 
 backend = InMemoryBackend()
 lock_mgr = LockManager(backend, node_id="node-001")
@@ -213,7 +213,7 @@ with rw_lock.acquire_write():
 
 ---
 
-### 4. Distributed Rate Limiting (`memopt/distributed_rate_limit.py`)
+### 4. Distributed Rate Limiting (`Memopt/distributed_rate_limit.py`)
 
 **Status:** ✅ Complete (310 lines)
 
@@ -232,7 +232,7 @@ with rw_lock.acquire_write():
 
 **Usage:**
 ```python
-from memopt.distributed_rate_limit import (
+from Memopt.distributed_rate_limit import (
     DistributedRateLimiter,
     RateLimitConfig,
     ClusterRateLimitCoordinator
@@ -272,7 +272,7 @@ print(f"Cluster using {stats['cluster_utilization']*100:.1f}% of quota")
 
 ---
 
-### 5. Cluster Resource Tracking (`memopt/cluster_resources.py`)
+### 5. Cluster Resource Tracking (`Memopt/cluster_resources.py`)
 
 **Status:** ✅ Complete (380 lines)
 
@@ -299,7 +299,7 @@ print(f"Cluster using {stats['cluster_utilization']*100:.1f}% of quota")
 
 **Usage:**
 ```python
-from memopt.cluster_resources import (
+from Memopt.cluster_resources import (
     ClusterResourceTracker,
     NodeResources,
     GlobalScheduler
@@ -352,12 +352,12 @@ else:
 ### Complete Multi-Node Setup:
 
 ```python
-from memopt import OptimizedLLM
-from memopt.distributed_state import init_state_manager, InMemoryBackend
-from memopt.leader_election import LeaderElection, LeadershipCoordinator
-from memopt.distributed_locks import LockManager
-from memopt.distributed_rate_limit import ClusterRateLimitCoordinator, RateLimitConfig
-from memopt.cluster_resources import ClusterResourceTracker, GlobalScheduler, NodeResources
+from Memopt import OptimizedLLM
+from Memopt.distributed_state import init_state_manager, InMemoryBackend
+from Memopt.leader_election import LeaderElection, LeadershipCoordinator
+from Memopt.distributed_locks import LockManager
+from Memopt.distributed_rate_limit import ClusterRateLimitCoordinator, RateLimitConfig
+from Memopt.cluster_resources import ClusterResourceTracker, GlobalScheduler, NodeResources
 
 # 1. Initialize distributed state
 backend = InMemoryBackend()  # Use EtcdBackend in production
@@ -437,7 +437,7 @@ coordinator.register_leader_task(global_scheduling_task)
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: memopt-cluster-config
+  name: Memopt-cluster-config
 data:
   CLUSTER_SIZE: "100"
   ETCD_ENDPOINTS: "etcd-0.etcd:2379,etcd-1.etcd:2379,etcd-2.etcd:2379"
@@ -447,15 +447,15 @@ data:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: memopt-cluster
+  name: Memopt-cluster
 spec:
-  serviceName: memopt
+  serviceName: Memopt
   replicas: 100
   template:
     spec:
       containers:
-      - name: memopt
-        image: memopt:latest
+      - name: Memopt
+        image: Memopt:latest
         env:
         - name: NODE_ID
           valueFrom:
@@ -464,7 +464,7 @@ spec:
         - name: ETCD_ENDPOINTS
           valueFrom:
             configMapKeyRef:
-              name: memopt-cluster-config
+              name: Memopt-cluster-config
               key: ETCD_ENDPOINTS
         resources:
           limits:
@@ -612,7 +612,7 @@ The system now provides:
 4. **Resource Management**: Real-time capacity tracking
 5. **Fault Tolerance**: Automatic failover and recovery
 
-Combined with Phase 1 (crash prevention) and Phase 2 (observability), MemOpt is now a **complete hyperscale LLM inference platform** ready for 10,000 GPU deployments.
+Combined with Phase 1 (crash prevention) and Phase 2 (observability), Memopt is now a **complete hyperscale LLM inference platform** ready for 10,000 GPU deployments.
 
 **Total Implementation:**
 - **Phase 1**: 241 lines (crash prevention)

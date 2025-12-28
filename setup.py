@@ -4,14 +4,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="memopt",
+    name="Memopt",
     version="0.1.0",
-    author="MemOpt Team",
-    author_email="info@memopt.ai",
+    author="Memopt Team",
+    author_email="info@Memopt.ai",
     description="GPU Memory Bandwidth Optimization Engine for LLM Inference",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/memopt/memopt",
+    url="https://github.com/Memopt/Memopt",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",

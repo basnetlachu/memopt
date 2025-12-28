@@ -1,6 +1,6 @@
-# MemOpt Implementation Details
+# Memopt Implementation Details
 
-Technical documentation for understanding and extending MemOpt.
+Technical documentation for understanding and extending Memopt.
 
 **Table of Contents**
 - [Architecture Overview](#architecture-overview)
@@ -57,7 +57,7 @@ Technical documentation for understanding and extending MemOpt.
 ### Code Structure
 
 ```
-memopt/
+Memopt/
 ├── __init__.py              # Package exports
 ├── model.py                 # Main OptimizedLLM class (1,113 lines)
 ├── kv_cache.py             # Paged KV cache (524 lines)
@@ -627,7 +627,7 @@ model = OptimizedLLM("gpt2-xl", enable_profiling=False)
 
 ```python
 # Check which backend is active
-from memopt.attention import get_attention_backend
+from Memopt.attention import get_attention_backend
 print(f"Backend: {get_attention_backend()}")
 
 # pytorch_sdpa: Good (2-3x)
@@ -636,7 +636,7 @@ print(f"Backend: {get_attention_backend()}")
 
 ---
 
-## Extending MemOpt
+## Extending Memopt
 
 ### Adding a New Optimization
 
@@ -665,7 +665,7 @@ model = OptimizedLLM("gpt2-xl", optimization_level="custom")
 
 ## Summary
 
-**MemOpt achieves 15-60x speedup through:**
+**Memopt achieves 15-60x speedup through:**
 
 1. **Memory Optimizations** (Stages 0-4): 6.2x base
 2. **Speculative Decoding** (Stage 5b): +2.5x boost

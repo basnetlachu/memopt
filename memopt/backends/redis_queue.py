@@ -34,8 +34,8 @@ except ImportError:
         redis = None  # type: ignore
     RedisError = Exception
 
-from memopt.scheduler import InferenceRequest
-from memopt.exceptions import QueueFullError
+from Memopt.scheduler import InferenceRequest
+from Memopt.exceptions import QueueFullError
 
 
 logger = logging.getLogger(__name__)
@@ -44,10 +44,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RedisQueueConfig:
     """Redis queue configuration."""
-    stream_name: str = "memopt:requests"
-    consumer_group: str = "memopt-workers"
+    stream_name: str = "Memopt:requests"
+    consumer_group: str = "Memopt-workers"
     consumer_id: str = None  # Auto-generated if None
-    dead_letter_stream: str = "memopt:requests:dlq"
+    dead_letter_stream: str = "Memopt:requests:dlq"
     max_len: int = 100000  # Max messages in stream (backpressure)
     max_retries: int = 3
     retry_delay_ms: int = 5000

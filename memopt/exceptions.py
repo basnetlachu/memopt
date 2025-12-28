@@ -1,5 +1,5 @@
 """
-Custom exceptions for MemOpt.
+Custom exceptions for Memopt.
 
 These exceptions enable graceful degradation and backpressure
 without changing inference behavior or performance.

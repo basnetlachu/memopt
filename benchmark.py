@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark script for MemOpt
+Benchmark script for Memopt
 
 Compares baseline vs optimized inference and provides customer-ready metrics.
 
@@ -25,8 +25,8 @@ import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 
-from memopt import OptimizedLLM, ProfileStats
-from memopt.profiler import compare_profiles
+from Memopt import OptimizedLLM, ProfileStats
+from Memopt.profiler import compare_profiles
 
 
 def run_baseline(model_name: str, prompts: list, max_tokens: int = 256):
@@ -132,16 +132,16 @@ def run_optimized(
     max_kv_blocks: int = None
 ):
     """
-    Run optimized inference with MemOpt.
+    Run optimized inference with Memopt.
 
     Returns:
         ProfileStats
     """
     print("\n" + "="*70)
-    print(f"RUNNING OPTIMIZED (MemOpt - {optimization_level})")
+    print(f"RUNNING OPTIMIZED (Memopt - {optimization_level})")
     print("="*70)
 
-    # Load with MemOpt
+    # Load with Memopt
     model = OptimizedLLM(
         model=model_name,
         optimization_level=optimization_level,
@@ -249,7 +249,7 @@ def print_memory_analysis(optimized_model, baseline_memory_gb, optimized_peak_gb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark MemOpt")
+    parser = argparse.ArgumentParser(description="Benchmark Memopt")
     parser.add_argument(
         "--model",
         type=str,
@@ -324,7 +324,7 @@ def main():
         print("Using unique prompts without common prefix (Stage 3 will have minimal overhead)")
 
     print("\n" + "="*70)
-    print("MEMOPT BENCHMARK")
+    print("Memopt BENCHMARK")
     print("="*70)
     # Map optimization levels to stage descriptions
     stage_map = {
@@ -444,7 +444,7 @@ def main():
         print(f"  Daily optimized cost:  ${daily_optimized_cost:,.0f}")
         print(f"  Daily savings:         ${daily_savings:,.0f}")
         print(f"  Annual savings:        ${annual_savings:,.0f}")
-        print(f"\n  MemOpt price: $50,000/year")
+        print(f"\n  Memopt price: $50,000/year")
         print(f"  Payback period: {(50000 / daily_savings):.1f} days")
         print(f"  First year ROI: {(annual_savings / 50000):.1f}x")
         print(f"\n  ⚠️  Note: Cost estimates assume $0.002/1K tokens. Actual costs vary by provider.")
@@ -468,7 +468,7 @@ def main():
             "tokens_per_day": 10e9,
             "daily_savings_usd": daily_savings,
             "annual_savings_usd": annual_savings,
-            "memopt_annual_cost_usd": 50000,
+            "Memopt_annual_cost_usd": 50000,
             "payback_days": 50000 / daily_savings,
             "first_year_roi": annual_savings / 50000
         }

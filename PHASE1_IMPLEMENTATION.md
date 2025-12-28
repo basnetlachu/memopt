@@ -9,7 +9,7 @@
 
 ## Changes Implemented
 
-### 1. Exception Framework (`memopt/exceptions.py`)
+### 1. Exception Framework (`Memopt/exceptions.py`)
 
 **Status:** ✅ Complete (36 lines)
 
@@ -27,7 +27,7 @@ Created custom exceptions for graceful degradation:
 
 ---
 
-### 2. Bounded Request Queue (`memopt/scheduler.py`)
+### 2. Bounded Request Queue (`Memopt/scheduler.py`)
 
 **Status:** ✅ Complete
 
@@ -55,7 +55,7 @@ if len(self.waiting_queue) >= self.max_queue_depth:
 
 ---
 
-### 3. KV Cache LRU Eviction (`memopt/kv_cache.py`)
+### 3. KV Cache LRU Eviction (`Memopt/kv_cache.py`)
 
 **Status:** ✅ Complete
 
@@ -103,7 +103,7 @@ if len(self.free_blocks) < num_blocks:
 
 ---
 
-### 4. Speculative Decoding Fallback (`memopt/speculative_decoding.py`)
+### 4. Speculative Decoding Fallback (`Memopt/speculative_decoding.py`)
 
 **Status:** ✅ Complete
 
@@ -207,14 +207,14 @@ except Exception:
 ## Integration Points
 
 ### Files Modified:
-1. ✅ `memopt/exceptions.py` - NEW
-2. ✅ `memopt/scheduler.py` - Modified `add_request()`
-3. ✅ `memopt/kv_cache.py` - Added eviction logic
-4. ✅ `memopt/speculative_decoding.py` - Added fallback logic
+1. ✅ `Memopt/exceptions.py` - NEW
+2. ✅ `Memopt/scheduler.py` - Modified `add_request()`
+3. ✅ `Memopt/kv_cache.py` - Added eviction logic
+4. ✅ `Memopt/speculative_decoding.py` - Added fallback logic
 
 ### Files Requiring Updates (callers):
-- `memopt/engine.py` - Should catch `QueueFullError` and return HTTP 429
-- `memopt/engine.py` - Should call `kv_cache.mark_request_active/complete()`
+- `Memopt/engine.py` - Should catch `QueueFullError` and return HTTP 429
+- `Memopt/engine.py` - Should call `kv_cache.mark_request_active/complete()`
 - `examples/api.py` - Should handle `QueueFullError` → 429 response
 
 ---

@@ -30,7 +30,7 @@ except ImportError:
 
 
 import torch
-from memopt import OptimizedLLM
+from Memopt import OptimizedLLM
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

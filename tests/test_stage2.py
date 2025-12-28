@@ -25,7 +25,7 @@ except ImportError:
                 return decorator
 
 import torch
-from memopt.scheduler import ContinuousBatchScheduler, SimpleScheduler, InferenceRequest
+from Memopt.scheduler import ContinuousBatchScheduler, SimpleScheduler, InferenceRequest
 
 
 class TestContinuousBatchScheduler:
@@ -189,7 +189,7 @@ class TestStage2Integration:
 
     def test_optimization_presets_have_stage2_flags(self):
         """Ensure all optimization presets define Stage 2 flags"""
-        from memopt.model import OptimizedLLM
+        from Memopt.model import OptimizedLLM
 
         presets = OptimizedLLM.OPTIMIZATION_PRESETS
 
@@ -210,8 +210,8 @@ class TestStage2Integration:
 
     def test_scheduler_selection(self):
         """Test that correct scheduler is selected based on preset"""
-        from memopt.model import OptimizedLLM
-        from memopt.scheduler import ContinuousBatchScheduler, SimpleScheduler
+        from Memopt.model import OptimizedLLM
+        from Memopt.scheduler import ContinuousBatchScheduler, SimpleScheduler
 
         # Mock minimal model for testing
         # We'll just check the preset configs without loading a full model
@@ -226,7 +226,7 @@ class TestStage2Integration:
 
     def test_backward_compatibility(self):
         """Ensure Stage 2 flags have safe defaults"""
-        from memopt.scheduler import ContinuousBatchScheduler, SimpleScheduler
+        from Memopt.scheduler import ContinuousBatchScheduler, SimpleScheduler
 
         # Should work without issues
         simple = SimpleScheduler(device="cuda")
