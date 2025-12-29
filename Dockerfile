@@ -13,23 +13,15 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy SaaS requirements
-COPY saas/requirements.txt /app/saas/requirements.txt
+# Copy everything first
+COPY . /app/
 
-# Install Python dependencies
+# Install SaaS requirements
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /app/saas/requirements.txt
 
-# Copy memopt core library
-COPY memopt /app/memopt
-COPY setup.py /app/setup.py
-COPY README.md /app/README.md
-
-# Install memopt in editable mode
-RUN pip install -e /app
-
-# Copy SaaS application
-COPY saas /app/saas
+# Set Python path to include memopt
+ENV PYTHONPATH=/app:$PYTHONPATH
 
 # Create non-root user
 RUN useradd -m -u 1000 memopt && chown -R memopt:memopt /app
