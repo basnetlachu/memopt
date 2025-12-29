@@ -1,3 +1,10 @@
+# MemOpt Core Dependencies
+torch>=2.1.0
+transformers>=4.36.0
+accelerate>=0.25.0
+numpy>=1.24.0
+tqdm>=4.66.0
+
 # Core API
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
@@ -23,6 +30,3 @@ python-multipart==0.0.6
 python-dotenv==1.0.0
 structlog==24.1.0
 tenacity==8.2.3
-
-# MemOpt core (from parent)
-# Install with: pip install -e ..
