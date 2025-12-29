@@ -78,25 +78,27 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("starting_memopt_saas", env=settings.ENV)
 
-    # Initialize Redis
+    # Initialize Redis (optional for now)
     global redis_client
-    redis_client = redis.from_url(
-        settings.REDIS_URL,
-        encoding="utf-8",
-        decode_responses=True,
-        max_connections=settings.REDIS_MAX_CONNECTIONS,
-    )
+    if settings.REDIS_URL:
+        try:
+            redis_client = redis.from_url(
+                settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True,
+                max_connections=settings.REDIS_MAX_CONNECTIONS,
+            )
+            await redis_client.ping()
+            logger.info("redis_connected", url=settings.REDIS_URL)
 
-    # Test Redis connection
-    try:
-        await redis_client.ping()
-        logger.info("redis_connected", url=settings.REDIS_URL)
-    except Exception as e:
-        logger.error("redis_connection_failed", error=str(e))
-        raise SystemExit(1)
-
-    # Initialize rate limiter
-    init_rate_limiter(redis_client)
+            # Initialize rate limiter only if Redis is available
+            init_rate_limiter(redis_client)
+        except Exception as e:
+            logger.warning("redis_unavailable", error=str(e), message="Rate limiting disabled")
+            redis_client = None
+    else:
+        logger.warning("redis_not_configured", message="Rate limiting disabled")
+        redis_client = None
 
     # Create tables (in development only, use migrations in production)
     if settings.ENV == "development":
@@ -108,7 +110,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("shutting_down_memopt_saas")
-    await redis_client.close()
+    if redis_client:
+        await redis_client.close()
     logger.info("memopt_saas_stopped")
 
 
@@ -299,12 +302,14 @@ async def infer(
     rate_limiter = get_rate_limiter()
 
     try:
-        # 1. Check rate limits
-        await rate_limiter.check_request_limit(ctx)
-        await rate_limiter.check_concurrent_requests(ctx)
+        # 1. Check rate limits (skip if Redis unavailable)
+        if rate_limiter:
+            await rate_limiter.check_request_limit(ctx)
+            await rate_limiter.check_concurrent_requests(ctx)
 
-        # 2. Check monthly quota
-        await rate_limiter.check_monthly_token_quota(ctx, db)
+        # 2. Check monthly quota (works without Redis)
+        if rate_limiter:
+            await rate_limiter.check_monthly_token_quota(ctx, db)
 
         # 3. Check model allowed
         if not ctx.is_model_allowed(request.model):
@@ -313,8 +318,9 @@ async def infer(
                 detail=f"Model '{request.model}' not allowed for your tier",
             )
 
-        # 4. Acquire concurrent slot
-        await rate_limiter.acquire_request_slot(ctx)
+        # 4. Acquire concurrent slot (skip if Redis unavailable)
+        if rate_limiter:
+            await rate_limiter.acquire_request_slot(ctx)
 
         try:
             # 5. Run inference (use real MemOpt model)
@@ -346,8 +352,9 @@ async def infer(
 
             latency_ms = (time.time() - start_time) * 1000
 
-            # 6. Check token rate limit (after we know token count)
-            await rate_limiter.check_token_limit_per_minute(ctx, total_tokens)
+            # 6. Check token rate limit (after we know token count, skip if Redis unavailable)
+            if rate_limiter:
+                await rate_limiter.check_token_limit_per_minute(ctx, total_tokens)
 
             # 7. Record usage event
             usage_event = UsageEvent(
@@ -383,8 +390,9 @@ async def infer(
             )
 
         finally:
-            # Always release concurrent slot
-            await rate_limiter.release_request_slot(ctx)
+            # Always release concurrent slot (skip if Redis unavailable)
+            if rate_limiter:
+                await rate_limiter.release_request_slot(ctx)
 
     except HTTPException:
         # Re-raise HTTP exceptions

@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = Field(default=20)
     DB_MAX_OVERFLOW: int = Field(default=10)
 
-    # Redis
-    REDIS_URL: str = Field(..., description="Redis connection URL")
+    # Redis (optional - rate limiting disabled if not provided)
+    REDIS_URL: Optional[str] = Field(default=None, description="Redis connection URL")
     REDIS_MAX_CONNECTIONS: int = Field(default=50)
 
     # Admin authentication
@@ -101,8 +101,9 @@ def get_settings() -> Settings:
         print(f"❌ Configuration error: {e}")
         print("\n📋 Required environment variables:")
         print("  - DATABASE_URL (e.g., postgresql://user:pass@localhost/memopt)")
-        print("  - REDIS_URL (e.g., redis://localhost:6379)")
         print("  - ADMIN_API_KEY (secure random string, 32+ chars)")
+        print("\n📋 Optional environment variables:")
+        print("  - REDIS_URL (e.g., redis://localhost:6379) - for rate limiting")
         print("\n💡 Copy .env.example to .env and configure values")
         raise SystemExit(1)
 

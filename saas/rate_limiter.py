@@ -206,8 +206,6 @@ def init_rate_limiter(redis_client: redis.Redis):
     logger.info("rate_limiter_initialized")
 
 
-def get_rate_limiter() -> RateLimiter:
-    """Get global rate limiter instance"""
-    if _rate_limiter is None:
-        raise RuntimeError("Rate limiter not initialized")
+def get_rate_limiter() -> Optional[RateLimiter]:
+    """Get global rate limiter instance (None if Redis unavailable)"""
     return _rate_limiter
