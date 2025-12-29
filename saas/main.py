@@ -100,9 +100,13 @@ async def lifespan(app: FastAPI):
         logger.warning("redis_not_configured", message="Rate limiting disabled")
         redis_client = None
 
-    # Create tables (in development only, use migrations in production)
-    if settings.ENV == "development":
+    # Create tables if they don't exist
+    # In production, you should use Alembic migrations, but for initial deployment we auto-create
+    try:
         create_tables()
+        logger.info("database_tables_ensured")
+    except Exception as e:
+        logger.warning("table_creation_skipped", error=str(e))
 
     logger.info("memopt_saas_started", version=settings.API_VERSION)
 
@@ -255,15 +259,19 @@ async def health(db: Session = Depends(get_db)):
         logger.error("database_unhealthy", error=str(e))
         db_status = "unhealthy"
 
-    # Check Redis
-    try:
-        await redis_client.ping()
-        redis_status = "healthy"
-    except Exception as e:
-        logger.error("redis_unhealthy", error=str(e))
-        redis_status = "unhealthy"
+    # Check Redis (optional)
+    if redis_client:
+        try:
+            await redis_client.ping()
+            redis_status = "healthy"
+        except Exception as e:
+            logger.error("redis_unhealthy", error=str(e))
+            redis_status = "unhealthy"
+    else:
+        redis_status = "disabled"
 
-    overall_status = "healthy" if db_status == "healthy" and redis_status == "healthy" else "unhealthy"
+    # Overall status is healthy if database is healthy (Redis is optional)
+    overall_status = "healthy" if db_status == "healthy" else "unhealthy"
 
     return {
         "status": overall_status,
