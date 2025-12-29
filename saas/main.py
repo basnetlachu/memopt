@@ -252,9 +252,10 @@ async def root():
 async def health(db: Session = Depends(get_db)):
     """Health check endpoint"""
     # Check database
+    from sqlalchemy import text
     db_error = None
     try:
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db_status = "healthy"
     except Exception as e:
         logger.error("database_unhealthy", error=str(e))
