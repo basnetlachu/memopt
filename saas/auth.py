@@ -33,13 +33,19 @@ def generate_api_key() -> str:
 
 
 def hash_api_key(api_key: str) -> str:
-    """Hash API key using bcrypt"""
-    return pwd_context.hash(api_key)
+    """Hash API key using bcrypt (with SHA256 pre-hashing to handle long keys)"""
+    import hashlib
+    # Pre-hash with SHA256 to ensure it's under 72 bytes for bcrypt
+    sha_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    return pwd_context.hash(sha_hash)
 
 
 def verify_api_key(api_key: str, key_hash: str) -> bool:
-    """Verify API key against stored hash"""
-    return pwd_context.verify(api_key, key_hash)
+    """Verify API key against stored hash (with SHA256 pre-hashing)"""
+    import hashlib
+    # Pre-hash with SHA256 to match the hashing function
+    sha_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    return pwd_context.verify(sha_hash, key_hash)
 
 
 def get_key_prefix(api_key: str) -> str:
