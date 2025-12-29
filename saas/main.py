@@ -252,12 +252,14 @@ async def root():
 async def health(db: Session = Depends(get_db)):
     """Health check endpoint"""
     # Check database
+    db_error = None
     try:
         db.execute("SELECT 1")
         db_status = "healthy"
     except Exception as e:
         logger.error("database_unhealthy", error=str(e))
         db_status = "unhealthy"
+        db_error = str(e)
 
     # Check Redis (optional)
     if redis_client:
@@ -273,13 +275,19 @@ async def health(db: Session = Depends(get_db)):
     # Overall status is healthy if database is healthy (Redis is optional)
     overall_status = "healthy" if db_status == "healthy" else "unhealthy"
 
-    return {
+    response = {
         "status": overall_status,
         "database": db_status,
         "redis": redis_status,
         "version": settings.API_VERSION,
         "env": settings.ENV,
     }
+
+    # Include error details if database is unhealthy
+    if db_error:
+        response["database_error"] = db_error
+
+    return response
 
 
 # ============================================================================
