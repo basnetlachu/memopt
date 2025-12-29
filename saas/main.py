@@ -21,8 +21,6 @@ import structlog
 # Add parent directory to path to import memopt
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from memopt import OptimizedLLM
-
 from .config import settings
 from .database import (
     get_db,
@@ -69,7 +67,6 @@ logger = structlog.get_logger()
 
 # Global resources
 redis_client: Optional[redis.Redis] = None
-model_cache = {}
 
 
 @asynccontextmanager
@@ -273,20 +270,41 @@ async def health(db: Session = Depends(get_db)):
     else:
         redis_status = "disabled"
 
-    # Overall status is healthy if database is healthy (Redis is optional)
+    # Check Worker (optional but recommended in production)
+    worker_status = "not_configured"
+    worker_error = None
+    if settings.WORKER_URL:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                worker_response = await client.get(f"{settings.WORKER_URL}/health")
+                if worker_response.status_code == 200:
+                    worker_status = "healthy"
+                else:
+                    worker_status = "unhealthy"
+                    worker_error = f"HTTP {worker_response.status_code}"
+        except Exception as e:
+            logger.error("worker_unhealthy", error=str(e))
+            worker_status = "unhealthy"
+            worker_error = str(e)
+
+    # Overall status is healthy if database is healthy (Redis and Worker are optional)
     overall_status = "healthy" if db_status == "healthy" else "unhealthy"
 
     response = {
         "status": overall_status,
         "database": db_status,
         "redis": redis_status,
+        "worker": worker_status,
         "version": settings.API_VERSION,
         "env": settings.ENV,
     }
 
-    # Include error details if database is unhealthy
+    # Include error details
     if db_error:
         response["database_error"] = db_error
+    if worker_error:
+        response["worker_error"] = worker_error
 
     return response
 
@@ -340,32 +358,57 @@ async def infer(
             await rate_limiter.acquire_request_slot(ctx)
 
         try:
-            # 5. Run inference (use real MemOpt model)
-            model_key = f"{request.model}_{request.optimization_level}"
+            # 5. Call worker service for inference
+            import httpx
 
-            if model_key not in model_cache:
-                logger.info("loading_model", model=request.model, optimization_level=request.optimization_level)
-                model_cache[model_key] = OptimizedLLM(
-                    model=request.model,
-                    optimization_level=request.optimization_level,
-                    enable_profiling=True,
+            if not settings.WORKER_URL:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Worker service not configured"
                 )
 
-            model = model_cache[model_key]
+            async with httpx.AsyncClient(timeout=settings.WORKER_TIMEOUT_SECONDS) as client:
+                worker_response = await client.post(
+                    f"{settings.WORKER_URL}/generate",
+                    headers={
+                        "X-Worker-Token": settings.WORKER_TOKEN,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "request_id": request_id,
+                        "prompt": request.prompt,
+                        "model": request.model,
+                        "max_tokens": request.max_tokens,
+                        "temperature": request.temperature,
+                        "top_p": request.top_p,
+                        "optimization_level": request.optimization_level,
+                    }
+                )
 
-            # Generate text
-            generated_text = model.generate(
-                prompt=request.prompt,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                do_sample=(request.temperature > 0),
-            )
+                if worker_response.status_code == 401:
+                    logger.error("worker_auth_failed", request_id=request_id)
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Worker authentication failed"
+                    )
 
-            # Calculate tokens (rough estimate - use real tokenizer in production)
-            prompt_tokens = len(request.prompt.split())
-            completion_tokens = len(generated_text.split())
-            total_tokens = prompt_tokens + completion_tokens
+                if worker_response.status_code != 200:
+                    logger.error(
+                        "worker_error",
+                        request_id=request_id,
+                        status=worker_response.status_code,
+                        detail=worker_response.text
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Worker service unavailable"
+                    )
+
+                worker_result = worker_response.json()
+                generated_text = worker_result["generated_text"]
+                prompt_tokens = worker_result["usage"]["prompt_tokens"]
+                completion_tokens = worker_result["usage"]["completion_tokens"]
+                total_tokens = worker_result["usage"]["total_tokens"]
 
             latency_ms = (time.time() - start_time) * 1000
 

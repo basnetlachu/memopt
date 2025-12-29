@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str = Field(default="*", description="Comma-separated CORS origins")
 
+    # Worker configuration
+    WORKER_URL: Optional[str] = Field(default=None, description="Worker service URL (required in production)")
+    WORKER_TOKEN: Optional[str] = Field(default=None, description="Worker authentication token (required in production)")
+    WORKER_TIMEOUT_SECONDS: int = Field(default=120, description="Worker request timeout in seconds")
+
     @validator("ENV")
     def validate_env(cls, v):
         """Validate environment"""
@@ -75,6 +80,25 @@ class Settings(BaseSettings):
                 raise ValueError("ADMIN_API_KEY must be set to a secure value in production")
             if len(v) < 32:
                 raise ValueError("ADMIN_API_KEY must be at least 32 characters in production")
+        return v
+
+    @validator("WORKER_URL")
+    def validate_worker_url(cls, v, values):
+        """Ensure WORKER_URL is set in production"""
+        env = values.get("ENV", "development")
+        if env == "production" and not v:
+            raise ValueError("WORKER_URL must be set in production")
+        return v
+
+    @validator("WORKER_TOKEN")
+    def validate_worker_token(cls, v, values):
+        """Ensure WORKER_TOKEN is set in production"""
+        env = values.get("ENV", "development")
+        if env == "production":
+            if not v:
+                raise ValueError("WORKER_TOKEN must be set in production")
+            if len(v) < 32:
+                raise ValueError("WORKER_TOKEN must be at least 32 characters in production")
         return v
 
     @property

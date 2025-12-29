@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  memopt-worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    container_name: memopt-worker
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      # REQUIRED: Set these in .env file
+      - WORKER_TOKEN=${WORKER_TOKEN}
+      - MODEL_NAME=${MODEL_NAME:-meta-llama/Llama-2-7b-hf}
+
+      # OPTIONAL
+      - HF_TOKEN=${HF_TOKEN:-}
+      - WORKER_PORT=8001
+      - OPTIMIZATION_LEVEL=${OPTIMIZATION_LEVEL:-7}
+
+    # GPU support - uncomment for GPU servers
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    volumes:
+      # Cache HuggingFace models
+      - huggingface-cache:/home/memopt/.cache/huggingface
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  huggingface-cache:
