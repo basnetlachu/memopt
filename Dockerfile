@@ -28,11 +28,11 @@ RUN useradd -m -u 1000 memopt && chown -R memopt:memopt /app
 USER memopt
 
 # Expose port
-EXPOSE 8000
+EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:3000/health || exit 1
 
 # Run application
-CMD ["python", "-m", "uvicorn", "saas.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["python", "-m", "uvicorn", "saas.main:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "4"]
