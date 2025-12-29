@@ -160,7 +160,7 @@ REDIS_URL=redis://redis:6379/0
 
 # Admin API Key (CRITICAL: Generate secure key!)
 # Generate with: openssl rand -base64 32
-ADMIN_API_KEY=YOUR_SECURE_RANDOM_STRING_HERE_32_CHARS_MINIMUM
+ADMIN_API_KEY=svkKLNDlY6GnPAyDMt9V6/QWlc1K5p8Vve0FqS/SHGPYiXwBG2DJbGKzBOAeT121
 
 # Postgres password (same as in DATABASE_URL)
 POSTGRES_PASSWORD=YOUR_STRONG_PASSWORD_HERE
@@ -174,7 +174,7 @@ PRICE_PER_1K_TOKENS=0.002
 ENTERPRISE_FLAT_MONTHLY=66666.67
 
 # CORS (optional, use your domain in production)
-CORS_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+CORS_ORIGINS=https://memopt.sophisticatesai.com
 ```
 
 ### 3. Generate Secure Keys
