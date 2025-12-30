@@ -19,7 +19,7 @@ except ImportError:
 
 # Embedded public key for license verification
 # Generated with: python -c "from nacl.signing import SigningKey; sk = SigningKey.generate(); print(sk.verify_key.encode().hex())"
-PUBLIC_KEY_HEX = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+PUBLIC_KEY_HEX = "5905a5abdda50429a8a943a6fb8297995b86382cb9200465b58f69b487d61436"
 
 
 class LicenseError(Exception):

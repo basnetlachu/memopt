@@ -41,7 +41,7 @@ except ImportError:
 # ============================================================================
 
 # TODO: Replace with your actual private key from generate_keypair.py
-PRIVATE_KEY_HEX = "REPLACE_WITH_YOUR_PRIVATE_KEY_FROM_generate_keypair_py"
+PRIVATE_KEY_HEX = "85b46fd4680c87781068c11c1bcbf19a0beb9ff26085489c73942ea304699ea5"
 
 # ============================================================================
 
