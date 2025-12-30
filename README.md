@@ -190,152 +190,25 @@ Access API docs at: http://localhost:8000/docs
 
 ## 🏭 Production Deployment
 
-Memopt supports two deployment modes: **Development** and **Production**.
+**Status:** Deployment strategy pending - clean baseline.
 
-### Development Mode (Default)
-
-For local testing and development:
+Memopt currently supports local development and testing:
 
 ```python
 from Memopt import OptimizedLLM
 
-# Uses in-memory backends and HuggingFace models
+# Local development mode
 model = OptimizedLLM("gpt2-xl", optimization_level="flash")
 response = model.generate("Test", max_tokens=100)
 ```
 
-No additional configuration needed. Perfect for:
+Perfect for:
 - Local development
 - Unit testing
 - Prototyping
+- Performance benchmarking
 
-### Production Mode
-
-For multi-GPU clusters with distributed coordination:
-
-**Required Environment Variables:**
-
-```bash
-# Production mode selector
-export Memopt_ENV=prod
-
-# Redis connection (required in prod)
-export REDIS_URL=redis://localhost:6379
-# or with authentication:
-# export REDIS_URL=redis://:password@redis-host:6379
-
-# Model configuration (required in prod)
-export MODEL_NAME=meta-llama/Llama-2-7b-hf
-
-# Optional: Redis connection pooling
-export REDIS_MAX_CONNECTIONS=50
-
-# Optional: Tensor parallelism (multi-GPU)
-export TENSOR_PARALLEL_SIZE=2
-```
-
-**Minimal Working Command:**
-
-```bash
-# 1. Start Redis (if not already running)
-docker run -d -p 6379:6379 redis:7-alpine
-
-# 2. Set environment variables
-export Memopt_ENV=prod
-export REDIS_URL=redis://localhost:6379
-export MODEL_NAME=gpt2  # Small model for testing
-
-# 3. Run production smoke test
-python tests/smoke_test_production.py
-```
-
-**Expected Output:**
-```
-✅ ALL SMOKE TESTS PASSED
-Production system is ready!
-```
-
-### Production Worker Example
-
-Complete production-ready worker with:
-- vLLM inference engine (zero Python per token)
-- Redis Streams request queue (at-least-once delivery)
-- Distributed state coordination
-- Automatic failure recovery
-- Leader election
-- Metrics collection
-
-```bash
-python -m examples.production_worker \
-  --redis-host redis.internal \
-  --model meta-llama/Llama-2-7b-hf \
-  --gpus 1
-```
-
-**Production Features:**
-
-| Feature | Dev Mode | Prod Mode |
-|---------|----------|-----------|
-| Inference Engine | HuggingFace | vLLM (C++/CUDA) |
-| Request Queue | In-memory | Redis Streams |
-| Distributed State | In-memory | Redis with CAS |
-| Failure Recovery | None | Automatic retry + DLQ |
-| Multi-node | No | Yes (leader election) |
-| Crash Recovery | No | <60s automatic |
-
-### Production Requirements
-
-**Dependencies:**
-```bash
-pip install redis>=4.5.0
-pip install vllm>=0.3.0
-```
-
-**Infrastructure:**
-- Redis 7.0+ with AOF+RDB persistence
-- Redis Sentinel (3+ nodes) for HA
-- NVIDIA A100/H100 GPUs with CUDA 11.8+
-- 100Gbps+ network for multi-GPU
-
-**Monitoring:**
-
-Production workers expose metrics at `/metrics`:
-- Queue depth and pending count
-- Request latency (p50, p95, p99)
-- Tokens per second
-- Failure rates
-- Leader election status
-
-See [PRODUCTION_REQUIREMENTS.md](PRODUCTION_REQUIREMENTS.md) for complete deployment guide.
-
-### Configuration Reference
-
-| Environment Variable | Required | Default | Description |
-|---------------------|----------|---------|-------------|
-| `Memopt_ENV` | No | `dev` | Runtime mode: `dev`, `test`, or `prod` |
-| `REDIS_URL` | Prod only | - | Redis connection URL |
-| `MODEL_NAME` | Prod only | - | HuggingFace model name or path |
-| `REDIS_MAX_CONNECTIONS` | No | `50` | Redis connection pool size |
-| `TENSOR_PARALLEL_SIZE` | No | `1` | Number of GPUs for model parallelism |
-| `MAX_NUM_SEQS` | No | `256` | vLLM max concurrent sequences |
-| `GPU_MEMORY_UTILIZATION` | No | `0.90` | GPU memory utilization (0.0-1.0) |
-
-### Fail-Fast Validation
-
-Production mode performs strict validation at startup:
-
-```python
-from Memopt.runtime import validate_production_runtime
-
-# Crashes if prod requirements not met:
-# - Missing REDIS_URL
-# - Missing MODEL_NAME
-# - Redis unreachable
-# - Wrong backend types
-validate_production_runtime()
-```
-
-This prevents silent failures and ensures production safety.
+**Production deployment architecture is under review.**
 
 ---
 

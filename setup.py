@@ -8,7 +8,7 @@ setup(
     version="0.1.0",
     author="Memopt Team",
     author_email="info@Memopt.ai",
-    description="On-Premise vLLM Plugin for GPU Memory Optimization",
+    description="GPU Memory Bandwidth Optimization for LLM Inference",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Memopt/Memopt",
@@ -33,7 +33,6 @@ setup(
         "accelerate>=0.25.0",
         "numpy>=1.24.0",
         "tqdm>=4.66.0",
-        "pynacl>=1.5.0",  # Ed25519 signature verification
     ],
     extras_require={
         "dev": [
@@ -49,11 +48,6 @@ setup(
         ],
         "triton": [
             "triton>=2.1.0",
-        ],
-    },
-    entry_points={
-        "console_scripts": [
-            "memopt=memopt.cli:main",
         ],
     },
 )
