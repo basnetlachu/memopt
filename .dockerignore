@@ -47,13 +47,16 @@ Thumbs.db
 
 # Docker
 .dockerignore
-Dockerfile
 docker-compose.yml
 
-# Documentation
-README.md
+# Documentation (except README.md which is needed for setup.py)
 docs/
-*.md
+DEPLOYMENT.md
+QUICKSTART.md
+IMPLEMENTATION_SUMMARY.md
+FILE_STRUCTURE.md
+TRANSFORMATION_SUMMARY.md
+README_DEPLOYMENT.md
 
 # Tests
 tests/

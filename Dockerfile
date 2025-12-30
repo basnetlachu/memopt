@@ -17,9 +17,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package files
-COPY memopt/ /app/memopt/
 COPY setup.py /app/
 COPY README.md /app/
+COPY memopt/ /app/memopt/
 
 # Install MemOpt package
 RUN pip install --no-cache-dir -e .
