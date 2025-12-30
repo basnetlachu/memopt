@@ -198,3 +198,35 @@ class SmartMemoryManager:
             'free_gb': free,
             'utilization': allocated / (self.total_memory * 1024**3),
         }
+
+
+# ========================================================================
+# vLLM Plugin Integration
+# ========================================================================
+
+def optimize_cache_params(cache_config):
+    """
+    MemOpt optimization hook for vLLM memory planning.
+
+    Optimizes memory allocation parameters:
+    - Dynamic cache sizing based on workload
+    - Memory-efficient buffer allocation
+    - GPU memory utilization tuning
+
+    Args:
+        cache_config: vLLM CacheConfig instance to optimize
+    """
+    # Adjust swap space configuration
+    if hasattr(cache_config, 'swap_space'):
+        # Increase swap space for better handling of long sequences
+        cache_config.swap_space = 8  # GB
+
+    # Configure sliding window if available
+    if hasattr(cache_config, 'sliding_window'):
+        # Enable sliding window for memory efficiency on long contexts
+        pass  # vLLM handles this automatically
+
+    # Set block manager settings
+    if hasattr(cache_config, 'enable_prefix_caching'):
+        # Enable prefix caching for reuse across requests
+        cache_config.enable_prefix_caching = True

@@ -8,7 +8,7 @@ setup(
     version="0.1.0",
     author="Memopt Team",
     author_email="info@Memopt.ai",
-    description="GPU Memory Bandwidth Optimization Engine for LLM Inference",
+    description="On-Premise vLLM Plugin for GPU Memory Optimization",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Memopt/Memopt",
@@ -18,12 +18,13 @@ setup(
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "License :: OSI Approved :: Apache Software License",
+        "License :: Other/Proprietary License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
     python_requires=">=3.8",
     install_requires=[
@@ -32,6 +33,7 @@ setup(
         "accelerate>=0.25.0",
         "numpy>=1.24.0",
         "tqdm>=4.66.0",
+        "pynacl>=1.5.0",  # Ed25519 signature verification
     ],
     extras_require={
         "dev": [
@@ -39,11 +41,19 @@ setup(
             "black>=23.0.0",
             "flake8>=6.0.0",
         ],
+        "vllm": [
+            "vllm>=0.2.0",  # Optional: vLLM for plugin mode
+        ],
         "flash": [
             "flash-attn>=2.3.0",
         ],
         "triton": [
             "triton>=2.1.0",
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "memopt=memopt.cli:main",
         ],
     },
 )
