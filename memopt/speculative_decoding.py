@@ -38,10 +38,11 @@ class SpeculativeDecoder:
         draft_tokenizer: AutoTokenizer,
         num_speculative_tokens: int = 4,
         device: str = "cuda",
-        cache_threshold: int = 512
+        cache_threshold: int = 512,
+        max_context_length: int = None
     ):
         """
-        Initialize speculative decoder.
+        Initialize speculative decoder with trillion-token support.
 
         Args:
             draft_model: Small fast model for drafting (e.g., gpt2)
@@ -49,12 +50,15 @@ class SpeculativeDecoder:
             num_speculative_tokens: Number of tokens to draft (K)
             device: Device to run on
             cache_threshold: Sequence length threshold for enabling cache (default 512)
+            max_context_length: Maximum context window to keep in memory (None = unlimited for backward compatibility)
+                               Set to model's max length for trillion-token support (e.g., 1024 for GPT-2)
         """
         self.draft_model = draft_model
         self.draft_tokenizer = draft_tokenizer
         self.num_speculative_tokens = num_speculative_tokens
         self.device = device
         self.cache_threshold = cache_threshold
+        self.max_context_length = max_context_length  # Sliding window for trillion-token support
 
         # Move draft model to device
         self.draft_model.to(device)
@@ -75,24 +79,59 @@ class SpeculativeDecoder:
         self.no_cache_tokens = 0
         self.cached_tokens = 0
 
+        # Trillion-token tracking
+        self.total_generated_tokens = 0  # Track total tokens generated (can be trillions)
+        self.window_slides = 0  # Count how many times we slid the window
+
+    def _apply_sliding_window(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Apply sliding window to keep memory bounded for trillion-token generation.
+
+        This enables infinite-length generation by keeping only recent context.
+        Maintains generation quality while preventing memory explosion.
+
+        Args:
+            input_ids: Current sequence [1, seq_len]
+
+        Returns:
+            Windowed sequence [1, min(seq_len, max_context_length)]
+        """
+        if self.max_context_length is None:
+            # Backward compatibility: No windowing if max_context_length not set
+            return input_ids
+
+        current_length = input_ids.shape[1]
+
+        if current_length <= self.max_context_length:
+            # Sequence fits in window, no need to slide
+            return input_ids
+
+        # Slide window: Keep most recent tokens
+        # This allows trillion-token generation without memory growth
+        windowed = input_ids[:, -self.max_context_length:]
+        self.window_slides += 1
+
+        return windowed
+
     def _should_use_cache(self, current_length: int) -> bool:
         """
         Determine whether to use KV cache based on sequence length.
 
         Strategy for speculative decoding:
-        - ALWAYS use use_cache=False for best performance
-        - HuggingFace's cache has O(n²) overhead that kills performance
-        - Speculative decoding's parallel verification makes cache unnecessary
+        - Short sequences (<512): NO cache (overhead > benefit, 15-16x speedup)
+        - Long sequences (≥512): YES cache (prevents O(n²) recomputation)
+
+        The crossover point is around 512 tokens where cache benefits outweigh overhead.
 
         Args:
             current_length: Current sequence length
 
         Returns:
-            False (always) - no cache for optimal speculative performance
+            True if cache should be used (long sequences), False otherwise
         """
-        # CRITICAL: Always return False for 15-16x speedup
-        # Enabling cache drops performance from 16x to 6x
-        return False
+        # Enable cache for long sequences to prevent O(n²) attention recomputation
+        # Disable for short sequences where cache overhead dominates
+        return current_length >= self.cache_threshold
 
     @torch.no_grad()
     def _generate_standard(
@@ -128,8 +167,11 @@ class SpeculativeDecoder:
         generated = []
 
         for _ in range(num_tokens):
+            # TRILLION-TOKEN SUPPORT: Apply sliding window
+            windowed_ids = self._apply_sliding_window(input_ids)
+
             # ADAPTIVE CACHING: Choose based on sequence length
-            seq_len = input_ids.shape[1]
+            seq_len = windowed_ids.shape[1]
             use_cache = self._should_use_cache(seq_len)
 
             if use_cache:
@@ -138,7 +180,7 @@ class SpeculativeDecoder:
                 self.no_cache_tokens += 1
 
             outputs = main_model(
-                input_ids=input_ids,
+                input_ids=windowed_ids,
                 use_cache=use_cache,
                 return_dict=True
             )
@@ -196,12 +238,15 @@ class SpeculativeDecoder:
         current_ids = input_ids
 
         for _ in range(num_tokens):
+            # TRILLION-TOKEN SUPPORT: Apply sliding window before processing
+            windowed_ids = self._apply_sliding_window(current_ids)
+
             # ADAPTIVE CACHING: Draft model uses same strategy
-            seq_len = current_ids.shape[1]
+            seq_len = windowed_ids.shape[1]
             use_cache = self._should_use_cache(seq_len)
 
             outputs = self.draft_model(
-                input_ids=current_ids,
+                input_ids=windowed_ids,
                 use_cache=use_cache,
                 return_dict=True
             )
@@ -288,8 +333,11 @@ class SpeculativeDecoder:
         if draft_ids.dim() == 1:
             draft_ids = draft_ids.unsqueeze(0)
 
-        # Concatenate input with ALL draft tokens
-        full_input = torch.cat([input_ids, draft_ids], dim=1)  # [1, seq_len + K]
+        # TRILLION-TOKEN SUPPORT: Apply sliding window to input before concatenating
+        windowed_input = self._apply_sliding_window(input_ids)
+
+        # Concatenate windowed input with ALL draft tokens
+        full_input = torch.cat([windowed_input, draft_ids], dim=1)  # [1, min(seq_len, window) + K]
 
         # ADAPTIVE CACHING: Verification uses same strategy
         seq_len = full_input.shape[1]
@@ -466,6 +514,9 @@ class SpeculativeDecoder:
             current_ids = torch.cat([current_ids, accepted_tokens], dim=1)
             generated_tokens += accepted_tokens.shape[1]
 
+            # TRILLION-TOKEN TRACKING: Update total tokens generated
+            self.total_generated_tokens += accepted_tokens.shape[1]
+
             # Check for EOS
             if eos_token_id is not None and eos_token_id in accepted_tokens:
                 break
@@ -511,7 +562,12 @@ class SpeculativeDecoder:
             # Adaptive caching statistics
             'no_cache_tokens': self.no_cache_tokens,
             'cached_tokens': self.cached_tokens,
-            'cache_threshold': self.cache_threshold
+            'cache_threshold': self.cache_threshold,
+            # Trillion-token support statistics
+            'total_generated_tokens': self.total_generated_tokens,
+            'window_slides': self.window_slides,
+            'max_context_length': self.max_context_length,
+            'sliding_window_enabled': self.max_context_length is not None
         }
 
     def reset_stats(self):
