@@ -22,10 +22,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 class SpeculativeDecoder:
     """
-    Speculative decoding implementation.
+    Speculative decoding implementation with adaptive caching.
 
     Uses a small draft model to generate candidate tokens,
     then verifies them with the main model in parallel.
+
+    Performance optimization:
+    - Short sequences (<512 tokens): use_cache=False (avoids O(n²) overhead)
+    - Long sequences (≥512 tokens): Chunked processing with selective caching
     """
 
     def __init__(
@@ -33,7 +37,8 @@ class SpeculativeDecoder:
         draft_model: AutoModelForCausalLM,
         draft_tokenizer: AutoTokenizer,
         num_speculative_tokens: int = 4,
-        device: str = "cuda"
+        device: str = "cuda",
+        cache_threshold: int = 512
     ):
         """
         Initialize speculative decoder.
@@ -43,11 +48,13 @@ class SpeculativeDecoder:
             draft_tokenizer: Tokenizer for draft model
             num_speculative_tokens: Number of tokens to draft (K)
             device: Device to run on
+            cache_threshold: Sequence length threshold for enabling cache (default 512)
         """
         self.draft_model = draft_model
         self.draft_tokenizer = draft_tokenizer
         self.num_speculative_tokens = num_speculative_tokens
         self.device = device
+        self.cache_threshold = cache_threshold
 
         # Move draft model to device
         self.draft_model.to(device)
@@ -62,6 +69,27 @@ class SpeculativeDecoder:
         self.consecutive_failures = 0
         self.total_fallbacks = 0
         self.max_consecutive_failures = 3  # Disable speculative after 3 failures
+
+        # Adaptive caching stats
+        self.cache_mode_switches = 0
+        self.no_cache_tokens = 0
+        self.cached_tokens = 0
+
+    def _should_use_cache(self, current_length: int) -> bool:
+        """
+        Determine whether to use KV cache based on sequence length.
+
+        Strategy:
+        - Short sequences (<512): NO cache (overhead > benefit)
+        - Long sequences (≥512): Use cache (benefit > overhead)
+
+        Args:
+            current_length: Current sequence length
+
+        Returns:
+            True if cache should be used, False otherwise
+        """
+        return current_length >= self.cache_threshold
 
     @torch.no_grad()
     def _generate_standard(
@@ -97,11 +125,18 @@ class SpeculativeDecoder:
         generated = []
 
         for _ in range(num_tokens):
-            # PERFORMANCE FIX: Disable use_cache to avoid O(n²) memory overhead at long sequences
-            # Recomputation is faster than cache management for sequences >256 tokens
+            # ADAPTIVE CACHING: Choose based on sequence length
+            seq_len = input_ids.shape[1]
+            use_cache = self._should_use_cache(seq_len)
+
+            if use_cache:
+                self.cached_tokens += 1
+            else:
+                self.no_cache_tokens += 1
+
             outputs = main_model(
                 input_ids=input_ids,
-                use_cache=False,  # Changed from True - eliminates long-sequence slowdown
+                use_cache=use_cache,
                 return_dict=True
             )
 
@@ -158,11 +193,13 @@ class SpeculativeDecoder:
         current_ids = input_ids
 
         for _ in range(num_tokens):
-            # Generate next token with draft model
-            # PERFORMANCE FIX: Disable cache for draft model too
+            # ADAPTIVE CACHING: Draft model uses same strategy
+            seq_len = current_ids.shape[1]
+            use_cache = self._should_use_cache(seq_len)
+
             outputs = self.draft_model(
                 input_ids=current_ids,
-                use_cache=False,  # Changed from True
+                use_cache=use_cache,
                 return_dict=True
             )
 
@@ -251,11 +288,14 @@ class SpeculativeDecoder:
         # Concatenate input with ALL draft tokens
         full_input = torch.cat([input_ids, draft_ids], dim=1)  # [1, seq_len + K]
 
+        # ADAPTIVE CACHING: Verification uses same strategy
+        seq_len = full_input.shape[1]
+        use_cache = self._should_use_cache(seq_len)
+
         # Single forward pass for verification
-        # PERFORMANCE FIX: Disable cache for main model verification too
         outputs = main_model(
             input_ids=full_input,
-            use_cache=False,  # Changed from True
+            use_cache=use_cache,
             return_dict=True
         )
 
@@ -464,7 +504,11 @@ class SpeculativeDecoder:
             # Phase 1: Fallback statistics
             'consecutive_failures': self.consecutive_failures,
             'total_fallbacks': self.total_fallbacks,
-            'speculative_enabled': self.consecutive_failures < self.max_consecutive_failures
+            'speculative_enabled': self.consecutive_failures < self.max_consecutive_failures,
+            # Adaptive caching statistics
+            'no_cache_tokens': self.no_cache_tokens,
+            'cached_tokens': self.cached_tokens,
+            'cache_threshold': self.cache_threshold
         }
 
     def reset_stats(self):

@@ -25,8 +25,8 @@ import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 
-from Memopt import OptimizedLLM, ProfileStats
-from Memopt.profiler import compare_profiles
+from memopt import OptimizedLLM, ProfileStats
+from memopt.profiler import compare_profiles
 
 
 def run_baseline(model_name: str, prompts: list, max_tokens: int = 256):
