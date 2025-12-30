@@ -290,8 +290,8 @@ def main():
         "--optimization-level",
         type=str,
         choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive", "speculative", "flash"],
-        default="flash",
-        help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative/flash (default: flash - Stage 7, 30-60x)"
+        default="speculative",
+        help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative/flash (default: speculative - Stage 5b, 15-16x)"
     )
     parser.add_argument(
         "--max-kv-blocks",

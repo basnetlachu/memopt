@@ -16,7 +16,7 @@ from Memopt import OptimizedLLM
 # Initialize with best performance settings
 model = OptimizedLLM(
     model="gpt2-xl",
-    optimization_level="flash"  # 16-60x speedup
+    optimization_level="speculative"  # 15-16x speedup
 )
 
 # Generate text
@@ -103,8 +103,8 @@ pip install flash-attn --no-build-isolation
 | `high` | 0-2 | 6.20x | Good |
 | `maximum` | 0-3 | 6.14x | Advanced |
 | `ultra` | 0-4 | 6.12x | Full |
-| `speculative` | 0-5b | 15.45x | Excellent |
-| **`flash`** | **0-5b+7** | **16-60x** | **BEST** 🚀 |
+| **`speculative`** | **0-5b** | **15-16x** | **BEST** 🚀 |
+| `flash` | 0-5b+7 | 50-60x | Linux+A100 only |
 
 ---
 
@@ -115,7 +115,7 @@ pip install flash-attn --no-build-isolation
 ```python
 from Memopt import OptimizedLLM
 
-model = OptimizedLLM("gpt2-xl", optimization_level="flash")
+model = OptimizedLLM("gpt2-xl", optimization_level="speculative")
 response = model.generate("Explain quantum computing:", max_tokens=256)
 print(response)
 ```
@@ -125,7 +125,7 @@ print(response)
 ```python
 model = OptimizedLLM(
     model="gpt2-xl",
-    optimization_level="flash",
+    optimization_level="speculative",
     enable_profiling=True
 )
 
@@ -144,7 +144,7 @@ from fastapi import FastAPI
 from Memopt import OptimizedLLM
 
 app = FastAPI()
-model = OptimizedLLM("gpt2-xl", optimization_level="flash")
+model = OptimizedLLM("gpt2-xl", optimization_level="speculative")
 
 @app.post("/generate")
 async def generate(prompt: str, max_tokens: int = 256):
@@ -161,7 +161,7 @@ See `examples/api.py` for complete implementation.
 # Automatically uses all available GPUs
 model = OptimizedLLM(
     model="meta-llama/Llama-2-13b-hf",
-    optimization_level="flash",
+    optimization_level="speculative",
     num_gpus=None  # Auto-detect
 )
 
@@ -178,7 +178,7 @@ docker build -t Memopt:latest .
 
 # Run benchmark
 docker run --gpus all Memopt:latest \
-  python3 benchmark.py --model gpt2-xl --optimization-level flash
+  python3 benchmark.py --model gpt2-xl --optimization-level speculative
 
 # Run API server
 docker-compose up Memopt-api
@@ -198,7 +198,7 @@ Memopt currently supports local development and testing:
 from Memopt import OptimizedLLM
 
 # Local development mode
-model = OptimizedLLM("gpt2-xl", optimization_level="flash")
+model = OptimizedLLM("gpt2-xl", optimization_level="speculative")
 response = model.generate("Test", max_tokens=100)
 ```
 
@@ -216,7 +216,7 @@ Perfect for:
 
 ```bash
 # Quick benchmark
-python benchmark.py --model gpt2-xl --optimization-level flash
+python benchmark.py --model gpt2-xl --optimization-level speculative
 
 # Compare all levels
 python benchmark.py --model gpt2-xl --optimization-level all
@@ -241,7 +241,7 @@ Speedup:   16-17x ✅
 ```python
 model = OptimizedLLM(
     model="gpt2-xl",
-    optimization_level="flash",
+    optimization_level="speculative",
     device="cuda",           # or "cpu" (auto-detected)
     max_kv_blocks=4096,      # 64K token capacity
     enable_profiling=False
@@ -253,7 +253,7 @@ model = OptimizedLLM(
 ```python
 model = OptimizedLLM(
     model="meta-llama/Llama-2-13b-hf",
-    optimization_level="flash",
+    optimization_level="speculative",
     max_kv_blocks=4096,
     num_gpus=2,              # Multi-GPU
     expected_batch_size=8,
@@ -471,7 +471,7 @@ MIT License - see LICENSE file for details.
 
 ```python
 from Memopt import OptimizedLLM
-model = OptimizedLLM("gpt2-xl", optimization_level="flash")
+model = OptimizedLLM("gpt2-xl", optimization_level="speculative")
 print(model.generate("Hello world", max_tokens=50))
 ```
 
