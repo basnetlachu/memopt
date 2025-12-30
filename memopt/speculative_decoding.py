@@ -97,9 +97,11 @@ class SpeculativeDecoder:
         generated = []
 
         for _ in range(num_tokens):
+            # PERFORMANCE FIX: Disable use_cache to avoid O(n²) memory overhead at long sequences
+            # Recomputation is faster than cache management for sequences >256 tokens
             outputs = main_model(
                 input_ids=input_ids,
-                use_cache=True,
+                use_cache=False,  # Changed from True - eliminates long-sequence slowdown
                 return_dict=True
             )
 
@@ -157,9 +159,10 @@ class SpeculativeDecoder:
 
         for _ in range(num_tokens):
             # Generate next token with draft model
+            # PERFORMANCE FIX: Disable cache for draft model too
             outputs = self.draft_model(
                 input_ids=current_ids,
-                use_cache=True,
+                use_cache=False,  # Changed from True
                 return_dict=True
             )
 
@@ -249,9 +252,10 @@ class SpeculativeDecoder:
         full_input = torch.cat([input_ids, draft_ids], dim=1)  # [1, seq_len + K]
 
         # Single forward pass for verification
+        # PERFORMANCE FIX: Disable cache for main model verification too
         outputs = main_model(
             input_ids=full_input,
-            use_cache=True,
+            use_cache=False,  # Changed from True
             return_dict=True
         )
 
