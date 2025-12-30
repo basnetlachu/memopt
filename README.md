@@ -106,7 +106,7 @@ pip install flash-attn --no-build-isolation
 | **`speculative`** | **0-5b** | **15-16x** | **BEST** 🚀 |
 | `flash` | 0-5b+7 | 50-60x | Linux+A100 only |
 
-**Adaptive Caching:** The speculative optimization now uses intelligent cache management that maintains 15-16x speedup across all sequence lengths (100 to 10,000+ tokens) by automatically switching strategies based on sequence length.
+**Cache-Free Optimization:** Speculative decoding achieves 15-16x speedup by disabling KV cache (`use_cache=False`), eliminating O(n²) overhead. The parallel verification strategy makes traditional caching unnecessary, delivering consistent performance from 100 to 10,000+ tokens.
 
 ---
 
