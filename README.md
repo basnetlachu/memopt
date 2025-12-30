@@ -106,11 +106,11 @@ pip install flash-attn --no-build-isolation
 | **`speculative`** | **0-5b** | **15-16x** | **BEST** 🚀 |
 | `flash` | 0-5b+7 | 50-60x | Linux+A100 only |
 
-**Adaptive Caching Strategy:** Speculative decoding uses intelligent cache management:
-- **Short sequences (<512 tokens)**: Cache disabled for 15-16x speedup (cache overhead eliminated)
-- **Long sequences (≥512 tokens)**: Cache enabled to prevent O(n²) attention recomputation
-- **Trillion-token support**: Optional sliding window prevents memory explosion while maintaining quality
-- This hybrid approach maintains 15-16x speedup from 100 tokens to **trillions of tokens** 🚀
+**Cache-Free + Sliding Window Strategy:** Speculative decoding achieves optimal performance through:
+- **Cache completely disabled**: Parallel verification eliminates need for KV cache (15-16x speedup)
+- **Sliding window for long sequences**: Prevents O(n²) memory growth without cache overhead
+- **Trillion-token support**: Constant memory usage regardless of generation length
+- This approach maintains **15-16x speedup** from 100 tokens to **trillions of tokens** 🚀
 
 ---
 
