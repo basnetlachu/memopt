@@ -88,7 +88,7 @@ if torch.cuda.is_available():
 print("\n3. OPTIMIZED (Speculative, WITH sliding window)")
 print("-" * 70)
 model_with_window = OptimizedLLM(
-    MODEL,
+    model=MODEL,
     optimization_level="speculative",
     opt_config={'max_context_length': 'auto'},  # Enable sliding window!
     enable_profiling=True
