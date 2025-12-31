@@ -87,12 +87,34 @@ if torch.cuda.is_available():
 # Test 3: Optimized WITH sliding window (should be faster!)
 print("\n3. OPTIMIZED (Speculative, WITH sliding window)")
 print("-" * 70)
+
+# Create model normally first
 model_with_window = OptimizedLLM(
     model=MODEL,
     optimization_level="speculative",
-    opt_config={'max_context_length': 'auto'},  # Enable sliding window!
     enable_profiling=True
 )
+
+# MANUALLY enable sliding window by recreating the speculative decoder
+# This is a workaround since opt_config can't be passed to __init__
+if hasattr(model_with_window, 'speculative_decoder') and model_with_window.speculative_decoder:
+    # Get the current draft model and tokenizer
+    draft_model = model_with_window.speculative_decoder.draft_model
+    draft_tokenizer = model_with_window.speculative_decoder.draft_tokenizer
+
+    # Recreate with sliding window enabled
+    from memopt.speculative_decoding import SpeculativeDecoder
+    model_with_window.speculative_decoder = SpeculativeDecoder(
+        draft_model=draft_model,
+        draft_tokenizer=draft_tokenizer,
+        num_speculative_tokens=4,
+        device=model_with_window.device,
+        cache_threshold=512,
+        max_context_length=1024  # Enable sliding window (GPT-2 XL max)
+    )
+    print("✓ Sliding window enabled: 1024 tokens")
+else:
+    print("⚠️  Speculative decoder not available")
 
 start = time.time()
 _ = model_with_window.generate(PROMPT, max_tokens=MAX_TOKENS, do_sample=False)
