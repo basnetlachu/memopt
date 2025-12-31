@@ -23,6 +23,7 @@ from .memory_manager import SmartMemoryManager
 from .batch_utils import pad_sequences, update_attention_mask
 from .speculative_decoding import SpeculativeDecoder, create_draft_model
 from .model_parallel import init_model_parallel
+from .performance_guard import PerformanceGuard, AdaptiveController
 
 
 class OptimizedLLM:
@@ -181,6 +182,8 @@ class OptimizedLLM:
         expected_seq_len: int = 1000,
         max_kv_blocks: int = None,  # Override KV cache block limit
         num_gpus: int = None,  # Number of GPUs for Stage 6 (None = auto-detect)
+        enable_performance_guard: bool = False,  # Enable production safety guardrails
+        baseline_throughput: float = None,  # Baseline throughput for guard (measured externally)
         **kwargs
     ):
         """
@@ -204,6 +207,21 @@ class OptimizedLLM:
         self.expected_batch_size = expected_batch_size
         self.expected_seq_len = expected_seq_len
         self.max_kv_blocks_override = max_kv_blocks  # Store override
+
+        # Performance guard for production safety
+        self.performance_guard = None
+        self.adaptive_controller = None
+        if enable_performance_guard and baseline_throughput is not None:
+            self.performance_guard = PerformanceGuard(
+                baseline_throughput=baseline_throughput,
+                enable_auto_fallback=True,
+                regression_threshold=0.98,  # Max 2% regression
+                acceptance_threshold=0.85   # Min 85% acceptance rate
+            )
+            self.adaptive_controller = AdaptiveController(
+                guard=self.performance_guard,
+                initial_draft_tokens=4
+            )
 
         # Stage 6: Model parallelism setup
         self.num_gpus = num_gpus
@@ -557,41 +575,72 @@ class OptimizedLLM:
 
         # Stage 5b: Use speculative decoding if enabled
         if self.speculative_decoder is not None:
-            # Use speculative decoding path
-            with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
-                output_ids = self.speculative_decoder.generate(
-                    main_model=self.model,
-                    input_ids=input_ids[0],  # Single prompt for now
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=do_sample
-                )
+            # Check if guard has disabled speculative decoding
+            if self.performance_guard and self.performance_guard.should_disable_speculative():
+                print("⚠️  Performance guard: Speculative decoding disabled, falling back to baseline")
+                # Fall through to baseline generation path
+            else:
+                # Record start time for guard monitoring
+                import time
+                gen_start_time = time.time()
+                tokens_before = self.speculative_decoder.total_accepted_tokens if hasattr(self.speculative_decoder, 'total_accepted_tokens') else 0
+                draft_before = self.speculative_decoder.total_draft_tokens if hasattr(self.speculative_decoder, 'total_draft_tokens') else 0
 
-            # Track tokens for profiling
-            num_generated_tokens = output_ids.shape[-1] - input_ids.shape[-1]
-            if self.profiler:
-                self.profiler.tokens_generated += num_generated_tokens
+                # Use speculative decoding path
+                with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
+                    output_ids = self.speculative_decoder.generate(
+                        main_model=self.model,
+                        input_ids=input_ids[0],  # Single prompt for now
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=do_sample
+                    )
 
-            # End profiling
-            if self.profiler:
-                self.profiler.end_profiling()
-                if self.kv_cache:
-                    self.profiler.set_kv_cache_stats(self.kv_cache.get_stats())
+                # Calculate performance metrics for guard
+                gen_elapsed = time.time() - gen_start_time
+                num_generated_tokens = output_ids.shape[-1] - input_ids.shape[-1]
+                throughput = num_generated_tokens / gen_elapsed if gen_elapsed > 0 else 0
 
-            # Decode output - squeeze to 1D if needed
-            if output_ids.dim() > 1:
-                output_ids = output_ids.squeeze(0)
-            generated_text = self.tokenizer.decode(output_ids.tolist(), skip_special_tokens=True)
+                # Calculate acceptance rate
+                tokens_after = self.speculative_decoder.total_accepted_tokens if hasattr(self.speculative_decoder, 'total_accepted_tokens') else 0
+                draft_after = self.speculative_decoder.total_draft_tokens if hasattr(self.speculative_decoder, 'total_draft_tokens') else 0
+                draft_generated = draft_after - draft_before
+                acceptance_rate = (tokens_after - tokens_before) / draft_generated if draft_generated > 0 else 1.0
 
-            # Print speculative decoding stats
-            stats = self.speculative_decoder.get_stats()
-            if stats['total_draft_tokens'] > 0:
-                print(f"\n[Speculative Decoding Stats]")
-                print(f"  Acceptance rate: {stats['acceptance_rate']:.1%}")
-                print(f"  Theoretical speedup: {stats['theoretical_speedup']:.2f}x")
+                # Record metrics in performance guard
+                if self.performance_guard:
+                    gpu_memory = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+                    self.performance_guard.record_metrics(
+                        tokens_per_second=throughput,
+                        acceptance_rate=acceptance_rate,
+                        gpu_memory_gb=gpu_memory,
+                        sequence_length=output_ids.shape[-1]
+                    )
 
-            return generated_text if not is_batch else [generated_text]
+                # Track tokens for profiling
+                if self.profiler:
+                    self.profiler.tokens_generated += num_generated_tokens
+
+                # End profiling
+                if self.profiler:
+                    self.profiler.end_profiling()
+                    if self.kv_cache:
+                        self.profiler.set_kv_cache_stats(self.kv_cache.get_stats())
+
+                # Decode output - squeeze to 1D if needed
+                if output_ids.dim() > 1:
+                    output_ids = output_ids.squeeze(0)
+                generated_text = self.tokenizer.decode(output_ids.tolist(), skip_special_tokens=True)
+
+                # Print speculative decoding stats
+                stats = self.speculative_decoder.get_stats()
+                if stats['total_draft_tokens'] > 0:
+                    print(f"\n[Speculative Decoding Stats]")
+                    print(f"  Acceptance rate: {stats['acceptance_rate']:.1%}")
+                    print(f"  Theoretical speedup: {stats['theoretical_speedup']:.2f}x")
+
+                return generated_text if not is_batch else [generated_text]
 
         # Original generation path (Stages 0-4)
         # Create inference request
@@ -1061,6 +1110,17 @@ class OptimizedLLM:
             self.profiler.print_stats(baseline_stats)
         else:
             print("Profiling not enabled. Set enable_profiling=True when creating model.")
+
+    def get_performance_guard_stats(self) -> Optional[dict]:
+        """
+        Get performance guard statistics if guard is enabled.
+
+        Returns:
+            Dictionary with guard stats, or None if guard not enabled
+        """
+        if self.performance_guard:
+            return self.performance_guard.get_stats()
+        return None
     
     def reset_kv_cache(self, keep_prefixes: bool = None):
         """
