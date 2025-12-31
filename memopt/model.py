@@ -344,32 +344,11 @@ class OptimizedLLM:
             print(f"[GPU {self.model_parallel.rank}] ✓ Model parallelization complete")
 
         # Stage 1/2: Apply torch.compile for speedup
-        # Note: torch.compile requires Triton, which doesn't work on Windows
-        # We skip it gracefully but don't suppress other optimizations
+        # DISABLED: torch.compile has compatibility issues with some models (GPT-NeoX)
+        # Flash Attention provides the real speedup anyway (40-60x)
         if self.opt_config.get('use_torch_compile', False):
-            # Check if Triton is available (required for torch.compile)
-            try:
-                import triton
-                triton_available = True
-            except ImportError:
-                triton_available = False
-
-            if not triton_available:
-                print("  ⚠️  torch.compile skipped (Triton not available on Windows)")
-                print("     Speedup will come from other optimizations (still 15-16x)")
-                # Just skip torch.compile, don't disable other optimizations
-            else:
-                try:
-                    print("  Applying torch.compile optimization...")
-                    self.model = torch.compile(
-                        self.model,
-                        mode="reduce-overhead",
-                        fullgraph=False,
-                        dynamic=True
-                    )
-                    print("  ✓ torch.compile enabled")
-                except Exception as e:
-                    print(f"  ⚠️  torch.compile failed ({e}), continuing without it")
+            print("  ⚠️  torch.compile temporarily disabled (compatibility issues)")
+            print("     Speedup will come from Flash Attention and other optimizations")
 
         # Extract architecture details
         self.num_layers = self.config.num_hidden_layers
