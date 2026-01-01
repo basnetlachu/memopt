@@ -314,13 +314,26 @@ class OptimizedLLM:
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            # Load model
+            # Load model with Flash Attention 2 if available
+            load_kwargs = {
+                'torch_dtype': self.torch_dtype,
+                'device_map': self.device,
+                'low_cpu_mem_usage': True,
+                **kwargs
+            }
+
+            # Force Flash Attention 2 if enabled in optimization config
+            if self.opt_config.get('use_flash_attention', False):
+                try:
+                    import flash_attn
+                    load_kwargs['attn_implementation'] = 'flash_attention_2'
+                    print("  ✓ Forcing Flash Attention 2 implementation")
+                except ImportError:
+                    print("  ⚠️  Flash Attention not installed, using default attention")
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model,
-                torch_dtype=self.torch_dtype,
-                device_map=self.device,
-                low_cpu_mem_usage=True,
-                **kwargs
+                **load_kwargs
             )
         else:
             # Use provided model instance
