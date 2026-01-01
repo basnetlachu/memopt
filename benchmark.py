@@ -323,7 +323,16 @@ def main():
         prompts = base_prompts
         print("Using unique prompts without common prefix (Stage 3 will have minimal overhead)")
 
-    print("\n" + "="*70)
+    # CRITICAL: Clear GPU memory from any previous runs
+    if torch.cuda.is_available():
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        print("✓ GPU memory cleared\n")
+
+    print("="*70)
     print("Memopt BENCHMARK")
     print("="*70)
     # Map optimization levels to stage descriptions
