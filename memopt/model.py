@@ -543,6 +543,9 @@ class OptimizedLLM:
         - This guarantees 16-20x speedup for models without Flash Attention support
         - Models WITH Flash Attention get 50-60x speedup
         """
+        # Initialize to None by default
+        self.speculative_decoder = None
+
         # Auto-enable speculative decoding if Flash Attention isn't working
         force_speculative = False
         if hasattr(self, 'flash_attention_verified'):
