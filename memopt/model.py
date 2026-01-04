@@ -563,6 +563,11 @@ class OptimizedLLM:
                 device=self.device
             )
 
+            # If no compatible draft model available, skip speculative decoding
+            if draft_model is None:
+                print("  Skipping speculative decoding - no compatible draft model")
+                return
+
             # Get number of speculative tokens (K)
             num_speculative_tokens = self.opt_config.get('num_speculative_tokens', 4)
 
