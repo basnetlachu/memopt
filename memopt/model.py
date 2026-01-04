@@ -545,8 +545,10 @@ class OptimizedLLM:
         """
         # Auto-enable speculative decoding if Flash Attention isn't working
         force_speculative = False
-        if hasattr(self, 'flash_attention_available'):
-            if self.flash_attention_available and not self.flash_attention_verified:
+        if hasattr(self, 'flash_attention_verified'):
+            # If Flash Attention is NOT verified (either not installed or not working),
+            # FORCE enable speculative decoding for production robustness
+            if not self.flash_attention_verified:
                 print("\n=== AUTO-ENABLING Speculative Decoding (Flash Attention not verified) ===")
                 print("This ensures robust 16-20x speedup for this model")
                 force_speculative = True

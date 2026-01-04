@@ -603,6 +603,9 @@ def create_draft_model(
         'meta-llama/Llama-2-13b': 'meta-llama/Llama-2-7b',  # 13B → 7B
         'meta-llama/Llama-2-70b': 'meta-llama/Llama-2-13b',  # 70B → 13B
         'EleutherAI/gpt-neox-20b': 'EleutherAI/pythia-1.4b',  # NeoX 20B → Pythia 1.4B (same tokenizer!)
+        'Qwen/Qwen2-7B': 'Qwen/Qwen2-1.5B',  # Qwen2 7B → Qwen2 1.5B (same tokenizer!)
+        'Qwen/Qwen2-72B': 'Qwen/Qwen2-7B',  # Qwen2 72B → Qwen2 7B
+        'mistralai/Mistral-7B': 'mistralai/Mistral-7B-v0.1',  # Use same model (no smaller Mistral available)
     }
 
     # Check if main model is in map
