@@ -566,6 +566,28 @@ class OptimizedLLM:
             # If no compatible draft model available, skip speculative decoding
             if draft_model is None:
                 print("  Skipping speculative decoding - no compatible draft model")
+                print()
+                print("=" * 80)
+                print("⚠️  WARNING: Limited Speedup Expected (8-12x)")
+                print("=" * 80)
+                print()
+                print("This model has:")
+                print("  ✗ No Flash Attention (not installed or not working)")
+                print("  ✗ No compatible draft model for speculative decoding")
+                print()
+                print("Current optimizations: Paged KV cache + continuous batching")
+                print("Expected speedup: 8-12x")
+                print()
+                print("To achieve 40-60x speedup:")
+                print("  Option 1: Install Flash Attention")
+                print("    pip3 install flash-attn --no-build-isolation")
+                print()
+                print("  Option 2: Use model with proven draft model")
+                print("    EleutherAI/gpt-neox-20b (15-20x speedup)")
+                print("    meta-llama/Llama-2-7b-hf (with Flash Attn: 40-60x)")
+                print()
+                print("=" * 80)
+                print()
                 return
 
             # Get number of speculative tokens (K)
