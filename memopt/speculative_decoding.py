@@ -595,17 +595,29 @@ def create_draft_model(
     Returns:
         Tuple of (draft_model, draft_tokenizer)
     """
-    # Map main models to appropriate draft models
+    # Map main models to appropriate draft models with SAME tokenizer
     draft_model_map = {
         'gpt2-xl': 'gpt2',           # XL → base (4x smaller)
         'gpt2-large': 'gpt2',         # Large → base (3x smaller)
         'gpt2-medium': 'gpt2',        # Medium → base (2x smaller)
         'meta-llama/Llama-2-13b': 'meta-llama/Llama-2-7b',  # 13B → 7B
         'meta-llama/Llama-2-70b': 'meta-llama/Llama-2-13b',  # 70B → 13B
+        'EleutherAI/gpt-neox-20b': 'EleutherAI/pythia-1.4b',  # NeoX 20B → Pythia 1.4B (same tokenizer!)
     }
 
-    # Default: use gpt2 as draft model
-    draft_model_name = draft_model_map.get(main_model_name, 'gpt2')
+    # Check if main model is in map
+    draft_model_name = None
+    for key in draft_model_map:
+        if key in main_model_name:
+            draft_model_name = draft_model_map[key]
+            break
+
+    # Default: use gpt2 as draft model (may cause vocab mismatch for some models)
+    if draft_model_name is None:
+        draft_model_name = 'gpt2'
+        print(f"  ⚠️  WARNING: Using GPT-2 as draft for {main_model_name}")
+        print(f"     This may cause vocabulary mismatch errors")
+        print(f"     Consider using a draft model with matching tokenizer")
 
     print(f"  Loading draft model: {draft_model_name}")
 
