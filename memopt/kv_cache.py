@@ -276,11 +276,22 @@ class PagedKVCache:
 
         return blocks
     
+    def _evict_lru_block(self):
+        """
+        Evict a single LRU block to make room for long sequences.
+        For production trillion-token support.
+        """
+        try:
+            self._evict_lru_blocks(1)
+        except CacheEvictionError:
+            # No blocks available to evict
+            pass
+
     def free_sequence(self, seq_id: int):
         """Free all blocks associated with a sequence."""
         if seq_id not in self.block_tables:
             return
-        
+
         blocks = self.block_tables[seq_id]
         for block_id in blocks:
             self.block_ref_counts[block_id] -= 1
@@ -288,7 +299,7 @@ class PagedKVCache:
                 self.free_blocks.add(block_id)
                 self.stats.used_pages -= 1
                 del self.block_ref_counts[block_id]
-        
+
         del self.block_tables[seq_id]
     
     def _quantize_tensor(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
@@ -365,6 +376,19 @@ class PagedKVCache:
             additional = end_block - len(self.block_tables[seq_id])
             new_blocks = []
             for _ in range(additional):
+                # Check if we have free blocks
+                if not self.free_blocks:
+                    # Cache is full - evict LRU blocks for long sequence support
+                    self._evict_lru_block()
+
+                if not self.free_blocks:
+                    # Still no free blocks - this sequence is too long for allocated cache
+                    raise RuntimeError(
+                        f"KV cache exhausted: need {additional} more blocks but cache is full. "
+                        f"Sequence length {seq_len} exceeds cache capacity. "
+                        f"Try increasing max_kv_blocks or reducing sequence length."
+                    )
+
                 block_id = self.free_blocks.pop()
                 new_blocks.append(block_id)
                 self.block_ref_counts[block_id] = 1
