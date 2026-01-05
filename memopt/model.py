@@ -95,6 +95,9 @@ class OptimizedLLM:
             "use_continuous_batching": True,
             # Stage 3 optimizations (enabled in maximum+)
             "enable_prefix_sharing": True,  # Stage 3: KV cache prefix sharing
+            # Trillion-token features (enabled in maximum+)
+            "enable_sliding_window": True,
+            "window_size": 4096,
         },
         "aggressive": {
             "quantize_kv": True,
@@ -127,6 +130,9 @@ class OptimizedLLM:
             "enable_priority_scheduling": True,   # Stage 4: Priority-aware scheduling
             "enable_dynamic_batching": True,      # Stage 4: Auto-tune batch size, smart grouping
             "max_batch_size": 32,                 # Stage 4: Larger batches
+            # Trillion-token features (enabled in ultra+)
+            "enable_sliding_window": True,
+            "window_size": 4096,
         },
         "speculative": {
             "quantize_kv": False,
@@ -146,6 +152,9 @@ class OptimizedLLM:
             "enable_speculative_decoding": True,       # Stage 5b: Use draft model
             "num_speculative_tokens": 4,               # Stage 5b: Draft K=4 tokens at a time
             "draft_model": "auto",                     # Stage 5b: Auto-select draft model
+            # Trillion-token features (enabled in speculative+)
+            "enable_sliding_window": True,
+            "window_size": 8192,  # Larger window for speculative mode
         },
         "flash": {
             "quantize_kv": False,
@@ -168,6 +177,9 @@ class OptimizedLLM:
             # Stage 7: Enhanced attention (2-3x additional, 30-60x total) 🚀
             "force_flash_attention": True,             # Stage 7: Force best attention backend
             "print_attention_backend": True,           # Stage 7: Show which backend is used
+            # Trillion-token features (enabled in flash mode)
+            "enable_sliding_window": True,
+            "window_size": 8192,  # Larger window for flash mode
         },
     }
     
@@ -497,7 +509,9 @@ class OptimizedLLM:
             max_blocks=optimal_config['max_blocks'],  # Smart allocation!
             device=self.device,
             quantize=self.opt_config['quantize_kv'],
-            enable_prefix_sharing=self.opt_config.get('enable_prefix_sharing', False)  # Stage 3
+            enable_prefix_sharing=self.opt_config.get('enable_prefix_sharing', False),  # Stage 3
+            enable_sliding_window=self.opt_config.get('enable_sliding_window', False),  # Trillion-token
+            window_size=self.opt_config.get('window_size', 4096)  # Trillion-token
         )
         
         # Store memory manager for potential dynamic adjustments
