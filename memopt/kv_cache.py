@@ -18,6 +18,12 @@ import time
 # Phase 1: Import exceptions for crash prevention
 from .exceptions import CacheEvictionError
 
+# Trillion-token scale: Sliding window for bounded memory
+from .sliding_window import SlidingWindowManager, apply_sliding_window_to_kv_cache
+
+# Cross-request prefix deduplication for trillion-token workloads
+from .prefix_deduplication import PrefixDeduplicationManager
+
 
 @dataclass
 class CacheStats:
@@ -65,7 +71,9 @@ class PagedKVCache:
         quantize: bool = True,
         layer_retention_strategy: str = "keep_early",
         enable_prefix_sharing: bool = False,
-        eviction_policy: str = "lru"
+        eviction_policy: str = "lru",
+        enable_sliding_window: bool = True,
+        window_size: int = 4096
     ):
         """
         Args:
@@ -79,6 +87,8 @@ class PagedKVCache:
             layer_retention_strategy: "keep_early" or "keep_all"
             enable_prefix_sharing: Enable KV cache prefix sharing (Stage 3)
             eviction_policy: Cache eviction policy - "lru" (Phase 1)
+            enable_sliding_window: Enable sliding window for trillion-token scale
+            window_size: Sliding window size in tokens
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -90,6 +100,7 @@ class PagedKVCache:
         self.layer_retention_strategy = layer_retention_strategy
         self.enable_prefix_sharing = enable_prefix_sharing
         self.eviction_policy = eviction_policy
+        self.enable_sliding_window = enable_sliding_window
         
         # Determine which layers to keep in HBM vs stream
         # Early layers (first 25%) stay resident - they're accessed most
@@ -144,6 +155,27 @@ class PagedKVCache:
         # Prefix sharing (Stage 3)
         self.prefix_cache: Dict[str, List[int]] = {}  # prefix_hash -> block_ids
         self.prefix_min_length = 32  # Minimum tokens for prefix sharing
+
+        # Trillion-token scale: Sliding window manager
+        self.sliding_window = None
+        if self.enable_sliding_window:
+            self.sliding_window = SlidingWindowManager(
+                window_size=window_size,
+                min_window_size=1024,
+                enable_dynamic_window=True
+            )
+
+        # Track sequence info for sliding window integration
+        self.sequence_blocks: Dict[int, dict] = {}  # seq_id -> {blocks, current_length}
+
+        # Cross-request prefix deduplication (Stage 3 enhancement)
+        self.prefix_dedup = None
+        if self.enable_prefix_sharing:
+            self.prefix_dedup = PrefixDeduplicationManager(
+                min_prefix_length=max(32, self.prefix_min_length),
+                max_prefix_length=2048,
+                enable_auto_detection=True
+            )
 
         # Statistics
         self.stats = CacheStats(total_pages=max_blocks)
@@ -274,6 +306,13 @@ class PagedKVCache:
         self.block_tables[seq_id] = blocks
         self.stats.used_pages += num_blocks
 
+        # Trillion-token scale: Track sequence info for sliding window
+        if seq_id not in self.sequence_blocks:
+            self.sequence_blocks[seq_id] = {
+                'blocks': blocks.copy(),
+                'current_length': 0
+            }
+
         return blocks
     
     def _evict_lru_block(self):
@@ -292,6 +331,21 @@ class PagedKVCache:
         if seq_id not in self.block_tables:
             return
 
+        # Cross-request prefix dedup: Decrement ref count for shared prefix
+        if self.prefix_dedup:
+            evictable_prefix = self.prefix_dedup.decrement_ref(seq_id)
+            if evictable_prefix:
+                # Prefix is no longer used, can evict its blocks
+                prefix_blocks = self.prefix_dedup.evict_prefix(evictable_prefix)
+                if prefix_blocks:
+                    for block_id in prefix_blocks:
+                        if block_id in self.block_ref_counts:
+                            self.block_ref_counts[block_id] -= 1
+                            if self.block_ref_counts[block_id] == 0:
+                                self.free_blocks.add(block_id)
+                                self.stats.used_pages -= 1
+                                del self.block_ref_counts[block_id]
+
         blocks = self.block_tables[seq_id]
         for block_id in blocks:
             self.block_ref_counts[block_id] -= 1
@@ -301,6 +355,10 @@ class PagedKVCache:
                 del self.block_ref_counts[block_id]
 
         del self.block_tables[seq_id]
+
+        # Trillion-token scale: Clean up sequence tracking
+        if seq_id in self.sequence_blocks:
+            del self.sequence_blocks[seq_id]
     
     def _quantize_tensor(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
         """
@@ -338,6 +396,7 @@ class PagedKVCache:
         Write KV cache for a layer and sequence.
 
         Phase 1: Updates LRU timestamps (O(1) overhead).
+        Trillion-token scale: Applies sliding window eviction if enabled.
 
         Args:
             layer_idx: Layer index
@@ -348,6 +407,29 @@ class PagedKVCache:
         """
         # Phase 1: Update LRU timestamp for all blocks touched (O(1) per block)
         current_time = time.time()
+
+        # Trillion-token scale: Apply sliding window BEFORE writing if needed
+        if self.enable_sliding_window and self.sliding_window and seq_id in self.sequence_blocks:
+            seq_info = self.sequence_blocks[seq_id]
+            current_length = seq_info['current_length']
+
+            # Check if we need to apply sliding window
+            if self.sliding_window.should_apply_window(current_length):
+                # Apply sliding window eviction to free old blocks
+                apply_sliding_window_to_kv_cache(self, self.sliding_window, seq_id)
+
+                # Adjust start_pos after windowing
+                # After windowing, we keep only last W tokens
+                # So if we had 5000 tokens and window is 4096, we keep tokens 904-5000
+                # New start_pos should be relative to the windowed sequence
+                if current_length > self.sliding_window.window_size:
+                    # Calculate new effective start position
+                    tokens_evicted = current_length - self.sliding_window.window_size
+                    if start_pos < tokens_evicted:
+                        # This write is for tokens that should be evicted, skip it
+                        return
+                    # Adjust start_pos to be relative to windowed cache
+                    start_pos = start_pos - tokens_evicted
         # Handle different input shapes
         if k.dim() == 3:
             # [num_heads, seq_len, head_dim] -> add batch dimension
@@ -446,6 +528,11 @@ class PagedKVCache:
                 # Direct FP16 storage
                 self.k_cache[layer_idx, block_id, cache_start:cache_end] = k_block
                 self.v_cache[layer_idx, block_id, cache_start:cache_end] = v_block
+
+        # Trillion-token scale: Update sequence length tracking
+        if seq_id in self.sequence_blocks:
+            self.sequence_blocks[seq_id]['current_length'] = end_pos
+            self.sequence_blocks[seq_id]['blocks'] = self.block_tables[seq_id].copy()
     
     def read_cache(
         self,
@@ -534,14 +621,51 @@ class PagedKVCache:
         
         return k_out, v_out
     
-    def get_stats(self) -> CacheStats:
-        """Return current cache statistics."""
-        return self.stats
+    def adjust_to_memory_pressure(self, memory_pressure: float):
+        """
+        Adjust cache behavior based on memory pressure.
+
+        Production-critical for trillion-token scale:
+        - Adjusts sliding window size dynamically
+        - Can trigger aggressive eviction if needed
+
+        Args:
+            memory_pressure: 0.0 to 1.0
+        """
+        if self.enable_sliding_window and self.sliding_window:
+            self.sliding_window.adjust_window_size(memory_pressure)
+
+    def get_stats(self) -> dict:
+        """Return current cache statistics including sliding window and prefix dedup stats."""
+        stats_dict = {
+            'total_pages': self.stats.total_pages,
+            'used_pages': self.stats.used_pages,
+            'cache_hits': self.stats.cache_hits,
+            'cache_misses': self.stats.cache_misses,
+            'memory_saved_gb': self.stats.memory_saved_gb,
+            'utilization': self.stats.utilization,
+            'hit_rate': self.stats.hit_rate,
+        }
+
+        # Add sliding window stats if enabled
+        if self.enable_sliding_window and self.sliding_window:
+            stats_dict['sliding_window'] = self.sliding_window.get_stats()
+
+        # Add prefix deduplication stats if enabled
+        if self.enable_prefix_sharing and self.prefix_dedup:
+            stats_dict['prefix_dedup'] = self.prefix_dedup.get_stats()
+
+        return stats_dict
 
     def reset_stats(self):
         """Reset statistics counters."""
         self.stats.cache_hits = 0
         self.stats.cache_misses = 0
+
+        # Reset sliding window stats if enabled
+        if self.enable_sliding_window and self.sliding_window:
+            # Note: sliding window counters are fleet-wide, don't reset them
+            pass
 
     # ========================================================================
     # Phase 1: Request Lifecycle Management (for eviction safety)

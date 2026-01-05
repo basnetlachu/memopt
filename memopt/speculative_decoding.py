@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, List, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from .adaptive_controller import AdaptiveSpeculationController
+from .memory_monitor import MemoryPressureMonitor
 
 
 class SpeculativeDecoder:
@@ -63,6 +65,19 @@ class SpeculativeDecoder:
         # Move draft model to device
         self.draft_model.to(device)
         self.draft_model.eval()
+
+        # Production-grade adaptive controller
+        # This is the KEY to trillion-token scale - makes speculation opportunistic, not mandatory
+        self.adaptive_controller = AdaptiveSpeculationController(
+            initial_k=num_speculative_tokens,
+            min_k=1,
+            max_k=8,
+            context_disable_threshold=8192,  # Disable speculation above 8k context
+            disable_after_low_steps=10
+        )
+
+        # Memory pressure monitor for adaptive decisions
+        self.memory_monitor = MemoryPressureMonitor(device=device)
 
         # Stats for monitoring
         self.total_draft_tokens = 0
@@ -459,9 +474,21 @@ class SpeculativeDecoder:
         generated_tokens = 0
 
         while generated_tokens < max_new_tokens:
+            context_length = current_ids.shape[1]
+
+            # PRODUCTION: Check if speculation should be used (adaptive controller)
+            # This is the key to trillion-token scale - dynamic on/off based on metrics
+            memory_pressure = self.memory_monitor.get_memory_pressure()
+            should_speculate = self.adaptive_controller.should_speculate(
+                context_length=context_length,
+                memory_pressure=memory_pressure
+            )
+
             # Phase 1: Check if speculative decoding should be disabled
-            if self.consecutive_failures >= self.max_consecutive_failures:
-                # Too many failures, use standard generation for this request
+            if (self.consecutive_failures >= self.max_consecutive_failures or
+                not should_speculate):
+                # Adaptive controller says NO or too many failures
+                # Use standard generation (1 token at a time)
                 num_tokens = min(1, max_new_tokens - generated_tokens)
                 accepted_tokens = self._generate_standard(
                     main_model,
@@ -476,10 +503,13 @@ class SpeculativeDecoder:
                 continue
 
             try:
+                # Get dynamic K from adaptive controller
+                dynamic_k = self.adaptive_controller.get_num_speculative_tokens()
+
                 # Step 1: Draft K tokens with small model
                 draft_ids, draft_logits = self.draft_tokens(
                     current_ids,
-                    num_tokens=min(self.num_speculative_tokens, max_new_tokens - generated_tokens),
+                    num_tokens=min(dynamic_k, max_new_tokens - generated_tokens),
                     temperature=temperature,
                     top_p=top_p,
                     do_sample=do_sample
@@ -498,6 +528,19 @@ class SpeculativeDecoder:
 
                 # Success - reset failure counter
                 self.consecutive_failures = 0
+
+                # PRODUCTION: Update adaptive controller with results
+                num_proposed = draft_ids.shape[1]
+                update_info = self.adaptive_controller.update(
+                    num_accepted=num_accepted,
+                    num_proposed=num_proposed,
+                    context_length=context_length
+                )
+
+                # Log adaptive actions if any
+                if update_info['actions']:
+                    for action in update_info['actions']:
+                        pass  # Could log to monitoring system in production
 
             except Exception as e:
                 # Phase 1: Draft model failed, fallback to standard generation
@@ -535,10 +578,10 @@ class SpeculativeDecoder:
         """
         Get speculative decoding statistics.
 
-        Phase 1: Now includes fallback tracking.
+        PRODUCTION: Now includes adaptive controller metrics for fleet monitoring.
 
         Returns:
-            Dict with acceptance rate and speedup metrics
+            Dict with acceptance rate, speedup, and adaptive control metrics
         """
         if self.total_draft_tokens > 0:
             acceptance_rate = self.total_accepted_tokens / self.total_draft_tokens
@@ -553,6 +596,9 @@ class SpeculativeDecoder:
         else:
             theoretical_speedup = 1.0
 
+        # Get adaptive controller stats (PRODUCTION CRITICAL)
+        controller_stats = self.adaptive_controller.get_stats()
+
         return {
             'total_draft_tokens': self.total_draft_tokens,
             'total_accepted_tokens': self.total_accepted_tokens,
@@ -561,6 +607,10 @@ class SpeculativeDecoder:
             'theoretical_speedup': theoretical_speedup,
             # Phase 1: Fallback statistics
             'consecutive_failures': self.consecutive_failures,
+            # PRODUCTION: Adaptive control metrics (trillion-token scale)
+            'adaptive_controller': controller_stats,
+            'current_k': controller_stats['current_k'],
+            'speculation_enabled': controller_stats['enabled'],
             'total_fallbacks': self.total_fallbacks,
             'speculative_enabled': self.consecutive_failures < self.max_consecutive_failures,
             # Adaptive caching statistics
@@ -571,7 +621,9 @@ class SpeculativeDecoder:
             'total_generated_tokens': self.total_generated_tokens,
             'window_slides': self.window_slides,
             'max_context_length': self.max_context_length,
-            'sliding_window_enabled': self.max_context_length is not None
+            'sliding_window_enabled': self.max_context_length is not None,
+            # Memory pressure monitoring (production-critical)
+            'memory_stats': self.memory_monitor.get_memory_stats()
         }
 
     def reset_stats(self):
