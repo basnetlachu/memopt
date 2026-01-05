@@ -238,9 +238,14 @@ class MemoryProfiler:
         
         # KV cache metrics
         if self.kv_cache_stats:
-            stats.kv_cache_hit_rate = self.kv_cache_stats.hit_rate * 100
-            stats.memory_saved_by_quantization_gb = self.kv_cache_stats.memory_saved_gb
-            
+            # Handle both dict and object formats
+            if isinstance(self.kv_cache_stats, dict):
+                stats.kv_cache_hit_rate = self.kv_cache_stats.get('hit_rate', 0.0) * 100
+                stats.memory_saved_by_quantization_gb = self.kv_cache_stats.get('memory_saved_gb', 0.0)
+            else:
+                stats.kv_cache_hit_rate = self.kv_cache_stats.hit_rate * 100
+                stats.memory_saved_by_quantization_gb = self.kv_cache_stats.memory_saved_gb
+
             # Estimate KV cache memory usage
             # For 13B model with 40 layers: ~160MB per 1K tokens with FP16
             # With INT8: ~40MB per 1K tokens
