@@ -16,7 +16,6 @@ from typing import Optional, List, Union
 import warnings
 
 from .kv_cache import PagedKVCache
-from .attention import OptimizedAttentionLayer
 from .scheduler import SimpleScheduler, ContinuousBatchScheduler, InferenceRequest
 from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
@@ -454,19 +453,15 @@ class OptimizedLLM:
         self.memory_manager = memory_manager
     
     def _initialize_attention(self):
-        """Initialize optimized attention."""
-        if not self.opt_config['use_flash_attention']:
-            self.attention = None
-            return
+        """Initialize optimized attention.
 
-        # Stage 1: Pass workspace reuse flag
-        self.attention = OptimizedAttentionLayer(
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            use_flash=True,
-            enable_workspace_reuse=self.opt_config.get('enable_workspace_reuse', False)
-        )
+        NOTE: Attention optimization is now handled by HuggingFace's attn_implementation parameter.
+        This method is kept for backwards compatibility but does nothing.
+        SDPA (scaled_dot_product_attention) is enabled via attn_implementation='sdpa' in model loading.
+        """
+        # Attention backend is now controlled by attn_implementation parameter in _load_model()
+        # No separate attention layer needed - HuggingFace handles this natively
+        self.attention = None
     
     def _initialize_scheduler(self):
         """Initialize batch scheduler."""
