@@ -233,9 +233,18 @@ def apply_sliding_window_to_kv_cache(
 
     # Evict the blocks
     for block_id in blocks_to_evict:
-        if block_id in kv_cache.allocated_blocks:
-            kv_cache.allocated_blocks.remove(block_id)
-            kv_cache.free_blocks.append(block_id)
+        # Check if block is not in free_blocks (meaning it's allocated)
+        if block_id not in kv_cache.free_blocks:
+            # Free the block
+            kv_cache.free_blocks.add(block_id)
+
+            # Remove from block ownership tracking
+            if block_id in kv_cache.block_owner:
+                del kv_cache.block_owner[block_id]
+            if block_id in kv_cache.block_last_used:
+                del kv_cache.block_last_used[block_id]
+            if block_id in kv_cache.block_ref_counts:
+                del kv_cache.block_ref_counts[block_id]
 
     # Update sequence info
     seq_info['blocks'] = seq_info['blocks'][end_block + 1:]

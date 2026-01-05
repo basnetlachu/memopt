@@ -40,106 +40,15 @@ class OptimizedLLM:
     """
     
     OPTIMIZATION_PRESETS = {
-        "conservative": {
-            "quantize_kv": False,
-            "use_paged_cache": True,
-            "use_flash_attention": True,
-            "kv_block_size": 16,
-            # Stage 1 optimizations (disabled in conservative mode)
-            "enable_adaptive_allocation": False,
-            "enable_workspace_reuse": False,
-            "use_torch_compile": False,  # Disabled in conservative
-            # Stage 2 optimizations (disabled in conservative mode)
-            "use_continuous_batching": False,
-            # Stage 3 optimizations (disabled in conservative mode)
-            "enable_prefix_sharing": False,
-        },
-        "balanced": {
-            "quantize_kv": False,  # FP16 for maximum speed (Stage 1)
-            "use_paged_cache": True,
-            "use_flash_attention": True,
-            "kv_block_size": 16,
-            # Stage 1 optimizations (enabled in balanced+)
-            "enable_adaptive_allocation": True,
-            "enable_workspace_reuse": True,
-            "use_torch_compile": True,  # Stage 1: torch.compile for speedup
-            # Stage 2 optimizations (disabled in balanced, enabled in high+)
-            "use_continuous_batching": False,
-            # Stage 3 optimizations (disabled in balanced, enabled in maximum+)
-            "enable_prefix_sharing": False,
-        },
-        "high": {
-            "quantize_kv": False,  # FP16 for maximum speed (Stage 2)
-            "use_paged_cache": True,
-            "use_flash_attention": True,
-            "kv_block_size": 16,
-            # Stage 1 optimizations (enabled)
-            "enable_adaptive_allocation": True,
-            "enable_workspace_reuse": True,
-            "use_torch_compile": True,  # Stage 2: torch.compile enabled
-            # Stage 2 optimizations (enabled in high+)
-            "use_continuous_batching": True,
-            # Stage 3 optimizations (disabled in high, enabled in maximum+)
-            "enable_prefix_sharing": False,
-        },
+        # ONE unified "maximum" preset with ALL optimizations enabled
         "maximum": {
-            "quantize_kv": False,  # FP16 for maximum speed (Stage 3)
+            # Core optimizations
+            "quantize_kv": False,  # FP16 for speed
             "use_paged_cache": True,
             "use_flash_attention": True,
             "kv_block_size": 16,
-            # Stage 1 optimizations (enabled)
-            "enable_adaptive_allocation": True,
-            "enable_workspace_reuse": True,
-            "use_torch_compile": True,  # Stage 3: torch.compile enabled
-            # Stage 2 optimizations (enabled)
-            "use_continuous_batching": True,
-            # Stage 3 optimizations (enabled in maximum+)
-            "enable_prefix_sharing": True,  # Stage 3: KV cache prefix sharing
-            # Trillion-token features (enabled in maximum+)
-            "enable_sliding_window": True,
-            "window_size": 4096,
-        },
-        "aggressive": {
-            "quantize_kv": True,
-            "use_paged_cache": True,
-            "use_flash_attention": True,
-            "kv_block_size": 32,
-            # Stage 1 optimizations (enabled)
-            "enable_adaptive_allocation": True,
-            "enable_workspace_reuse": True,
-            "use_torch_compile": True,  # Enabled in aggressive
-            # Stage 2 optimizations (enabled)
-            "use_continuous_batching": True,
-            # Stage 3 optimizations (enabled)
-            "enable_prefix_sharing": True,
-        },
-        "ultra": {
-            "quantize_kv": False,  # FP16 for maximum speed
-            "use_paged_cache": True,
-            "use_flash_attention": True,
-            "kv_block_size": 16,
-            # Stage 1 optimizations (enabled)
-            "enable_adaptive_allocation": True,
-            "enable_workspace_reuse": True,
-            "use_torch_compile": True,
-            # Stage 2 optimizations (enabled)
-            "use_continuous_batching": True,
-            # Stage 3 optimizations (enabled)
-            "enable_prefix_sharing": True,
-            # Stage 4 optimizations (enabled in ultra)
-            "enable_priority_scheduling": True,   # Stage 4: Priority-aware scheduling
-            "enable_dynamic_batching": True,      # Stage 4: Auto-tune batch size, smart grouping
-            "max_batch_size": 32,                 # Stage 4: Larger batches
-            # Trillion-token features (enabled in ultra+)
-            "enable_sliding_window": True,
-            "window_size": 4096,
-        },
-        "speculative": {
-            "quantize_kv": False,
-            "use_paged_cache": True,
-            "use_flash_attention": True,
-            "kv_block_size": 16,
-            # Stage 1-4 optimizations (all enabled)
+
+            # Stage 1-4: All memory optimizations
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
             "use_torch_compile": True,
@@ -148,45 +57,35 @@ class OptimizedLLM:
             "enable_priority_scheduling": True,
             "enable_dynamic_batching": True,
             "max_batch_size": 32,
-            # Stage 5b: Speculative decoding (15.45x speedup)
-            "enable_speculative_decoding": True,       # Stage 5b: Use draft model
-            "num_speculative_tokens": 4,               # Stage 5b: Draft K=4 tokens at a time
-            "draft_model": "auto",                     # Stage 5b: Auto-select draft model
-            # Trillion-token features (enabled in speculative+)
-            "enable_sliding_window": True,
-            "window_size": 8192,  # Larger window for speculative mode
-        },
-        "flash": {
-            "quantize_kv": False,
-            "use_paged_cache": True,
-            "use_flash_attention": True,  # Stage 7: Enhanced Flash Attention
-            "kv_block_size": 16,
-            # Stage 1-4 optimizations (all enabled)
-            "enable_adaptive_allocation": True,
-            "enable_workspace_reuse": True,
-            "use_torch_compile": True,
-            "use_continuous_batching": True,
-            "enable_prefix_sharing": True,
-            "enable_priority_scheduling": True,
-            "enable_dynamic_batching": True,
-            "max_batch_size": 32,
-            # Stage 5b: Speculative decoding (15.45x)
+
+            # Stage 5: Speculative decoding (6-12x speedup)
             "enable_speculative_decoding": True,
             "num_speculative_tokens": 4,
             "draft_model": "auto",
-            # Stage 7: Enhanced attention (2-3x additional, 30-60x total) 🚀
-            "force_flash_attention": True,             # Stage 7: Force best attention backend
-            "print_attention_backend": True,           # Stage 7: Show which backend is used
-            # Trillion-token features (enabled in flash mode)
+
+            # Stage 7: Flash Attention backend selection
+            "force_flash_attention": True,
+            "print_attention_backend": True,
+
+            # Trillion-token features
             "enable_sliding_window": True,
-            "window_size": 8192,  # Larger window for flash mode
+            "window_size": 8192,  # 8K sliding window for infinite contexts
         },
+
+        # Aliases for backward compatibility (all point to "maximum")
+        "conservative": None,  # Will default to "maximum"
+        "balanced": None,
+        "high": None,
+        "ultra": None,
+        "aggressive": None,
+        "speculative": None,
+        "flash": None,
     }
     
     def __init__(
         self,
         model: Union[str, nn.Module],
-        optimization_level: str = "balanced",
+        optimization_level: str = "maximum",
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.float16,
         enable_profiling: bool = False,
@@ -257,13 +156,18 @@ class OptimizedLLM:
                 print(f"    Falling back to single GPU.")
                 self.num_gpus = 1
         
-        # Get optimization config
+        # Get optimization config - all levels now use "maximum"
         if optimization_level not in self.OPTIMIZATION_PRESETS:
             warnings.warn(
-                f"Unknown optimization level '{optimization_level}', using 'balanced'"
+                f"Unknown optimization level '{optimization_level}', using 'maximum'"
             )
-            optimization_level = "balanced"
-        
+            optimization_level = "maximum"
+
+        # If alias (None), use "maximum"
+        if self.OPTIMIZATION_PRESETS[optimization_level] is None:
+            print(f"  Note: '{optimization_level}' is an alias for 'maximum' (all optimizations enabled)")
+            optimization_level = "maximum"
+
         self.opt_config = self.OPTIMIZATION_PRESETS[optimization_level]
         self.optimization_level = optimization_level
 

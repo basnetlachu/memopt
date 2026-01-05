@@ -205,20 +205,26 @@ def print_memory_analysis(optimized_model, baseline_memory_gb, optimized_peak_gb
         kv = optimized_model.kv_cache
         stats = kv.get_stats()
         
-        # Calculate actual memory
-        blocks_used = stats.used_pages
+        # Calculate actual memory - handle both dict and object
+        if isinstance(stats, dict):
+            blocks_used = stats.get('used_pages', 0)
+            utilization = stats.get('utilization', 0.0)
+        else:
+            blocks_used = stats.used_pages
+            utilization = stats.utilization
+
         bytes_per_block = (
-            kv.block_size * kv.num_heads * kv.head_dim * 
+            kv.block_size * kv.num_heads * kv.head_dim *
             (1 if kv.quantize else 2) * 2 * kv.num_layers
         )
         actual_kv_gb = (blocks_used * bytes_per_block) / (1024**3)
-        
+
         # What baseline would use (FP16 for same tokens)
         baseline_kv_gb = actual_kv_gb * (2 if kv.quantize else 1)
-        
+
         print(f"\nKV Cache:")
         print(f"  Allocated: {kv.max_blocks} blocks (max capacity)")
-        print(f"  Used: {blocks_used} blocks ({stats.utilization*100:.1f}% utilization)")
+        print(f"  Used: {blocks_used} blocks ({utilization*100:.1f}% utilization)")
         print(f"  Quantization: {'INT8' if kv.quantize else 'FP16'}")
 
         # Show prefix sharing stats if enabled
