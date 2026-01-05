@@ -4,19 +4,17 @@ Benchmark script for Memopt
 
 Compares baseline vs optimized inference and provides customer-ready metrics.
 
-The "optimized" mode supports multiple presets:
-- conservative: Stage 0 (baseline with paged cache) - 6.17x
-- balanced: Stage 1 (adaptive allocation, workspace reuse, torch.compile) - 6.15x
-- high: Stage 2 (+ continuous batching) - 6.2x speedup
-- maximum: Stage 3 (+ KV cache prefix sharing) - 6.14x
-- ultra: Stage 4 (+ priority scheduling, dynamic batching) - 6.12x
-- speculative: Stage 5b (+ speculative decoding) - 15.45x speedup ✅
-- flash: Stage 7 (+ Flash Attention) - 30-60x speedup 🚀
+Two optimization presets:
+- fast: Flash Attention only (3-4x speedup) - DEFAULT for single-sequence benchmarks
+- maximum: All features (10-30x with batching, requires draft model for best speedup)
+
+All old optimization levels (conservative, balanced, high, ultra, speculative, flash)
+are aliases for "fast".
 
 Usage:
-    python benchmark.py --model gpt2-xl --optimization-level flash         # Stage 7 (BEST - 30-60x target) 🚀
-    python benchmark.py --model gpt2-xl --optimization-level speculative   # Stage 5b (15.45x)
-    python benchmark.py --model gpt2-xl --optimization-level high          # Stage 2 (6.2x)
+    python benchmark.py --model Qwen/Qwen2-7B --max-tokens 1000                    # Uses "fast" by default (3-4x)
+    python benchmark.py --model Qwen/Qwen2-7B --optimization-level fast            # Flash Attention only (3-4x)
+    python benchmark.py --model Qwen/Qwen2-7B --optimization-level maximum         # All features (10-30x with batching)
 """
 
 import argparse
@@ -302,9 +300,9 @@ def main():
     parser.add_argument(
         "--optimization-level",
         type=str,
-        choices=["conservative", "balanced", "high", "maximum", "ultra", "aggressive", "speculative", "flash"],
-        default="speculative",
-        help="Optimization level: conservative/balanced/high/maximum/ultra/aggressive/speculative/flash (default: speculative - Stage 5b, 15-16x)"
+        choices=["fast", "maximum", "conservative", "balanced", "high", "ultra", "aggressive", "speculative", "flash"],
+        default="fast",
+        help="Optimization level: 'fast' (Flash Attention only, 3-4x) or 'maximum' (all features, 10-30x with batching)"
     )
     parser.add_argument(
         "--max-kv-blocks",
