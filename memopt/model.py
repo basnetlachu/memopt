@@ -40,7 +40,43 @@ class OptimizedLLM:
     """
     
     OPTIMIZATION_PRESETS = {
-        # ONE unified "maximum" preset with ALL optimizations enabled
+        # FAST: For single-sequence workloads - minimal overhead
+        # Just Flash Attention + basic optimizations
+        # Expected speedup: 3-4x with Flash Attention
+        "fast": {
+            # Core optimizations - ONLY Flash Attention
+            "quantize_kv": False,  # FP16 for speed
+            "use_paged_cache": False,  # Disable - adds overhead for single sequence
+            "use_flash_attention": True,  # Main speedup source
+            "kv_block_size": 16,
+
+            # Disable batching features (overhead for single sequence)
+            "enable_adaptive_allocation": False,
+            "enable_workspace_reuse": False,
+            "use_torch_compile": False,
+            "use_continuous_batching": False,
+            "enable_prefix_sharing": False,
+            "enable_priority_scheduling": False,
+            "enable_dynamic_batching": False,
+            "max_batch_size": 1,
+
+            # Disable speculative decoding (needs draft model)
+            "enable_speculative_decoding": False,
+            "num_speculative_tokens": 0,
+            "draft_model": None,
+
+            # Flash Attention backend selection
+            "force_flash_attention": True,
+            "print_attention_backend": True,
+
+            # Disable trillion-token features (not needed for benchmark)
+            "enable_sliding_window": False,
+            "window_size": 4096,
+        },
+
+        # MAXIMUM: For production multi-request batching workloads
+        # All optimizations enabled - requires draft model for best speedup
+        # Expected speedup: 10-30x with batching + draft model
         "maximum": {
             # Core optimizations
             "quantize_kv": False,  # FP16 for speed
@@ -72,8 +108,8 @@ class OptimizedLLM:
             "window_size": 8192,  # 8K sliding window for infinite contexts
         },
 
-        # Aliases for backward compatibility (all point to "maximum")
-        "conservative": None,  # Will default to "maximum"
+        # Aliases for backward compatibility
+        "conservative": None,  # Will default to "fast"
         "balanced": None,
         "high": None,
         "ultra": None,
@@ -85,7 +121,7 @@ class OptimizedLLM:
     def __init__(
         self,
         model: Union[str, nn.Module],
-        optimization_level: str = "maximum",
+        optimization_level: str = "fast",
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.float16,
         enable_profiling: bool = False,
@@ -156,17 +192,17 @@ class OptimizedLLM:
                 print(f"    Falling back to single GPU.")
                 self.num_gpus = 1
         
-        # Get optimization config - all levels now use "maximum"
+        # Get optimization config
         if optimization_level not in self.OPTIMIZATION_PRESETS:
             warnings.warn(
-                f"Unknown optimization level '{optimization_level}', using 'maximum'"
+                f"Unknown optimization level '{optimization_level}', using 'fast'"
             )
-            optimization_level = "maximum"
+            optimization_level = "fast"
 
-        # If alias (None), use "maximum"
+        # If alias (None), use "fast" for benchmarking/single-sequence
         if self.OPTIMIZATION_PRESETS[optimization_level] is None:
-            print(f"  Note: '{optimization_level}' is an alias for 'maximum' (all optimizations enabled)")
-            optimization_level = "maximum"
+            print(f"  Note: '{optimization_level}' is an alias for 'fast' (Flash Attention without batching overhead)")
+            optimization_level = "fast"
 
         self.opt_config = self.OPTIMIZATION_PRESETS[optimization_level]
         self.optimization_level = optimization_level

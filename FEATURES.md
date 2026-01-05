@@ -44,25 +44,31 @@ All trillion-token features are **fully integrated** and working:
 ```python
 from memopt import OptimizedLLM
 
-# Simple! All features enabled by default
+# Simple! "fast" preset by default (Flash Attention without overhead)
 model = OptimizedLLM(model="Qwen/Qwen2-7B")
 
-# Or explicitly specify "maximum" (same result)
+# Or explicitly specify "fast"
 model = OptimizedLLM(
     model="Qwen/Qwen2-7B",
-    optimization_level="maximum"  # ALL features enabled
+    optimization_level="fast"  # Flash Attention only (3-4x speedup)
 )
 
-# Generate with trillion-token support - NO CRASHES!
+# For production multi-request batching, use "maximum"
+model = OptimizedLLM(
+    model="Qwen/Qwen2-7B",
+    optimization_level="maximum"  # All features (10-30x with batching)
+)
+
+# Generate text
 response = model.generate(
     "Your prompt here",
-    max_tokens=100000  # Sliding window handles infinite length!
+    max_tokens=1000
 )
 
-# Works with any optimization level name (all are aliases for "maximum")
-model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="speculative")  # Same as maximum
-model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="flash")  # Same as maximum
-model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="balanced")  # Same as maximum
+# All old optimization levels are aliases for "fast"
+model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="speculative")  # Same as fast
+model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="flash")  # Same as fast
+model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="balanced")  # Same as fast
 ```
 
 ## 📊 Expected Speedup
@@ -73,54 +79,74 @@ model = OptimizedLLM(model="Qwen/Qwen2-7B", optimization_level="balanced")  # Sa
 | With Flash Attention | 6-12x | 3-5x tokens/day |
 | Production (100 GPUs) | 6-12x | 350M tokens/day |
 
-## 🎚️ Optimization Level (SIMPLIFIED!)
+## 🎚️ Optimization Levels
 
-**Now there's only ONE level: "maximum" with ALL optimizations enabled!**
+**Two optimized presets for different workloads:**
 
-All previous levels (`conservative`, `balanced`, `high`, `ultra`, `speculative`, `flash`) are now aliases that point to `maximum`.
+### 1. "fast" - Single-Sequence Workloads (DEFAULT)
+**Best for**: Benchmarking, development, single-user inference
 
-### What's included in "maximum":
+**What's included:**
+- ✅ Flash Attention 2 (3-4x speedup)
+- ❌ Batching overhead disabled
+- ❌ Speculative decoding disabled (requires draft model)
+- ❌ KV cache paging disabled (overhead for single sequence)
+
+**Expected speedup:**
+- With Flash Attention 2: **3-4x**
+- Without Flash Attention: **1.0x** (no speedup)
+
+### 2. "maximum" - Production Multi-Request Batching
+**Best for**: Production serving with multiple concurrent requests
+
+**What's included:**
+- ✅ Flash Attention 2
 - ✅ Paged KV cache
-- ✅ Flash Attention backend selection
 - ✅ Continuous batching
 - ✅ Prefix deduplication (30-70% savings)
-- ✅ **Sliding window attention (8K window, infinite contexts)**
-- ✅ **Speculative decoding (6-12x speedup)**
-- ✅ **Adaptive speculation controller**
-- ✅ **Memory pressure monitoring**
+- ✅ Sliding window attention (8K window, infinite contexts)
+- ✅ Speculative decoding (requires draft model)
+- ✅ Adaptive speculation controller
+- ✅ Memory pressure monitoring
 - ✅ Priority scheduling
 - ✅ Dynamic batching
 
 **Expected speedup:**
-- Without Flash Attention: **6-12x**
-- With Flash Attention: **30-60x**
+- With Flash Attention + batching: **10-30x**
+- With draft model + Flash Attention: **30-60x**
+
+### Aliases
+All previous levels (`conservative`, `balanced`, `high`, `ultra`, `speculative`, `flash`) are aliases that point to `fast`.
 
 ## 🧪 Testing with benchmark.py
 
-**All trillion-token features are now ALWAYS enabled! No need to specify optimization level.**
+**The benchmark now uses "fast" by default for accurate single-sequence speedup measurements.**
 
 ```bash
-# Simple test (uses "maximum" by default - ALL features enabled)
+# Simple test (uses "fast" by default - Flash Attention without overhead)
 python benchmark.py --model gpt2 --max-tokens 256
 
-# Test with Qwen2-7B
+# Test with Qwen2-7B - should see 3-4x speedup with Flash Attention
 python benchmark.py --model Qwen/Qwen2-7B --max-tokens 1000
 
-# Test long contexts (will NOT crash thanks to sliding window!)
+# Test long contexts
 python benchmark.py --model Qwen/Qwen2-7B --max-tokens 10000
 
-# Test extreme long contexts (trillion-token scale!)
-python benchmark.py --model Qwen/Qwen2-7B --max-tokens 50000 --num-prompts 1
+# Test "fast" preset explicitly
+python benchmark.py --model Qwen/Qwen2-7B --optimization-level fast --max-tokens 1000
 
-# All optimization levels now use the same "maximum" configuration
+# Test "maximum" preset (for multi-request batching - needs draft model for best speedup)
 python benchmark.py --model Qwen/Qwen2-7B --optimization-level maximum --max-tokens 1000
-python benchmark.py --model Qwen/Qwen2-7B --optimization-level speculative --max-tokens 1000  # Same as maximum
-python benchmark.py --model Qwen/Qwen2-7B --optimization-level flash --max-tokens 1000  # Same as maximum
 
-# For additional speedup, install Flash Attention
+# For 3-4x speedup, install Flash Attention 2
 pip install flash-attn --no-build-isolation
 python benchmark.py --model Qwen/Qwen2-7B --max-tokens 5000
 ```
+
+**Expected Results:**
+- **Without Flash Attention**: ~1.0x speedup (baseline performance)
+- **With Flash Attention 2**: ~3-4x speedup
+- **"maximum" with draft model**: ~10-30x speedup (production only)
 
 ## 📁 Core Files (18 total)
 
