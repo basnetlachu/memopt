@@ -162,8 +162,15 @@ def run_optimized(
             do_sample=False
         )
 
-        # DO NOT reset cache here - this was destroying performance!
-        # Only reset between completely unrelated batches
+        # Free this sequence from KV cache to prevent exhaustion
+        # This allows prefix sharing while avoiding OOM
+        if hasattr(model, 'kv_cache') and model.kv_cache:
+            # Find the most recent sequence ID and free it
+            if hasattr(model, '_last_seq_id'):
+                try:
+                    model.kv_cache.free_sequence(model._last_seq_id)
+                except:
+                    pass  # Ignore if already freed
     
     # Get stats
     stats = model.get_profiling_stats()
