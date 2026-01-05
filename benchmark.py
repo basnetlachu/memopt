@@ -2,19 +2,20 @@
 """
 Benchmark script for Memopt
 
-Compares baseline vs optimized inference and provides customer-ready metrics.
+Compares baseline vs optimized inference and provides honest performance metrics.
 
-Two optimization presets:
-- fast: Flash Attention only (3-4x speedup) - DEFAULT for single-sequence benchmarks
-- maximum: All features (10-30x with batching, requires draft model for best speedup)
+Three optimization presets:
+- fast: SDPA only (1.2-1.5x speedup) - DEFAULT for single-sequence
+- batch: Batching + paging (5-10x speedup) - For multi-request workloads
+- maximum: Batching + speculation (10-20x speedup) - Requires draft model
 
-All old optimization levels (conservative, balanced, high, ultra, speculative, flash)
-are aliases for "fast".
+All old optimization levels are aliases for "fast".
 
 Usage:
-    python benchmark.py --model Qwen/Qwen2-7B --max-tokens 1000                    # Uses "fast" by default (3-4x)
-    python benchmark.py --model Qwen/Qwen2-7B --optimization-level fast            # Flash Attention only (3-4x)
-    python benchmark.py --model Qwen/Qwen2-7B --optimization-level maximum         # All features (10-30x with batching)
+    python benchmark.py --model Qwen/Qwen2-7B --max-tokens 1000                    # Uses "fast" (1.2-1.5x)
+    python benchmark.py --model Qwen/Qwen2-7B --optimization-level fast            # SDPA only (1.2-1.5x)
+    python benchmark.py --model Qwen/Qwen2-7B --optimization-level batch           # Batching (5-10x)
+    python benchmark.py --model Qwen/Qwen2-7B --optimization-level maximum         # Batching + spec (10-20x)
 """
 
 import argparse
@@ -149,6 +150,19 @@ def run_optimized(
     
     # CRITICAL FIX: Reset cache ONCE before the loop, not after each prompt
     model.reset_kv_cache()
+
+    # Warmup: Run one iteration to exclude model load and any first-run overhead
+    # This ensures we measure steady-state performance, not compilation/initialization
+    print("  Running warmup iteration (excluded from timing)...")
+    warmup_prompt = prompts[0] if prompts else "The"
+    _ = model.generate(warmup_prompt, max_tokens=min(50, max_tokens), do_sample=False)
+
+    # Reset profiler after warmup
+    if hasattr(model, 'profiler') and model.profiler:
+        model.profiler.reset()
+
+    # Reset timer for actual measurement
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
 
     # Run inference - Stage 4 auto-tuning will adapt to varying lengths
     for i, prompt in enumerate(prompts):
@@ -300,9 +314,9 @@ def main():
     parser.add_argument(
         "--optimization-level",
         type=str,
-        choices=["fast", "maximum", "conservative", "balanced", "high", "ultra", "aggressive", "speculative", "flash"],
+        choices=["fast", "batch", "maximum", "conservative", "balanced", "high", "ultra", "aggressive", "speculative", "flash"],
         default="fast",
-        help="Optimization level: 'fast' (Flash Attention only, 3-4x) or 'maximum' (all features, 10-30x with batching)"
+        help="Optimization: 'fast' (1.2-1.5x, single-seq), 'batch' (5-10x, multi-req), 'maximum' (10-20x, needs draft model)"
     )
     parser.add_argument(
         "--max-kv-blocks",

@@ -40,76 +40,111 @@ class OptimizedLLM:
     """
     
     OPTIMIZATION_PRESETS = {
-        # FAST: For single-sequence workloads - minimal overhead
-        # Just Flash Attention + basic optimizations
-        # Expected speedup: 3-4x with Flash Attention
+        # FAST: For single-sequence workloads
+        # Uses SDPA (PyTorch scaled_dot_product_attention) only
+        # Expected speedup: 1.2-1.5x (SDPA fusion on compatible hardware)
+        # Reality: Cannot achieve 10-20x without batching or draft model
         "fast": {
-            # Core optimizations - ONLY Flash Attention
-            "quantize_kv": False,  # FP16 for speed
-            "use_paged_cache": False,  # Disable - adds overhead for single sequence
-            "use_flash_attention": True,  # Main speedup source
+            # Core - ONLY SDPA, no other optimizations
+            "quantize_kv": False,
+            "use_paged_cache": False,  # Overhead for single sequence
+            "use_flash_attention": True,  # Requests SDPA via attn_implementation
             "kv_block_size": 16,
 
-            # Disable batching features (overhead for single sequence)
+            # All batching disabled (overhead without concurrency)
             "enable_adaptive_allocation": False,
             "enable_workspace_reuse": False,
-            "use_torch_compile": False,
+            "use_torch_compile": False,  # NEVER enable for autoregressive
             "use_continuous_batching": False,
             "enable_prefix_sharing": False,
             "enable_priority_scheduling": False,
             "enable_dynamic_batching": False,
             "max_batch_size": 1,
 
-            # Disable speculative decoding (needs draft model)
+            # Speculative decoding disabled (requires draft model)
             "enable_speculative_decoding": False,
             "num_speculative_tokens": 0,
             "draft_model": None,
 
-            # Flash Attention backend selection
+            # No backend detection logging
             "force_flash_attention": True,
             "print_attention_backend": False,
 
-            # Disable trillion-token features (not needed for benchmark)
+            # Sliding window disabled for single-sequence
             "enable_sliding_window": False,
             "window_size": 4096,
         },
 
-        # MAXIMUM: For production multi-request batching workloads
-        # All optimizations enabled - requires draft model for best speedup
-        # Expected speedup: 10-30x with batching + draft model
-        "maximum": {
-            # Core optimizations
-            "quantize_kv": False,  # FP16 for speed
-            "use_paged_cache": True,
+        # BATCH: For production multi-request batching (5-10x speedup)
+        # Enables paging, batching, sliding window
+        # NO speculative decoding (requires draft model)
+        "batch": {
+            # Core
+            "quantize_kv": False,
+            "use_paged_cache": True,  # Essential for batching
             "use_flash_attention": True,
             "kv_block_size": 16,
 
-            # Stage 1-4: All memory optimizations
+            # Batching optimizations enabled
             "enable_adaptive_allocation": True,
             "enable_workspace_reuse": True,
-            "use_torch_compile": True,
+            "use_torch_compile": False,  # Still unsafe for decode
             "use_continuous_batching": True,
             "enable_prefix_sharing": True,
             "enable_priority_scheduling": True,
             "enable_dynamic_batching": True,
             "max_batch_size": 32,
 
-            # Stage 5: Speculative decoding (6-12x speedup)
+            # Speculative decoding disabled by default
+            "enable_speculative_decoding": False,
+            "num_speculative_tokens": 0,
+            "draft_model": None,
+
+            # Backend selection
+            "force_flash_attention": True,
+            "print_attention_backend": False,
+
+            # Sliding window for long contexts
+            "enable_sliding_window": True,
+            "window_size": 8192,
+        },
+
+        # MAXIMUM: For production with speculative decoding (10-20x speedup)
+        # Requires compatible draft model
+        # Use ONLY if draft model exists and is validated
+        "maximum": {
+            # Core
+            "quantize_kv": False,
+            "use_paged_cache": True,
+            "use_flash_attention": True,
+            "kv_block_size": 16,
+
+            # All batching enabled
+            "enable_adaptive_allocation": True,
+            "enable_workspace_reuse": True,
+            "use_torch_compile": False,  # NEVER for autoregressive
+            "use_continuous_batching": True,
+            "enable_prefix_sharing": True,
+            "enable_priority_scheduling": True,
+            "enable_dynamic_batching": True,
+            "max_batch_size": 32,
+
+            # Speculative decoding - will auto-disable if no draft model
             "enable_speculative_decoding": True,
             "num_speculative_tokens": 4,
             "draft_model": "auto",
 
-            # Stage 7: Flash Attention backend selection
+            # Backend selection
             "force_flash_attention": True,
-            "print_attention_backend": True,
+            "print_attention_backend": False,
 
-            # Trillion-token features
+            # Sliding window
             "enable_sliding_window": True,
-            "window_size": 8192,  # 8K sliding window for infinite contexts
+            "window_size": 8192,
         },
 
-        # Aliases for backward compatibility
-        "conservative": None,  # Will default to "fast"
+        # Aliases -> fast (honest single-sequence performance)
+        "conservative": None,
         "balanced": None,
         "high": None,
         "ultra": None,
@@ -232,35 +267,24 @@ class OptimizedLLM:
         print(f"  - Paged KV cache: {self.opt_config['use_paged_cache']}")
         print(f"  - Flash attention: {self.opt_config['use_flash_attention']}")
 
-        # Show Stage 1 & 2 status
-        stage1_active = (self.opt_config.get('enable_adaptive_allocation', False) or
-                        self.opt_config.get('enable_workspace_reuse', False))
-        stage2_active = self.opt_config.get('use_continuous_batching', False)
-        stage5b_active = self.opt_config.get('enable_speculative_decoding', False) or (
-            hasattr(self, 'speculative_decoder') and self.speculative_decoder is not None
-        )
+        # Honest speedup reporting based on actual configuration
+        batching_active = self.opt_config.get('use_continuous_batching', False)
+        spec_active = (hasattr(self, 'speculative_decoder') and
+                      self.speculative_decoder is not None)
 
-        # PRODUCTION ROBUSTNESS: Report expected speedup based on actual capabilities
-        expected_speedup = "unknown"
-        if hasattr(self, 'flash_attention_verified') and self.flash_attention_verified:
-            expected_speedup = "50-60x (Flash Attention 2 verified)"
-        elif stage5b_active:
-            expected_speedup = "16-20x (speculative decoding)"
-        elif stage2_active:
-            expected_speedup = "8-12x (continuous batching + paged cache)"
+        # Truth: single-sequence cannot exceed ~1.5x, batching gives 5-10x,
+        # speculation adds 2-3x on top
+        if spec_active and batching_active:
+            expected_speedup = "10-20x (batching + speculation, multi-request only)"
+        elif batching_active:
+            expected_speedup = "5-10x (batching, multi-request only)"
+        elif self.opt_config.get('use_flash_attention', False):
+            expected_speedup = "1.2-1.5x (SDPA fusion, single-sequence)"
         else:
-            expected_speedup = "3-5x (paged cache only)"
+            expected_speedup = "1.0x (baseline, no optimization)"
 
         print(f"  - Expected speedup: {expected_speedup}")
-
-        if stage5b_active:
-            print(f"  - Optimization stage: Stage 5b (Speculative Decoding)")
-        elif stage2_active:
-            print(f"  - Optimization stage: Stage 2 (Continuous Batching)")
-        elif stage1_active:
-            print(f"  - Optimization stage: Stage 1 (Memory Allocation)")
-        else:
-            print(f"  - Optimization stage: Stage 0 (Baseline)")
+        print(f"  - Optimization level: {optimization_level}")
     
     def _load_model(self, model: Union[str, nn.Module], **kwargs):
         """Load model and tokenizer."""
@@ -301,28 +325,10 @@ class OptimizedLLM:
 
             print(f"  ✓ Model loaded")
 
-            # Apply torch.compile for REAL speedup (2-3x faster)
-            # Disable CUDA graphs for autoregressive generation
-            if self.opt_config.get('use_flash_attention', False) and torch.cuda.is_available():
-                print("  ✓ Applying torch.compile optimization...")
-                try:
-                    # Disable CUDA graphs to avoid KV cache conflicts
-                    import torch._inductor.config as inductor_config
-                    inductor_config.triton.cudagraphs = False
-
-                    # Compile the model
-                    self.model = torch.compile(
-                        self.model,
-                        mode="default",  # Use default mode (faster compilation, still good speedup)
-                        fullgraph=False,
-                        dynamic=True  # Support dynamic shapes for autoregressive
-                    )
-                    print("  ✓ torch.compile applied - expect 1.5-2.5x speedup")
-                    self.flash_attention_available = True
-                except Exception as e:
-                    print(f"  ⚠️ torch.compile failed: {e}")
-                    print("     Continuing without compilation")
-                    self.flash_attention_available = False
+            # torch.compile REMOVED - causes recompilation on every token in autoregressive decode
+            # Autoregressive generation has dynamic shapes (seq_len grows each iteration)
+            # This triggers constant recompilation, making inference 35x SLOWER
+            # SDPA alone provides 1.2-1.5x speedup without compilation overhead
         else:
             # Use provided model instance
             self.model = model

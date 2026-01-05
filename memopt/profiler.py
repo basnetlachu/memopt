@@ -132,10 +132,24 @@ class MemoryProfiler:
             self.start_event = None
             self.end_event = None
     
+    def reset(self):
+        """Reset profiler state (for excluding warmup from measurements)."""
+        self.tokens_generated = 0
+        self.start_time = None
+        self.end_time = None
+        self.peak_memory_allocated = 0
+        self.peak_memory_reserved = 0
+        self.batch_sizes = []
+        self.sequence_lengths = []
+        self.kv_cache_stats = None
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
     def start_profiling(self):
         """Start profiling session."""
         self.start_time = time.time()
-        
+
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
