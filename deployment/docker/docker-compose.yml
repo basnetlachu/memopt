@@ -1,0 +1,95 @@
+# Docker Compose for local multi-instance testing
+# Simulates horizontal scaling without Kubernetes
+
+version: '3.8'
+
+services:
+  # Node 1
+  memopt-node1:
+    build: .
+    container_name: memopt-node1
+    environment:
+      - MEMOPT_NODE_ID=node1
+      - PORT=8081
+      - MODEL_NAME=gpt2
+      - OPTIMIZATION_LEVEL=batch
+      - MEMOPT_MAX_QUEUE=5000
+      - MEMOPT_WORKERS=1
+      - MEMOPT_ENABLE_HEALTH=true
+      - MEMOPT_ENABLE_METRICS=true
+    ports:
+      - "8081:8081"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+  
+  # Node 2
+  memopt-node2:
+    build: .
+    container_name: memopt-node2
+    environment:
+      - MEMOPT_NODE_ID=node2
+      - PORT=8082
+      - MODEL_NAME=gpt2
+      - OPTIMIZATION_LEVEL=batch
+      - MEMOPT_MAX_QUEUE=5000
+      - MEMOPT_WORKERS=1
+      - MEMOPT_ENABLE_HEALTH=true
+      - MEMOPT_ENABLE_METRICS=true
+    ports:
+      - "8082:8082"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+  
+  # Node 3
+  memopt-node3:
+    build: .
+    container_name: memopt-node3
+    environment:
+      - MEMOPT_NODE_ID=node3
+      - PORT=8083
+      - MODEL_NAME=gpt2
+      - OPTIMIZATION_LEVEL=batch
+      - MEMOPT_MAX_QUEUE=5000
+      - MEMOPT_WORKERS=1
+      - MEMOPT_ENABLE_HEALTH=true
+      - MEMOPT_ENABLE_METRICS=true
+    ports:
+      - "8083:8083"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+  
+  # NGINX Load Balancer (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: memopt-loadbalancer
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      - memopt-node1
+      - memopt-node2
+      - memopt-node3
+    restart: unless-stopped
+
+networks:
+  default:
+    name: memopt-network

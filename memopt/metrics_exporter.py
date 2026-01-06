@@ -5,6 +5,8 @@ Background thread that exports metrics in Prometheus format.
 Can be adapted for Datadog, CloudWatch, or other monitoring systems.
 
 PERFORMANCE IMPACT: None on inference (runs in separate background thread).
+
+MULTI-NODE: All metrics include node_id label for horizontal scaling.
 """
 
 import threading
@@ -12,6 +14,7 @@ import time
 from typing import Optional
 
 from .production_metrics import ProductionMetrics, MetricsSnapshot
+from .node_identity import get_node_id
 
 
 class PrometheusExporter:
@@ -119,56 +122,58 @@ class PrometheusExporter:
         """
         if self.latest_snapshot is None:
             return "# No metrics available yet\n"
-        
+
         s = self.latest_snapshot
-        
+        node_id = get_node_id()
+
+        # All metrics include node_id label for multi-node deployments
         return f"""# HELP memopt_tokens_per_sec Token generation throughput
 # TYPE memopt_tokens_per_sec gauge
-memopt_tokens_per_sec {s.tokens_per_sec:.2f}
+memopt_tokens_per_sec{{node_id="{node_id}"}} {s.tokens_per_sec:.2f}
 
 # HELP memopt_requests_per_sec Request completion rate
 # TYPE memopt_requests_per_sec gauge
-memopt_requests_per_sec {s.requests_per_sec:.2f}
+memopt_requests_per_sec{{node_id="{node_id}"}} {s.requests_per_sec:.2f}
 
 # HELP memopt_avg_batch_size Average batch size
 # TYPE memopt_avg_batch_size gauge
-memopt_avg_batch_size {s.avg_batch_size:.2f}
+memopt_avg_batch_size{{node_id="{node_id}"}} {s.avg_batch_size:.2f}
 
 # HELP memopt_max_batch_size Maximum batch size observed
 # TYPE memopt_max_batch_size gauge
-memopt_max_batch_size {s.max_batch_size}
+memopt_max_batch_size{{node_id="{node_id}"}} {s.max_batch_size}
 
 # HELP memopt_kv_cache_utilization_pct KV cache utilization percentage
 # TYPE memopt_kv_cache_utilization_pct gauge
-memopt_kv_cache_utilization_pct {s.kv_cache_utilization_pct:.2f}
+memopt_kv_cache_utilization_pct{{node_id="{node_id}"}} {s.kv_cache_utilization_pct:.2f}
 
 # HELP memopt_gpu_memory_allocated_gb GPU memory allocated (GB)
 # TYPE memopt_gpu_memory_allocated_gb gauge
-memopt_gpu_memory_allocated_gb {s.gpu_memory_allocated_gb:.3f}
+memopt_gpu_memory_allocated_gb{{node_id="{node_id}"}} {s.gpu_memory_allocated_gb:.3f}
 
 # HELP memopt_gpu_memory_reserved_gb GPU memory reserved (GB)
 # TYPE memopt_gpu_memory_reserved_gb gauge
-memopt_gpu_memory_reserved_gb {s.gpu_memory_reserved_gb:.3f}
+memopt_gpu_memory_reserved_gb{{node_id="{node_id}"}} {s.gpu_memory_reserved_gb:.3f}
 
 # HELP memopt_queue_depth Current request queue depth
 # TYPE memopt_queue_depth gauge
-memopt_queue_depth {s.queue_depth}
+memopt_queue_depth{{node_id="{node_id}"}} {s.queue_depth}
 
 # HELP memopt_active_requests Currently processing requests
 # TYPE memopt_active_requests gauge
-memopt_active_requests {s.active_requests}
+memopt_active_requests{{node_id="{node_id}"}} {s.active_requests}
 
 # HELP memopt_requests_completed_total Total completed requests
 # TYPE memopt_requests_completed_total counter
-memopt_requests_completed_total {s.requests_completed}
+memopt_requests_completed_total{{node_id="{node_id}"}} {s.requests_completed}
 
 # HELP memopt_requests_rejected_total Total rejected requests
 # TYPE memopt_requests_rejected_total counter
-memopt_requests_rejected_total {s.requests_rejected}
+memopt_requests_rejected_total{{node_id="{node_id}"}} {s.requests_rejected}
 
 # HELP memopt_tokens_generated_total Total tokens generated
 # TYPE memopt_tokens_generated_total counter
-memopt_tokens_generated_total {s.total_tokens_generated}
+memopt_tokens_generated_total{{node_id="{node_id}"}} {s.total_tokens_generated}
 """
 
 

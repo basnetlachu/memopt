@@ -8,7 +8,7 @@ Automatic GPU optimization for trillion-token scale LLM inference.
 pip install -e .
 
 # Run benchmark - it tells you what to do
-python benchmark.py --model Qwen/Qwen2-7B --max-tokens 10000 \
+python benchmarks/benchmark.py --model Qwen/Qwen2-7B --max-tokens 10000 \
   --num-prompts 2 --optimization-level ultra --max-kv-blocks 2000
 ```
 
@@ -36,7 +36,7 @@ To achieve 40-60x speedup:
 
 **GPT-NeoX-20B** (15-20x, works NOW without Flash Attention):
 ```bash
-python benchmark.py --model EleutherAI/gpt-neox-20b --max-tokens 5000 \
+python benchmarks/benchmark.py --model EleutherAI/gpt-neox-20b --max-tokens 5000 \
   --num-prompts 2 --optimization-level ultra --max-kv-blocks 2000
 ```
 
@@ -46,7 +46,7 @@ python benchmark.py --model EleutherAI/gpt-neox-20b --max-tokens 5000 \
 pip3 install flash-attn --no-build-isolation
 
 # Then benchmark
-python benchmark.py --model meta-llama/Llama-2-7b-hf --max-tokens 10000 \
+python benchmarks/benchmark.py --model meta-llama/Llama-2-7b-hf --max-tokens 10000 \
   --num-prompts 2 --optimization-level ultra --max-kv-blocks 3000
 ```
 
@@ -55,3 +55,16 @@ python benchmark.py --model meta-llama/Llama-2-7b-hf --max-tokens 10000 \
 - **GPT-NeoX (15x)**: 10T tokens in 193 days on single A100
 - **Llama-2+Flash (40x)**: 10T tokens in 72 days on single A100
 - **With 10 GPUs**: 7-19 days for 10T tokens
+
+## Repository Structure
+
+The codebase is organized into clear functional areas:
+
+- **[memopt/](memopt/)** - Core package (31 optimized modules)
+- **[scripts/](scripts/)** - Production servers and utilities
+- **[benchmarks/](benchmarks/)** - Performance benchmarking tools
+- **[deployment/](deployment/)** - Docker & Kubernetes configs
+- **[docs/](docs/)** - Implementation guides and documentation
+- **[tests/](tests/)** - Test suite
+
+See [STRUCTURE.md](STRUCTURE.md) for complete repository layout and [ARCHITECTURE.md](ARCHITECTURE.md) for deployment architecture.

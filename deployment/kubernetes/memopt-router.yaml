@@ -1,0 +1,169 @@
+# MemOpt Router Deployment
+# CPU-only router for request distribution
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memopt-router-config
+  namespace: memopt
+data:
+  ROUTER_PORT: "8000"
+  ROUTER_MAX_RETRIES: "3"
+  ROUTER_REQUEST_TIMEOUT: "300"
+  # Worker hosts: Use K8s DNS for service discovery
+  MEMOPT_WORKER_HOSTS: "memopt-worker-0.memopt-worker.memopt.svc.cluster.local:9000,memopt-worker-1.memopt-worker.memopt.svc.cluster.local:9000,memopt-worker-2.memopt-worker.memopt.svc.cluster.local:9000"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memopt-router
+  namespace: memopt
+  labels:
+    app: memopt
+    role: router
+spec:
+  # Multiple routers for HA
+  replicas: 2
+  
+  selector:
+    matchLabels:
+      app: memopt
+      role: router
+  
+  template:
+    metadata:
+      labels:
+        app: memopt
+        role: router
+    
+    spec:
+      containers:
+      - name: router
+        image: memopt:latest
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "production_router.py"]
+        
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        
+        env:
+        # Node identity
+        - name: MEMOPT_NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        
+        # Role
+        - name: MEMOPT_NODE_ROLE
+          value: "router"
+        
+        # Configuration
+        - name: ROUTER_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: memopt-router-config
+              key: ROUTER_PORT
+        
+        - name: ROUTER_MAX_RETRIES
+          valueFrom:
+            configMapKeyRef:
+              name: memopt-router-config
+              key: ROUTER_MAX_RETRIES
+        
+        - name: ROUTER_REQUEST_TIMEOUT
+          valueFrom:
+            configMapKeyRef:
+              name: memopt-router-config
+              key: ROUTER_REQUEST_TIMEOUT
+        
+        - name: MEMOPT_WORKER_HOSTS
+          valueFrom:
+            configMapKeyRef:
+              name: memopt-router-config
+              key: MEMOPT_WORKER_HOSTS
+        
+        # Resource limits (CPU-only)
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "1"
+          limits:
+            memory: "1Gi"
+            cpu: "2"
+        
+        # Liveness probe
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Security
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+      
+      # Graceful termination
+      terminationGracePeriodSeconds: 30
+
+---
+# Router service (external access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: memopt-router
+  namespace: memopt
+  labels:
+    app: memopt
+    role: router
+spec:
+  type: LoadBalancer  # Or NodePort/ClusterIP depending on setup
+  selector:
+    app: memopt
+    role: router
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+  sessionAffinity: None  # Stateless routing
+
+---
+# Horizontal Pod Autoscaler for router
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: memopt-router
+  namespace: memopt
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: memopt-router
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
