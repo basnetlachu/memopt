@@ -24,6 +24,13 @@ from .speculative_decoding import SpeculativeDecoder, create_draft_model
 from .model_parallel import init_model_parallel
 from .performance_guard import PerformanceGuard, AdaptiveController
 
+# Production infrastructure (Phase 1-4) - all optional, disabled by default
+from .safety_limits import SafetyLimits
+from .bounded_metadata import BoundedMetadataStore
+from .production_metrics import ProductionMetrics
+from .health_monitor import HealthMonitor
+from .exceptions import ResourceExhaustedError, RequestRejectedError
+
 
 class OptimizedLLM:
     """
@@ -165,6 +172,17 @@ class OptimizedLLM:
         num_gpus: int = None,  # Number of GPUs for Stage 6 (None = auto-detect)
         enable_performance_guard: bool = False,  # Enable production safety guardrails
         baseline_throughput: float = None,  # Baseline throughput for guard (measured externally)
+        # Production features (Phase 1-4) - all disabled by default
+        enable_safety_limits: bool = False,
+        safety_max_kv_cache_gb: Optional[float] = None,
+        safety_max_queue_depth: Optional[int] = None,
+        safety_max_sequence_length: Optional[int] = None,
+        enable_bounded_metadata: bool = False,
+        bounded_metadata_max_history: int = 10000,
+        enable_metrics: bool = False,
+        metrics_window_size: int = 1000,
+        enable_health_monitor: bool = False,
+        health_check_interval_sec: int = 300,
         **kwargs
     ):
         """
@@ -260,6 +278,41 @@ class OptimizedLLM:
 
         # Profiler
         self.profiler = MemoryProfiler(device=device) if enable_profiling else None
+
+        # Production infrastructure (Phase 1-4) - all disabled by default
+        # Phase 1: Safety limits
+        self.safety_limits = SafetyLimits(
+            max_kv_cache_gb=safety_max_kv_cache_gb,
+            max_queue_depth=safety_max_queue_depth,
+            max_sequence_length=safety_max_sequence_length,
+            enable=enable_safety_limits
+        )
+        # Wire scheduler reference for queue depth checks
+        self.safety_limits.scheduler = self.scheduler
+
+        # Phase 1: Bounded metadata store
+        self.bounded_metadata = BoundedMetadataStore(
+            max_completed_history=bounded_metadata_max_history
+        ) if enable_bounded_metadata else None
+
+        # Phase 3: Production metrics
+        self.metrics = ProductionMetrics(
+            enable=enable_metrics,
+            window_size=metrics_window_size
+        )
+        # Wire references for metrics collection
+        if self.metrics.enable:
+            self.metrics.scheduler = self.scheduler
+            self.metrics.safety_limits = self.safety_limits
+
+        # Phase 4: Health monitor
+        self.health_monitor = HealthMonitor(
+            model=self,
+            check_interval_sec=health_check_interval_sec,
+            enable=enable_health_monitor
+        )
+        if enable_health_monitor:
+            self.health_monitor.start()
 
         print(f"\n✓ Model loaded and optimized")
         print(f"  - KV cache quantization: {self.opt_config['quantize_kv']}")
@@ -579,7 +632,14 @@ class OptimizedLLM:
         is_batch = isinstance(prompt, list)
         if not is_batch:
             prompt = [prompt]
-        
+
+        # Production safety check (Phase 1) - pre-flight before inference
+        if self.safety_limits.enable:
+            allowed, reason = self.safety_limits.can_accept_request(max_tokens)
+            if not allowed:
+                self.metrics.record_rejection()  # Track rejection
+                raise ResourceExhaustedError(reason)
+
         # Tokenize
         if self.tokenizer is None:
             raise ValueError("No tokenizer available")
@@ -701,6 +761,21 @@ class OptimizedLLM:
         ])
 
         generated_text = self.tokenizer.decode(full_ids, skip_special_tokens=True)
+
+        # Production tracking (Phase 1 & 3) - record completion
+        num_tokens_generated = len(generated_ids)
+        if self.metrics.enable:
+            self.metrics.record_request_complete()
+            # Note: batch metrics recorded elsewhere in scheduler
+
+        if self.bounded_metadata is not None:
+            # Track completed request metadata (bounded history)
+            self.bounded_metadata.on_request_complete(
+                request_id=request.request_id,
+                tokens_generated=num_tokens_generated,
+                latency_ms=0.0,  # Could add timing if needed
+                batch_size_avg=1.0
+            )
 
         return generated_text if not is_batch else [generated_text]
 
