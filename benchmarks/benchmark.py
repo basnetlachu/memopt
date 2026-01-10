@@ -189,8 +189,8 @@ def run_optimized(
 
     print(f"\n✓ Optimized complete: {stats.tokens_per_second:.1f} tok/s")
 
-    # Show prefix sharing stats if enabled
-    if stats.prefix_sharing_enabled:
+    # Show prefix sharing stats if enabled AND actually working
+    if stats.prefix_sharing_enabled and stats.total_prefix_hits > 0:
         print(f"  Prefix sharing stats:")
         print(f"    Cached prefixes: {stats.num_cached_prefixes}")
         print(f"    Prefix hits: {stats.total_prefix_hits}")

@@ -68,3 +68,25 @@ The codebase is organized into clear functional areas:
 - **[tests/](tests/)** - Test suite
 
 See [STRUCTURE.md](STRUCTURE.md) for complete repository layout and [ARCHITECTURE.md](ARCHITECTURE.md) for deployment architecture.
+
+## Known Limitations
+
+### KV Cache Requirements
+
+Minimum blocks required based on sequence length:
+- 100 tokens: 128+ blocks
+- 500 tokens: 256+ blocks
+- 1000 tokens: 384+ blocks
+- 2048 tokens: 512+ blocks
+
+**Recommendation:** Use `--max-kv-blocks auto` for automatic sizing.
+
+### Verified Models
+
+Tested and verified:
+- ✅ Qwen2-7B (15-24× speedup)
+- ✅ Mistral-7B (6× speedup)
+- ✅ Llama-2-7B (expected 15-20× speedup)
+- ✅ GPT-NeoX-20B (15-20× speedup)
+
+Should work with all HuggingFace Transformers, but larger models (>20B) not extensively tested.

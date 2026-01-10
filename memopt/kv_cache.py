@@ -465,10 +465,17 @@ class PagedKVCache:
 
                 if not self.free_blocks:
                     # Still no free blocks - this sequence is too long for allocated cache
+                    recommended_blocks = self.max_blocks + additional
                     raise RuntimeError(
-                        f"KV cache exhausted: need {additional} more blocks but cache is full. "
-                        f"Sequence length {seq_len} exceeds cache capacity. "
-                        f"Try increasing max_kv_blocks or reducing sequence length."
+                        f"KV cache exhausted: need {additional} more blocks but cache is full.\n"
+                        f"Sequence length {seq_len} exceeds cache capacity.\n"
+                        f"\n"
+                        f"🔧 SOLUTIONS:\n"
+                        f"  1. Increase KV blocks: --max-kv-blocks {recommended_blocks}\n"
+                        f"  2. Use auto-sizing: --max-kv-blocks auto\n"
+                        f"  3. Reduce sequence length: --max-tokens {seq_len // 2}\n"
+                        f"\n"
+                        f"Current: {self.max_blocks} blocks allocated, {self.stats.used_pages} in use"
                     )
 
                 block_id = self.free_blocks.pop()
