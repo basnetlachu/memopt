@@ -337,7 +337,15 @@ def main():
         "Explain the concept of recursion with an example.",
         "What makes quantum computing different from classical computing?",
         "Write a short story about a robot learning to paint.",
-    ][:args.num_prompts]
+    ]
+
+    # Generate requested number of prompts (cycle through base prompts if needed)
+    if args.num_prompts <= len(base_prompts):
+        base_prompts = base_prompts[:args.num_prompts]
+    else:
+        # Repeat prompts to reach requested count
+        import itertools
+        base_prompts = list(itertools.islice(itertools.cycle(base_prompts), args.num_prompts))
 
     # Add system prompt if requested (to demonstrate Stage 3 prefix sharing)
     if args.use_system_prompt:
