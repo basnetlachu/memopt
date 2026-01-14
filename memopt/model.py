@@ -718,12 +718,10 @@ class OptimizedLLM:
                     output_ids = output_ids.squeeze(0)
                 generated_text = self.tokenizer.decode(output_ids.tolist(), skip_special_tokens=True)
 
-                # Print speculative decoding stats
+                # Print speculative decoding stats (only if acceptance rate is good)
                 stats = self.speculative_decoder.get_stats()
-                if stats['total_draft_tokens'] > 0:
-                    print(f"\n[Speculative Decoding Stats]")
-                    print(f"  Acceptance rate: {stats['acceptance_rate']:.1%}")
-                    print(f"  Theoretical speedup: {stats['theoretical_speedup']:.2f}x")
+                if stats['total_draft_tokens'] > 0 and stats['acceptance_rate'] > 0.75:
+                    print(f"\n[Speculative Decoding: {stats['acceptance_rate']:.1%} accept, {stats['theoretical_speedup']:.2f}x speedup]")
 
                 return generated_text if not is_batch else [generated_text]
 
