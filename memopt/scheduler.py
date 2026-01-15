@@ -103,6 +103,8 @@ class ContinuousBatchScheduler:
         enable_dynamic_batching: bool = False,  # Stage 4: Dynamic batching
         device: str = "cuda",
         max_queue_depth: int = 1000,  # Phase 1: Bounded queue for crash prevention
+        enable_rl_scheduling: bool = False,  # Stage 5: RL-powered scheduling
+        rl_agent_path: Optional[str] = None,  # Path to trained RL agent
     ):
         """
         Args:
@@ -113,6 +115,8 @@ class ContinuousBatchScheduler:
             enable_dynamic_batching: Enable Stage 4 optimizations
             device: torch device
             max_queue_depth: Maximum pending requests (Phase 1: prevents OOM)
+            enable_rl_scheduling: Enable Stage 5 RL-powered batch size optimization
+            rl_agent_path: Path to trained RL agent (e.g., 'scheduler_rl_agent.zip')
         """
         self.max_batch_size = max_batch_size
         self.max_total_tokens = max_total_tokens
@@ -121,6 +125,31 @@ class ContinuousBatchScheduler:
         self.enable_dynamic_batching = enable_dynamic_batching
         self.device = device
         self.max_queue_depth = max_queue_depth  # Phase 1
+
+        # Stage 5: RL scheduling (optional, backward compatible)
+        self.enable_rl_scheduling = enable_rl_scheduling
+        self.rl_agent = None
+        self.batch_size_map = [1, 2, 4, 8, 16, 32, 64]
+
+        if enable_rl_scheduling:
+            # Try to load RL agent
+            if rl_agent_path is None:
+                rl_agent_path = "scheduler_rl_agent.zip"
+
+            try:
+                from .rl_scheduler import RLSchedulerAgent
+                self.rl_agent = RLSchedulerAgent.load(rl_agent_path, self.batch_size_map)
+                print(f"✓ RL scheduler agent loaded from {rl_agent_path}")
+            except FileNotFoundError:
+                print(f"⚠ RL agent not found at {rl_agent_path}, falling back to rule-based scheduling")
+                self.enable_rl_scheduling = False
+            except ImportError as e:
+                print(f"⚠ RL dependencies not installed ({e}), falling back to rule-based scheduling")
+                self.enable_rl_scheduling = False
+
+        # Stage 5: Neural memory predictor (optional)
+        self.neural_memory_predictor = None
+        self.use_neural_memory_predictor = False
 
         # Request queues
         # Phase 1: Keep as list for heapq (heapq requires list, not deque)
@@ -141,7 +170,28 @@ class ContinuousBatchScheduler:
         self._batch_size_history: List[int] = []
         self._avg_seq_len_history: List[float] = []
         self._grouping_savings: int = 0  # Tokens saved by smart grouping
-        
+
+    def enable_neural_memory_predictor(self, model_path: str = "memory_predictor.pth", model_config: Dict = None):
+        """
+        Enable neural memory predictor for more accurate memory estimation.
+
+        Args:
+            model_path: Path to trained neural memory predictor
+            model_config: Model configuration (hidden_size, num_layers, etc.)
+        """
+        try:
+            from .neural_memory_predictor import NeuralMemoryPredictor
+            self.neural_memory_predictor = NeuralMemoryPredictor.load(model_path)
+            self.use_neural_memory_predictor = True
+            self.model_config = model_config or {}
+            print(f"✓ Neural memory predictor loaded from {model_path}")
+        except FileNotFoundError:
+            print(f"⚠ Neural memory predictor not found at {model_path}")
+            self.use_neural_memory_predictor = False
+        except ImportError as e:
+            print(f"⚠ Could not load neural memory predictor ({e})")
+            self.use_neural_memory_predictor = False
+
     def add_request(self, request: InferenceRequest):
         """
         Add a new inference request to the queue.
@@ -181,16 +231,27 @@ class ContinuousBatchScheduler:
     
     def _compute_dynamic_batch_size(self) -> int:
         """
-        Stage 4 Optimization 1: Auto-tune batch size based on sequence lengths.
+        Stage 5 Optimization: RL-powered OR rule-based batch size optimization.
 
         Strategy:
-        - Longer sequences → smaller batch (memory constrained)
-        - Shorter sequences → larger batch (compute constrained)
-        - Uses exponential moving average of recent batch characteristics
+        - If RL enabled: Use trained RL agent to predict optimal batch size
+        - Otherwise: Use rule-based heuristic (Stage 4)
 
         Returns:
             Optimal batch size for current conditions
         """
+        # Stage 5: Use RL agent if enabled and available
+        if self.enable_rl_scheduling and self.rl_agent is not None:
+            try:
+                # RL agent predicts batch size based on current state
+                batch_size = self.rl_agent.predict(self, deterministic=True)
+                return batch_size
+            except Exception as e:
+                # Fallback to rule-based on error
+                print(f"⚠ RL prediction failed ({e}), using rule-based scheduling")
+                # Continue to rule-based fallback below
+
+        # Stage 4: Rule-based fallback (original logic)
         if not self.enable_dynamic_batching or not self._avg_seq_len_history:
             return self.max_batch_size
 
@@ -214,24 +275,54 @@ class ContinuousBatchScheduler:
 
     def _estimate_memory_with_reuse(self, request: InferenceRequest, current_batch: List[InferenceRequest]) -> float:
         """
-        Stage 4 Optimization 3: Memory-aware scheduling with KV cache reuse consideration.
+        Stage 5 Optimization: Neural memory prediction OR rule-based estimation.
 
         Improves upon naive estimation by considering:
         - Prefix sharing potential
         - Block-level memory accounting
         - Actual tensor overhead
+        - Learned patterns from production data (if neural predictor enabled)
 
         Returns:
             Estimated memory in MB
         """
+        # Stage 5: Use neural predictor if enabled and available
+        if self.use_neural_memory_predictor and self.neural_memory_predictor is not None:
+            try:
+                # Calculate batch characteristics
+                batch_size = len(current_batch) + 1  # Current batch + new request
+                all_requests = current_batch + [request]
+                seq_lengths = [req.current_length + req.tokens_remaining for req in all_requests]
+                avg_seq_len = sum(seq_lengths) / len(seq_lengths)
+
+                # Get model config
+                model_config = getattr(self, 'model_config', {})
+
+                # Predict memory using neural network
+                memory_mb = self.neural_memory_predictor.predict(
+                    batch_size=batch_size,
+                    avg_seq_len=avg_seq_len,
+                    model_config=model_config,
+                    quantize_kv=model_config.get('quantize_kv', False),
+                    use_flash_attention=model_config.get('use_flash_attention', True)
+                )
+
+                return memory_mb
+
+            except Exception as e:
+                # Fallback to rule-based on error
+                print(f"⚠ Neural memory prediction failed ({e}), using rule-based estimation")
+                # Continue to rule-based fallback below
+
+        # Stage 4: Rule-based fallback (original logic)
         if not self.enable_dynamic_batching:
-            # Fallback to naive estimation
+            # Naive estimation
             bytes_per_token = 200 * 1024
             current_tokens = sum(req.current_length for req in current_batch)
             new_tokens = request.current_length + request.tokens_remaining
             return (current_tokens + new_tokens) * bytes_per_token / (1024 * 1024)
 
-        # Stage 4: More accurate memory estimation
+        # More accurate rule-based estimation
         # Account for:
         # 1. KV cache blocks (paged memory)
         # 2. Prefix sharing (reduce memory if common prefix detected)
