@@ -265,9 +265,14 @@ def evaluate_agent(model, eval_env, n_eval_episodes: int = 10):
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            # Gymnasium returns: obs, reward, terminated, truncated, info
-            obs, reward, terminated, truncated, info = eval_env.step(action)
-            done = terminated[0] or truncated[0]  # VecEnv returns arrays
+            # VecEnv returns 4 values (wraps terminated/truncated into done)
+            step_result = eval_env.step(action)
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated[0] or truncated[0]
+            else:
+                obs, reward, done_arr, info = step_result
+                done = done_arr[0]
             episode_reward += reward[0]
             episode_length += 1
 
