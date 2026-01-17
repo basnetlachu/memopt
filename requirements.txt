@@ -17,7 +17,7 @@ tqdm>=4.66.0
 # Requirements: CUDA 11.6+ and NVIDIA GPU with compute capability 7.0+
 # Without this, you'll get 16-20x speedup (PyTorch SDPA fallback)
 # With this, you'll get 30-60x speedup (Flash Attention 2)
-flash-attn>=2.3.0
+#flash-attn>=2.3.0
 
 # ============================================================================
 # OPTIONAL PERFORMANCE LIBRARIES
