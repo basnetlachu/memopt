@@ -36,10 +36,10 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import gym
+    import gymnasium as gym
 except ImportError:
-    print("ERROR: gym not installed.")
-    print("Install with: pip install gym")
+    print("ERROR: gymnasium not installed.")
+    print("Install with: pip install gymnasium")
     sys.exit(1)
 
 # Import Memopt components
@@ -265,7 +265,9 @@ def evaluate_agent(model, eval_env, n_eval_episodes: int = 10):
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = eval_env.step(action)
+            # Gymnasium returns: obs, reward, terminated, truncated, info
+            obs, reward, terminated, truncated, info = eval_env.step(action)
+            done = terminated[0] or truncated[0]  # VecEnv returns arrays
             episode_reward += reward[0]
             episode_length += 1
 

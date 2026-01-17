@@ -12,9 +12,9 @@ Key Features:
 Expected Improvement: +15-25% throughput over rule-based scheduling
 """
 
-import gym
+import gymnasium as gym
 import numpy as np
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple, Any
 import time
 from dataclasses import dataclass
 
@@ -114,13 +114,20 @@ class BatchSchedulerEnv(gym.Env):
         self.total_latency_ms = 0.0
         self.oom_count = 0
 
-    def reset(self) -> np.ndarray:
+    def reset(self, seed=None, options=None) -> Tuple[np.ndarray, dict]:
         """
         Reset environment to initial state.
 
+        Args:
+            seed: Random seed (gymnasium API)
+            options: Additional options (gymnasium API)
+
         Returns:
-            Initial observation (state)
+            Tuple of (observation, info)
         """
+        # Handle seed for gymnasium compatibility
+        super().reset(seed=seed)
+
         # Import here to avoid circular dependency
         if self.scheduler is None:
             from .scheduler import ContinuousBatchScheduler
@@ -145,7 +152,7 @@ class BatchSchedulerEnv(gym.Env):
         # Generate initial requests (simulate workload)
         self._generate_workload(num_requests=10)
 
-        return self._get_state()
+        return self._get_state(), {}
 
     def _get_state(self) -> np.ndarray:
         """
@@ -184,7 +191,7 @@ class BatchSchedulerEnv(gym.Env):
 
         return state
 
-    def step(self, action: int):
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """
         Apply action (select batch size) and execute one scheduling step.
 
@@ -194,7 +201,8 @@ class BatchSchedulerEnv(gym.Env):
         Returns:
             observation: Next state
             reward: Reward for this step
-            done: Whether episode is finished
+            terminated: Whether episode ended naturally
+            truncated: Whether episode was cut short (e.g., time limit)
             info: Additional metrics
         """
         # Map action to batch size
@@ -207,6 +215,8 @@ class BatchSchedulerEnv(gym.Env):
         self.scheduler.max_batch_size = batch_size
 
         # Execute one scheduling step
+        terminated = False
+        truncated = False
         try:
             batch = self.scheduler.schedule_batch()
 
@@ -221,11 +231,12 @@ class BatchSchedulerEnv(gym.Env):
             if self.episode_steps % 10 == 0:
                 self._generate_workload(num_requests=5)
 
-            # Episode done conditions
-            done = (
-                self.episode_steps >= self.max_episode_steps or
-                self.scheduler.get_queue_depth() == 0 and len(self.scheduler.running_batch) == 0
-            )
+            # Episode termination conditions
+            if self.scheduler.get_queue_depth() == 0 and len(self.scheduler.running_batch) == 0:
+                terminated = True  # Natural end - no more work
+
+            if self.episode_steps >= self.max_episode_steps:
+                truncated = True  # Time limit reached
 
             # Restore original batch size (for compatibility)
             self.scheduler.max_batch_size = original_batch_size
@@ -233,7 +244,7 @@ class BatchSchedulerEnv(gym.Env):
         except MemoryError:
             # OOM penalty
             reward = -50.0
-            done = True
+            terminated = True
             self.oom_count += 1
             info = {'oom': True, 'batch_size': batch_size}
 
@@ -245,9 +256,9 @@ class BatchSchedulerEnv(gym.Env):
 
         if self.verbose:
             print(f"[RL Step {self.episode_steps}] Action={action} (bs={batch_size}), "
-                  f"Reward={reward:.2f}, Done={done}")
+                  f"Reward={reward:.2f}, Terminated={terminated}, Truncated={truncated}")
 
-        return next_state, reward, done, info
+        return next_state, reward, terminated, truncated, info
 
     def _compute_reward(self, batch: Optional[List], batch_size: int) -> tuple:
         """

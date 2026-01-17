@@ -35,11 +35,11 @@ pydantic>=2.6.0
 # ============================================================================
 # STAGE 5: RL-POWERED OPTIMIZATION (OPTIONAL)
 # ============================================================================
-# Install with: pip install stable-baselines3 gym
+# Install with: pip install stable-baselines3 gymnasium
 # Required for AI-powered batch scheduler (+15-25% throughput improvement)
 # Skip if you want rule-based scheduling only
 stable-baselines3>=2.2.0
-gym>=0.26.0
+gymnasium>=0.29.0
 tensorboard>=2.15.0  # For training visualization
 
 # ============================================================================
