@@ -204,6 +204,8 @@ def evaluate_agent(model, eval_env, n_eval_episodes: int = 10):
         eval_env: Evaluation environment
         n_eval_episodes: Number of episodes to evaluate
     """
+    import numpy as np
+
     episode_rewards = []
     episode_latencies = []
     episode_imbalances = []
@@ -218,7 +220,14 @@ def evaluate_agent(model, eval_env, n_eval_episodes: int = 10):
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = eval_env.step(action)
+            # VecEnv returns 4 values (wraps terminated/truncated into done)
+            step_result = eval_env.step(action)
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated[0] or truncated[0]
+            else:
+                obs, reward, done_arr, info = step_result
+                done = done_arr[0]
 
             episode_reward += reward[0]
             total_latency += info[0].get('latency_ms', 0)
