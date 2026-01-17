@@ -227,14 +227,19 @@ class NeuralMemoryPredictor:
             print(f"Loaded {len(df)} traces from {csv_path}")
 
         # Prepare features and targets
-        features = torch.tensor(df[[
-            'batch_size',
-            'avg_seq_len',
-            'hidden_size',
-            'num_layers',
-            'quantize_kv',
-            'use_flash_attention'
-        ]].values, dtype=torch.float32)
+        # Convert columns to numeric, handling booleans properly
+        feature_cols = ['batch_size', 'avg_seq_len', 'hidden_size', 'num_layers', 'quantize_kv', 'use_flash_attention']
+        feature_df = df[feature_cols].copy()
+
+        # Convert boolean columns to int
+        for col in ['quantize_kv', 'use_flash_attention']:
+            if col in feature_df.columns:
+                feature_df[col] = feature_df[col].astype(float)
+
+        # Convert all to float
+        feature_df = feature_df.astype(float)
+
+        features = torch.tensor(feature_df.values, dtype=torch.float32)
 
         targets = torch.tensor(
             df['gpu_memory_allocated_mb'].values,
@@ -371,17 +376,22 @@ class NeuralMemoryPredictor:
 
         df = pd.read_csv(csv_path)
 
-        features = torch.tensor(df[[
-            'batch_size',
-            'avg_seq_len',
-            'hidden_size',
-            'num_layers',
-            'quantize_kv',
-            'use_flash_attention'
-        ]].values, dtype=torch.float32)
+        # Convert columns to numeric, handling booleans properly
+        feature_cols = ['batch_size', 'avg_seq_len', 'hidden_size', 'num_layers', 'quantize_kv', 'use_flash_attention']
+        feature_df = df[feature_cols].copy()
+
+        # Convert boolean columns to float
+        for col in ['quantize_kv', 'use_flash_attention']:
+            if col in feature_df.columns:
+                feature_df[col] = feature_df[col].astype(float)
+
+        # Convert all to float
+        feature_df = feature_df.astype(float)
+
+        features = torch.tensor(feature_df.values, dtype=torch.float32)
 
         targets = torch.tensor(
-            df['gpu_memory_allocated_mb'].values,
+            df['gpu_memory_allocated_mb'].astype(float).values,
             dtype=torch.float32
         ).unsqueeze(1)
 
