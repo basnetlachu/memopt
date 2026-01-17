@@ -13,7 +13,7 @@ Expected Improvement: +5% scaling efficiency (87.5% → 92.5% on 4 GPUs)
 Training Time: 4-8 hours on CPU
 """
 
-import gym
+import gymnasium as gym
 import numpy as np
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
@@ -124,13 +124,20 @@ class MultiGPURouterEnv(gym.Env):
         self.episode_rewards = []
         self.load_imbalance_history = []
 
-    def reset(self) -> np.ndarray:
+    def reset(self, seed=None, options=None) -> Tuple[np.ndarray, dict]:
         """
         Reset environment to initial state.
 
+        Args:
+            seed: Random seed (gymnasium API)
+            options: Additional options (gymnasium API)
+
         Returns:
-            Initial observation
+            Tuple of (observation, info)
         """
+        # Handle seed for gymnasium compatibility
+        super().reset(seed=seed)
+
         # Reset GPUs
         self.gpus = [GPUState(gpu_id=i) for i in range(self.num_gpus)]
 
@@ -143,7 +150,7 @@ class MultiGPURouterEnv(gym.Env):
         # Generate first request
         self.current_request = self._generate_request()
 
-        return self._get_state()
+        return self._get_state(), {}
 
     def _generate_request(self) -> InferenceRequest:
         """
@@ -199,7 +206,7 @@ class MultiGPURouterEnv(gym.Env):
 
         return state
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute routing action.
 
@@ -209,7 +216,8 @@ class MultiGPURouterEnv(gym.Env):
         Returns:
             observation: Next state
             reward: Reward for this action
-            done: Whether episode is finished
+            terminated: Whether episode ended naturally
+            truncated: Whether episode was cut short
             info: Additional metrics
         """
         # Validate action
@@ -242,9 +250,10 @@ class MultiGPURouterEnv(gym.Env):
 
         # Generate next request
         self.current_step += 1
-        done = self.current_step >= self.episode_length
+        terminated = self.current_step >= self.episode_length
+        truncated = False  # No truncation in this environment
 
-        if not done:
+        if not terminated:
             self.current_request = self._generate_request()
 
         # Info
@@ -259,7 +268,7 @@ class MultiGPURouterEnv(gym.Env):
         if self.verbose:
             print(f"Step {self.current_step}: GPU {gpu_id}, Latency {actual_latency:.1f}ms, Reward {reward:.2f}")
 
-        return self._get_state(), reward, done, info
+        return self._get_state(), reward, terminated, truncated, info
 
     def _compute_reward(self, gpu_id: int, latency_ms: float) -> float:
         """
