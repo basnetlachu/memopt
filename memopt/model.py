@@ -173,6 +173,8 @@ class OptimizedLLM:
         multi_gpu_mode: str = "data_parallel",  # "data_parallel" (replicas) or "tensor_parallel" (split layers)
         enable_rl_routing: bool = False,  # Enable RL-powered multi-GPU routing
         rl_router_path: Optional[str] = None,  # Path to trained RL router agent
+        rl_scheduler_path: Optional[str] = None,  # Path to trained RL batch scheduler agent
+        memory_predictor_path: Optional[str] = None,  # Path to trained neural memory predictor
         enable_performance_guard: bool = False,  # Enable production safety guardrails
         baseline_throughput: float = None,  # Baseline throughput for guard (measured externally)
         # Production features (Phase 1-4) - all disabled by default
@@ -224,6 +226,30 @@ class OptimizedLLM:
                 guard=self.performance_guard,
                 initial_draft_tokens=4
             )
+
+        # AI-powered optimization components
+        self.rl_scheduler_agent = None
+        self.memory_predictor = None
+
+        # Load RL batch scheduler if provided
+        if rl_scheduler_path is not None:
+            try:
+                from .rl_scheduler import RLSchedulerAgent
+                self.rl_scheduler_agent = RLSchedulerAgent.load(rl_scheduler_path)
+                print(f"✓ Loaded RL batch scheduler from {rl_scheduler_path}")
+            except Exception as e:
+                print(f"⚠️  Failed to load RL scheduler: {e}")
+                print(f"   Continuing without RL scheduler")
+
+        # Load neural memory predictor if provided
+        if memory_predictor_path is not None:
+            try:
+                from .neural_memory_predictor import NeuralMemoryPredictor
+                self.memory_predictor = NeuralMemoryPredictor.load(memory_predictor_path)
+                print(f"✓ Loaded neural memory predictor from {memory_predictor_path}")
+            except Exception as e:
+                print(f"⚠️  Failed to load memory predictor: {e}")
+                print(f"   Continuing without memory predictor")
 
         # Stage 6: Multi-GPU setup
         self.num_gpus = num_gpus
@@ -564,8 +590,26 @@ class OptimizedLLM:
                 memory_limit_gb=40.0,  # Conservative GPU memory limit
                 enable_affinity=True,
                 enable_dynamic_batching=self.opt_config.get('enable_dynamic_batching', False),  # Stage 4
-                device=self.device
+                device=self.device,
+                enable_rl_scheduling=self.rl_scheduler_agent is not None,  # Enable if RL agent loaded
+                rl_agent_path=None  # We'll inject the agent directly
             )
+
+            # Inject the pre-loaded RL scheduler agent if available
+            if self.rl_scheduler_agent is not None:
+                self.scheduler.rl_agent = self.rl_scheduler_agent
+                self.scheduler.enable_rl_scheduling = True
+                print(f"✓ RL scheduler agent integrated into batch scheduler")
+
+            # Inject the pre-loaded memory predictor if available
+            if self.memory_predictor is not None:
+                self.scheduler.neural_memory_predictor = self.memory_predictor
+                self.scheduler.use_neural_memory_predictor = True
+                self.scheduler.model_config = {
+                    'hidden_size': self.hidden_size,
+                    'num_layers': self.num_layers
+                }
+                print(f"✓ Neural memory predictor integrated into batch scheduler")
         else:
             # Stage 0/1: Use SimpleScheduler (original behavior)
             self.scheduler = SimpleScheduler(device=self.device)

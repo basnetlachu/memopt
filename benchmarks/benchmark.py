@@ -134,6 +134,9 @@ def run_optimized(
     num_gpus: int = 1,
     multi_gpu_mode: str = "data_parallel",
     enable_rl_routing: bool = False,
+    rl_router_path: str = None,
+    rl_scheduler_path: str = None,
+    memory_predictor_path: str = None,
     enable_memory_tracing: bool = False,
     memory_trace_output: str = "memory_traces.csv"
 ):
@@ -183,7 +186,10 @@ def run_optimized(
         max_kv_blocks=max_kv_blocks,  # Apply user override if specified
         num_gpus=num_gpus,  # Multi-GPU support
         multi_gpu_mode=multi_gpu_mode,  # Data parallel or tensor parallel
-        enable_rl_routing=enable_rl_routing  # RL-powered routing
+        enable_rl_routing=enable_rl_routing,  # RL-powered routing
+        rl_router_path=rl_router_path,  # Trained RL router agent
+        rl_scheduler_path=rl_scheduler_path,  # Trained RL batch scheduler agent
+        memory_predictor_path=memory_predictor_path  # Trained neural memory predictor
     )
 
     # Override quantization if requested (must be done BEFORE cache initialization)
@@ -417,6 +423,24 @@ def main():
         help="Enable RL-powered multi-GPU routing (+5%% efficiency over load-aware)"
     )
     parser.add_argument(
+        "--rl-router-path",
+        type=str,
+        default=None,
+        help="Path to trained RL router agent (e.g., multi_gpu_router.zip)"
+    )
+    parser.add_argument(
+        "--rl-scheduler-path",
+        type=str,
+        default=None,
+        help="Path to trained RL batch scheduler agent (e.g., scheduler_rl_agent.zip)"
+    )
+    parser.add_argument(
+        "--memory-predictor-path",
+        type=str,
+        default=None,
+        help="Path to trained neural memory predictor (e.g., memory_predictor.pth)"
+    )
+    parser.add_argument(
         "--enable-memory-tracing",
         action="store_true",
         help="Enable memory tracing for neural predictor training (saves to memory_traces.csv)"
@@ -507,6 +531,9 @@ def main():
             num_gpus=args.num_gpus,
             multi_gpu_mode=args.multi_gpu_mode,
             enable_rl_routing=args.enable_rl_routing,
+            rl_router_path=args.rl_router_path,
+            rl_scheduler_path=args.rl_scheduler_path,
+            memory_predictor_path=args.memory_predictor_path,
             enable_memory_tracing=args.enable_memory_tracing,
             memory_trace_output=args.memory_trace_output
         )
