@@ -195,12 +195,20 @@ def run_optimized_concurrent(
 
     # Load optimized model with batch processing enabled
     print(f"Loading {model_name} with Memopt optimizations...")
+
+    # Calculate KV blocks needed for concurrent processing
+    # For 100 prompts with 256 tokens each, we need enough blocks
+    # Conservative: num_prompts / 2 (since we process in chunks)
+    num_prompts_estimate = len(prompts) if prompts else 100
+    expected_batch = min(50, num_prompts_estimate)  # Process in chunks of 50
+
     model = OptimizedLLM(
         model=model_name,
         optimization_level="batch",  # Enable continuous batching
         enable_profiling=True,
-        expected_batch_size=32,  # Allow large batches
+        expected_batch_size=expected_batch,  # Dynamic based on prompts
         expected_seq_len=max_tokens * 2,
+        max_kv_blocks=None,  # Auto-allocate based on batch size
         rl_scheduler_path=rl_scheduler_path,
         memory_predictor_path=memory_predictor_path,
         num_gpus=num_gpus,
@@ -228,12 +236,15 @@ def run_optimized_concurrent(
     start_time = time.time()
 
     # Process in chunks to avoid memory issues
-    chunk_size = 50
+    # Start with smaller chunks and let RL scheduler optimize
+    chunk_size = 10  # Smaller chunks to avoid KV cache exhaustion
     all_outputs = []
 
     for i in range(0, len(prompts), chunk_size):
         chunk = prompts[i:i+chunk_size]
-        print(f"    Processing chunk {i//chunk_size + 1}/{(len(prompts)-1)//chunk_size + 1} ({len(chunk)} prompts)...")
+        chunk_num = i//chunk_size + 1
+        total_chunks = (len(prompts)-1)//chunk_size + 1
+        print(f"    Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} prompts)...")
 
         # generate_batch uses ContinuousBatchScheduler internally
         outputs = model.generate_batch(
@@ -242,6 +253,10 @@ def run_optimized_concurrent(
             do_sample=False
         )
         all_outputs.extend(outputs)
+
+        # Reset KV cache between chunks to free memory
+        if hasattr(model, 'reset_kv_cache'):
+            model.reset_kv_cache()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -288,7 +303,7 @@ def main():
         "--model",
         type=str,
         default="gpt2-xl",
-        help="Model to benchmark"
+        help="Model to benchmark (gpt2-xl, Qwen/Qwen2.5-7B-Instruct, Qwen/Qwen2.5-14B-Instruct, etc.)"
     )
     parser.add_argument(
         "--num-prompts",
