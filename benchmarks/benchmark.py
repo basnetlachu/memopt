@@ -12,10 +12,16 @@ Three optimization presets:
 All old optimization levels are aliases for "fast".
 
 Usage:
+    # Single GPU
     python benchmark.py --model Qwen/Qwen2-7B --max-tokens 1000                    # Uses "fast" (1.2-1.5x)
     python benchmark.py --model Qwen/Qwen2-7B --optimization-level fast            # SDPA only (1.2-1.5x)
     python benchmark.py --model Qwen/Qwen2-7B --optimization-level batch           # Batching (5-10x)
     python benchmark.py --model Qwen/Qwen2-7B --optimization-level maximum         # Batching + spec (10-20x)
+
+    # Multi-GPU (Worker-Per-GPU Architecture)
+    python benchmark.py --model gpt2-xl --num-gpus 2 --use-workers --num-prompts 100 \
+        --rl-scheduler-path scheduler_rl_agent.zip \
+        --memory-predictor-path memory_predictor.pth
 """
 
 import argparse
@@ -23,6 +29,10 @@ import torch
 import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
+import multiprocessing as mp
+import os
+import sys
+import queue
 
 from memopt import OptimizedLLM, ProfileStats
 from memopt.profiler import compare_profiles
@@ -394,6 +404,263 @@ def print_memory_analysis(optimized_model, baseline_memory_gb, optimized_peak_gb
     print("="*70)
 
 
+def worker_process(
+    worker_id: int,
+    model_name: str,
+    optimization_level: str,
+    max_tokens: int,
+    rl_scheduler_path: str,
+    memory_predictor_path: str,
+    prompt_queue: mp.Queue,
+    result_queue: mp.Queue,
+    ready_queue: mp.Queue
+):
+    """
+    Worker process that runs on a single GPU.
+
+    Each worker:
+    1. Sets CUDA_VISIBLE_DEVICES to see only its GPU
+    2. Loads Memopt with full optimizations
+    3. Processes prompts from the queue
+    4. Returns results to the main process
+    """
+    # Set this worker to use only its assigned GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(worker_id)
+
+    # Import here to ensure CUDA_VISIBLE_DEVICES takes effect
+    import torch
+    from memopt import OptimizedLLM
+
+    print(f"[Worker {worker_id}] Starting on GPU {worker_id}")
+    print(f"[Worker {worker_id}] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+    print(f"[Worker {worker_id}] PyTorch sees {torch.cuda.device_count()} GPU(s)")
+
+    # Load model with Memopt optimizations
+    print(f"[Worker {worker_id}] Loading model {model_name}...")
+
+    model_kwargs = {
+        'model': model_name,
+        'optimization_level': optimization_level,
+        'enable_profiling': True,
+        'device': 'cuda',  # Will use GPU 0 in this process (which is actually GPU worker_id)
+    }
+
+    # Add AI models if provided
+    if rl_scheduler_path:
+        model_kwargs['rl_scheduler_path'] = rl_scheduler_path
+    if memory_predictor_path:
+        model_kwargs['memory_predictor_path'] = memory_predictor_path
+
+    try:
+        model = OptimizedLLM(**model_kwargs)
+        print(f"[Worker {worker_id}] ✓ Model loaded successfully")
+    except Exception as e:
+        print(f"[Worker {worker_id}] ✗ Failed to load model: {e}")
+        ready_queue.put(('error', worker_id, str(e)))
+        return
+
+    # Signal that worker is ready
+    ready_queue.put(('ready', worker_id, None))
+
+    # Process prompts from queue
+    prompts_processed = 0
+    total_tokens = 0
+    start_time = time.time()
+
+    while True:
+        try:
+            # Get prompt from queue (with timeout to allow graceful shutdown)
+            item = prompt_queue.get(timeout=1.0)
+
+            if item is None:  # Sentinel value to stop worker
+                break
+
+            prompt_id, prompt = item
+
+            # Generate response
+            try:
+                output = model.generate(prompt, max_tokens=max_tokens, do_sample=False)
+
+                # Count tokens (approximate)
+                tokens_generated = len(output.split())
+
+                prompts_processed += 1
+                total_tokens += tokens_generated
+
+                # Send result back
+                result_queue.put(('success', worker_id, prompt_id, tokens_generated))
+
+            except Exception as e:
+                print(f"[Worker {worker_id}] Error generating for prompt {prompt_id}: {e}")
+                result_queue.put(('error', worker_id, prompt_id, str(e)))
+
+        except queue.Empty:
+            continue  # No prompts available, keep waiting
+        except Exception as e:
+            print(f"[Worker {worker_id}] Unexpected error: {e}")
+            break
+
+    # Compute worker stats
+    elapsed = time.time() - start_time
+    throughput = total_tokens / elapsed if elapsed > 0 else 0
+
+    print(f"[Worker {worker_id}] Processed {prompts_processed} prompts, {total_tokens} tokens in {elapsed:.1f}s")
+    print(f"[Worker {worker_id}] Throughput: {throughput:.1f} tok/s")
+
+    # Send final stats
+    result_queue.put(('stats', worker_id, {
+        'prompts_processed': prompts_processed,
+        'total_tokens': total_tokens,
+        'elapsed': elapsed,
+        'throughput': throughput
+    }))
+
+
+def run_worker_benchmark(
+    model_name: str,
+    num_gpus: int,
+    prompts: list,
+    max_tokens: int,
+    optimization_level: str,
+    rl_scheduler_path: str,
+    memory_predictor_path: str
+):
+    """Run worker-per-GPU benchmark."""
+    print("\n" + "="*70)
+    print(f"WORKER-PER-GPU BENCHMARK ({num_gpus} GPUs)")
+    print("="*70)
+
+    # Create queues for communication
+    prompt_queue = mp.Queue()
+    result_queue = mp.Queue()
+    ready_queue = mp.Queue()
+
+    # Start worker processes
+    print(f"\nStarting {num_gpus} workers...")
+    workers = []
+
+    for worker_id in range(num_gpus):
+        p = mp.Process(
+            target=worker_process,
+            args=(
+                worker_id, model_name, optimization_level, max_tokens,
+                rl_scheduler_path, memory_predictor_path,
+                prompt_queue, result_queue, ready_queue
+            )
+        )
+        p.start()
+        workers.append(p)
+
+    # Wait for all workers to be ready
+    print(f"Waiting for {num_gpus} workers to initialize...")
+    workers_ready = 0
+
+    while workers_ready < num_gpus:
+        try:
+            status, worker_id, data = ready_queue.get(timeout=60)
+            if status == 'ready':
+                print(f"  ✓ Worker {worker_id} ready")
+                workers_ready += 1
+            elif status == 'error':
+                print(f"  ✗ Worker {worker_id} failed: {data}")
+                # Kill all workers and exit
+                for p in workers:
+                    p.terminate()
+                raise RuntimeError(f"Worker {worker_id} failed to start")
+        except queue.Empty:
+            print("  ✗ Timeout waiting for workers")
+            for p in workers:
+                p.terminate()
+            raise RuntimeError("Workers failed to start within timeout")
+
+    print(f"✓ All {num_gpus} workers ready\n")
+
+    # Distribute prompts to queue
+    print(f"Distributing {len(prompts)} prompts to workers...")
+    for i, prompt in enumerate(prompts):
+        prompt_queue.put((i, prompt))
+
+    # Add sentinel values to stop workers
+    for _ in range(num_gpus):
+        prompt_queue.put(None)
+
+    # Collect results
+    print(f"Processing prompts...")
+    start_time = time.time()
+
+    prompts_completed = 0
+    errors = 0
+    worker_stats = {}
+
+    while prompts_completed < len(prompts) or len(worker_stats) < num_gpus:
+        try:
+            result = result_queue.get(timeout=300)
+
+            if result[0] == 'success':
+                _, worker_id, prompt_id, tokens = result
+                prompts_completed += 1
+                print(f"  Completed {prompts_completed}/{len(prompts)} prompts", end='\r')
+
+            elif result[0] == 'error':
+                _, worker_id, prompt_id, error = result
+                errors += 1
+                print(f"\n  Error in worker {worker_id}, prompt {prompt_id}: {error}")
+
+            elif result[0] == 'stats':
+                _, worker_id, stats = result
+                worker_stats[worker_id] = stats
+
+        except queue.Empty:
+            print("\n  Warning: Timeout waiting for results")
+            break
+
+    elapsed = time.time() - start_time
+
+    # Wait for workers to finish
+    for p in workers:
+        p.join(timeout=5)
+        if p.is_alive():
+            p.terminate()
+
+    # Calculate aggregate stats
+    total_tokens = sum(stats['total_tokens'] for stats in worker_stats.values())
+    total_throughput = total_tokens / elapsed
+
+    print(f"\n\n✓ Worker benchmark complete")
+    print(f"\nPer-Worker Stats:")
+    for worker_id, stats in sorted(worker_stats.items()):
+        print(f"  Worker {worker_id}: {stats['throughput']:.1f} tok/s ({stats['prompts_processed']} prompts)")
+
+    print(f"\nAggregate Stats:")
+    print(f"  Total throughput: {total_throughput:.1f} tok/s")
+    print(f"  Total elapsed: {elapsed:.1f}s")
+    print(f"  Prompts completed: {prompts_completed}/{len(prompts)}")
+    if errors > 0:
+        print(f"  Errors: {errors}")
+
+    # Return stats compatible with ProfileStats
+    stats = ProfileStats()
+    stats.total_tokens_generated = total_tokens
+    stats.total_time_seconds = elapsed
+    stats.tokens_per_second = total_throughput
+    stats.latency_per_token_ms = (elapsed / total_tokens) * 1000 if total_tokens > 0 else 0
+
+    # Worker mode doesn't have accurate memory tracking (distributed)
+    stats.peak_memory_allocated_gb = 0.0
+    stats.peak_memory_reserved_gb = 0.0
+    stats.memory_bandwidth_utilization_pct = 0.0
+    stats.gpu_stall_pct = 0.0
+    stats.gpu_utilization_pct = 0.0
+
+    # Cost estimate
+    gpu_hourly_cost = 5.0  # A100 80GB
+    stats.estimated_gpu_hours = elapsed / 3600.0 * num_gpus  # Multiple GPUs
+    cost_for_run = stats.estimated_gpu_hours * gpu_hourly_cost
+    stats.cost_per_1m_tokens_usd = (cost_for_run / total_tokens) * 1e6 if total_tokens > 0 else 0
+
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Memopt")
     parser.add_argument(
@@ -502,8 +769,23 @@ def main():
         default="memory_traces.csv",
         help="Output file for memory traces (default: memory_traces.csv)"
     )
+    parser.add_argument(
+        "--use-workers",
+        action="store_true",
+        help="Use worker-per-GPU architecture for multi-GPU (recommended for 2+ GPUs)"
+    )
 
     args = parser.parse_args()
+
+    # Validate GPU count for worker mode
+    if args.use_workers:
+        available_gpus = torch.cuda.device_count()
+        if args.num_gpus > available_gpus:
+            print(f"Error: Requested {args.num_gpus} GPUs but only {available_gpus} available")
+            sys.exit(1)
+        if args.num_gpus < 2:
+            print("Warning: Worker mode is designed for 2+ GPUs. Using single GPU with standard mode.")
+            args.use_workers = False
 
     # Test prompts
     base_prompts = [
@@ -574,20 +856,34 @@ def main():
         baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
 
     if args.mode in ["optimized", "both"]:
-        # Use specified optimization level (default: ultra = Stage 0+1+2+3+4)
-        optimized_stats, optimized_model = run_optimized(
-            args.model, prompts, args.max_tokens, args.optimization_level, args.max_kv_blocks,
-            quantize_kv=args.quantize_kv,
-            enable_speculative=args.enable_speculative,
-            num_gpus=args.num_gpus,
-            multi_gpu_mode=args.multi_gpu_mode,
-            enable_rl_routing=args.enable_rl_routing,
-            rl_router_path=args.rl_router_path,
-            rl_scheduler_path=args.rl_scheduler_path,
-            memory_predictor_path=args.memory_predictor_path,
-            enable_memory_tracing=args.enable_memory_tracing,
-            memory_trace_output=args.memory_trace_output
-        )
+        # Check if we should use worker-per-GPU architecture
+        if args.use_workers and args.num_gpus >= 2:
+            # Use worker-per-GPU architecture (production-correct for multi-GPU)
+            optimized_stats = run_worker_benchmark(
+                args.model,
+                args.num_gpus,
+                prompts,
+                args.max_tokens,
+                args.optimization_level,
+                args.rl_scheduler_path,
+                args.memory_predictor_path
+            )
+            optimized_model = None  # No single model instance in worker mode
+        else:
+            # Use standard single-GPU or DataParallel mode
+            optimized_stats, optimized_model = run_optimized(
+                args.model, prompts, args.max_tokens, args.optimization_level, args.max_kv_blocks,
+                quantize_kv=args.quantize_kv,
+                enable_speculative=args.enable_speculative,
+                num_gpus=args.num_gpus,
+                multi_gpu_mode=args.multi_gpu_mode,
+                enable_rl_routing=args.enable_rl_routing,
+                rl_router_path=args.rl_router_path,
+                rl_scheduler_path=args.rl_scheduler_path,
+                memory_predictor_path=args.memory_predictor_path,
+                enable_memory_tracing=args.enable_memory_tracing,
+                memory_trace_output=args.memory_trace_output
+            )
 
     # "Optimized" uses specified optimization level (default: ultra with all stages)
     
@@ -711,4 +1007,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing on some platforms
+    mp.set_start_method('spawn', force=True)
     main()
