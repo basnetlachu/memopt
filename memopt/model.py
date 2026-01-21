@@ -21,7 +21,7 @@ from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
 from .batch_utils import pad_sequences, update_attention_mask
 from .speculative_decoding import SpeculativeDecoder, create_draft_model
-from .model_parallel import init_model_parallel
+# REMOVED: from .model_parallel import init_model_parallel (deprecated - use worker-per-GPU instead)
 from .performance_guard import PerformanceGuard, AdaptiveController
 
 # Production infrastructure (Phase 1-4) - all optional, disabled by default
@@ -169,10 +169,7 @@ class OptimizedLLM:
         expected_batch_size: int = 8,
         expected_seq_len: int = 1000,
         max_kv_blocks: int = None,  # Override KV cache block limit
-        num_gpus: int = None,  # Number of GPUs for Stage 6 (None = auto-detect)
-        multi_gpu_mode: str = "data_parallel",  # "data_parallel" (replicas) or "tensor_parallel" (split layers)
-        enable_rl_routing: bool = False,  # Enable RL-powered multi-GPU routing
-        rl_router_path: Optional[str] = None,  # Path to trained RL router agent
+        # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path (use worker-per-GPU instead)
         rl_scheduler_path: Optional[str] = None,  # Path to trained RL batch scheduler agent
         memory_predictor_path: Optional[str] = None,  # Path to trained neural memory predictor
         enable_performance_guard: bool = False,  # Enable production safety guardrails
@@ -251,62 +248,11 @@ class OptimizedLLM:
                 print(f"⚠️  Failed to load memory predictor: {e}")
                 print(f"   Continuing without memory predictor")
 
-        # Stage 6: Multi-GPU setup
-        self.num_gpus = num_gpus
-        self.multi_gpu_mode = multi_gpu_mode
-        self.model_parallel = None
-        self.multi_gpu_router = None
-        self.gpu_models = []  # For data parallel mode
-
-        # Auto-detect GPUs if not specified
-        if self.num_gpus is None:
-            self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-
-        # Initialize multi-GPU support
-        if self.num_gpus > 1:
-            import os
-
-            if multi_gpu_mode == "tensor_parallel":
-                # Tensor parallelism: split layers across GPUs
-                if "LOCAL_RANK" in os.environ:
-                    self.model_parallel = init_model_parallel(world_size=self.num_gpus)
-                    self.device = self.model_parallel.device
-                    print(f"[GPU {self.model_parallel.rank}] Multi-GPU: Tensor parallelism enabled ({self.num_gpus} GPUs)")
-                else:
-                    print(f"⚠️  Warning: {self.num_gpus} GPUs detected but not running in distributed mode.")
-                    print(f"    Use: torchrun --nproc_per_node={self.num_gpus} your_script.py")
-                    print(f"    Falling back to single GPU.")
-                    self.num_gpus = 1
-
-            elif multi_gpu_mode == "data_parallel":
-                # Data parallelism: replicate model on each GPU (better scaling for inference)
-                print(f"Multi-GPU: Data parallelism enabled ({self.num_gpus} GPUs)")
-
-                # Initialize multi-GPU router
-                from .multi_gpu_router import MultiGPURLRouter, LoadAwareRouter, calculate_scaling_efficiency
-
-                if enable_rl_routing:
-                    # Use RL-powered router
-                    self.multi_gpu_router = MultiGPURLRouter(
-                        num_gpus=self.num_gpus,
-                        rl_agent_path=rl_router_path,
-                        fallback_router="load_aware"
-                    )
-                    routing_strategy = "RL-powered"
-                else:
-                    # Use load-aware router (rule-based)
-                    self.multi_gpu_router = LoadAwareRouter(num_gpus=self.num_gpus)
-                    routing_strategy = "Load-aware"
-
-                # Calculate expected scaling efficiency
-                scaling_efficiency = calculate_scaling_efficiency(self.num_gpus)
-                print(f"  Routing strategy: {routing_strategy}")
-                print(f"  Expected scaling efficiency: {scaling_efficiency*100:.1f}%")
-
-                # Note: Model replicas will be created in _load_model()
-            else:
-                print(f"⚠️  Unknown multi_gpu_mode '{multi_gpu_mode}', falling back to single GPU")
-                self.num_gpus = 1
+        # REMOVED: Stage 6 - Old multi-GPU setup (deprecated)
+        # For multi-GPU inference, use production worker-per-GPU architecture:
+        #   - See: production/worker_service.py
+        #   - Run: scripts/benchmark_production.sh
+        # Old DataParallel/TensorParallel code moved to experiments/old_multi_gpu/
         
         # Get optimization config
         if optimization_level not in self.OPTIMIZATION_PRESETS:
@@ -460,11 +406,7 @@ class OptimizedLLM:
         
         self.model.eval()
 
-        # Stage 6: Apply model parallelism if multi-GPU
-        if self.model_parallel is not None:
-            print(f"[GPU {self.model_parallel.rank}] Parallelizing model across {self.num_gpus} GPUs...")
-            self.model = self.model_parallel.parallelize_model(self.model)
-            print(f"[GPU {self.model_parallel.rank}] ✓ Model parallelization complete")
+        # REMOVED: Model parallelism (deprecated - use worker-per-GPU instead)
 
         # torch.compile removed - not needed for production deployment
         # Speedup comes from Flash Attention (50-60x) and Speculative Decoding (16-20x)
@@ -710,9 +652,7 @@ class OptimizedLLM:
         Returns:
             Generated text
         """
-        # Multi-GPU routing (data parallel mode)
-        if self.multi_gpu_router is not None and self.num_gpus > 1 and len(self.gpu_models) > 0:
-            return self._generate_multi_gpu(prompt, max_tokens, temperature, top_p, do_sample, **kwargs)
+        # REMOVED: Multi-GPU routing (deprecated - use worker-per-GPU architecture instead)
 
         # Handle single or batch prompts
         is_batch = isinstance(prompt, list)
@@ -863,156 +803,11 @@ class OptimizedLLM:
 
         return generated_text if not is_batch else [generated_text]
 
-    def _generate_multi_gpu(
-        self,
-        prompt: Union[str, List[str]],
-        max_tokens: int = 512,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        do_sample: bool = False,
-        **kwargs
-    ) -> Union[str, List[str]]:
-        """
-        Multi-GPU generation using data parallelism.
-
-        Routes requests to different GPUs using the multi-GPU router,
-        enabling true parallel processing for maximum throughput.
-
-        Args:
-            prompt: Input prompt(s)
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_p: Nucleus sampling threshold
-            do_sample: Whether to sample (vs greedy)
-
-        Returns:
-            Generated text
-        """
-        import concurrent.futures
-        import time
-
-        # Handle single or batch prompts
-        is_batch = isinstance(prompt, list)
-        if not is_batch:
-            prompt = [prompt]
-
-        # If we have fewer prompts than GPUs, just use single GPU per prompt
-        if len(prompt) <= self.num_gpus:
-            results = []
-
-            def generate_on_gpu(gpu_id, p):
-                """Generate on specific GPU."""
-                # Select GPU model
-                if gpu_id < len(self.gpu_models):
-                    gpu_model = self.gpu_models[gpu_id]
-                else:
-                    gpu_model = self  # Fallback to main model
-
-                # Tokenize on target GPU
-                encoded = self.tokenizer(
-                    [p],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=2048
-                ).to(f"cuda:{gpu_id}")
-
-                input_ids = encoded['input_ids']
-
-                # Generate
-                with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
-                    output_ids = gpu_model.model.generate(
-                        input_ids,
-                        max_new_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        do_sample=do_sample,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        **kwargs
-                    )
-
-                # Decode
-                generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
-                # Update router metrics
-                if self.multi_gpu_router:
-                    self.multi_gpu_router.update_metrics(gpu_id, completed_tokens=max_tokens)
-
-                return generated_text
-
-            # Parallel generation across GPUs
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompt)) as executor:
-                futures = []
-                for i, p in enumerate(prompt):
-                    gpu_id = i % self.num_gpus  # Round-robin for simplicity
-                    futures.append(executor.submit(generate_on_gpu, gpu_id, p))
-
-                results = [f.result() for f in futures]
-
-            return results if is_batch else results[0]
-
-        else:
-            # More prompts than GPUs - use router
-            results = [None] * len(prompt)
-
-            def generate_with_routing(idx, p):
-                """Generate with router-based GPU selection."""
-                # Create dummy request for routing
-                from .scheduler import InferenceRequest
-                request = InferenceRequest(
-                    request_id=f"gen_{idx}",
-                    prompt=p,
-                    input_ids=torch.zeros((1, 1), dtype=torch.long),  # Dummy
-                    max_tokens=max_tokens
-                )
-
-                # Route to GPU
-                start_time = time.time()
-                gpu_id = self.multi_gpu_router.route_request(request)
-
-                # Generate on selected GPU
-                if gpu_id < len(self.gpu_models):
-                    gpu_model = self.gpu_models[gpu_id]
-                else:
-                    gpu_model = self
-
-                encoded = self.tokenizer(
-                    [p],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=2048
-                ).to(f"cuda:{gpu_id}")
-
-                input_ids = encoded['input_ids']
-
-                with torch.amp.autocast('cuda', enabled=(self.torch_dtype == torch.float16)):
-                    output_ids = gpu_model.model.generate(
-                        input_ids,
-                        max_new_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        do_sample=do_sample,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        **kwargs
-                    )
-
-                generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
-                # Update router metrics
-                latency_ms = (time.time() - start_time) * 1000
-                self.multi_gpu_router.update_metrics(gpu_id, completed_tokens=max_tokens, latency_ms=latency_ms)
-
-                return idx, generated_text
-
-            # Parallel generation with routing
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_gpus) as executor:
-                futures = [executor.submit(generate_with_routing, i, p) for i, p in enumerate(prompt)]
-                for future in concurrent.futures.as_completed(futures):
-                    idx, text = future.result()
-                    results[idx] = text
-
-            return results if is_batch else results[0]
+    # REMOVED: _generate_multi_gpu() method (deprecated)
+    # For multi-GPU inference, use production worker-per-GPU architecture:
+    #   - See: production/worker_service.py
+    #   - Run: scripts/benchmark_production.sh
+    # Old implementation moved to: experiments/old_multi_gpu/
 
     def generate_with_priority(
         self,
