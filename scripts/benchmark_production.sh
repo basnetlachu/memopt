@@ -1,6 +1,6 @@
 #!/bin/bash
 # Complete benchmark script for multi-GPU production testing
-# Tests throughput while monitoring GPU utilization
+# Shows: Baseline vs Optimized performance + Multi-GPU scaling
 
 set -e
 
@@ -8,6 +8,7 @@ NUM_GPUS=${1:-2}
 NUM_REQUESTS=${2:-100}
 CONCURRENT_PER_GPU=${3:-50}  # Concurrent requests per GPU
 MODEL_NAME=${MODEL_NAME:-"gpt2-xl"}
+RUN_BASELINE=${RUN_BASELINE:-true}  # Set to false to skip baseline
 
 echo "======================================="
 echo "Memopt Production Benchmark"
@@ -35,6 +36,40 @@ fi
 
 # Create logs directory
 mkdir -p logs
+
+# Run baseline benchmark if enabled
+BASELINE_THROUGHPUT=0
+if [ "$RUN_BASELINE" = "true" ]; then
+    echo ""
+    echo "======================================="
+    echo "STEP 1: BASELINE BENCHMARK"
+    echo "======================================="
+    echo "Running unoptimized inference for comparison..."
+    echo ""
+
+    # Run baseline with benchmark.py (single GPU, no optimizations)
+    BASELINE_OUTPUT=$(python3 benchmarks/benchmark.py \
+        --model $MODEL_NAME \
+        --num-prompts 10 \
+        --max-tokens 256 \
+        --optimization-level none 2>&1 || echo "")
+
+    # Extract baseline throughput
+    BASELINE_THROUGHPUT=$(echo "$BASELINE_OUTPUT" | grep -oP "(?<=Throughput: )[0-9.]+" | tail -1 || echo "0")
+
+    if [ "$BASELINE_THROUGHPUT" != "0" ] && [ -n "$BASELINE_THROUGHPUT" ]; then
+        echo "✓ Baseline: ${BASELINE_THROUGHPUT} tok/s"
+    else
+        echo "⚠ Baseline benchmark failed, will skip comparison"
+        BASELINE_THROUGHPUT=0
+    fi
+
+    echo ""
+fi
+
+echo "======================================="
+echo "STEP 2: OPTIMIZED MULTI-GPU BENCHMARK"
+echo "======================================="
 
 # Start GPU monitor in background
 echo "Starting GPU monitor..."
@@ -201,6 +236,16 @@ EXPECTED_THROUGHPUT=$(echo "$SINGLE_GPU_BASELINE * $NUM_GPUS" | bc)
 SCALING_EFFICIENCY=$(echo "scale=2; 100 * $TOTAL_THROUGHPUT / $EXPECTED_THROUGHPUT" | bc)
 echo "Expected (linear): $EXPECTED_THROUGHPUT tok/s"
 echo "Scaling Efficiency: ${SCALING_EFFICIENCY}%"
+echo ""
+
+# Show baseline comparison if available
+if [ "$BASELINE_THROUGHPUT" != "0" ] && [ -n "$BASELINE_THROUGHPUT" ]; then
+    SPEEDUP=$(echo "scale=2; $TOTAL_THROUGHPUT / $BASELINE_THROUGHPUT" | bc)
+    echo "Performance vs Baseline:"
+    echo "  Baseline (unoptimized): ${BASELINE_THROUGHPUT} tok/s"
+    echo "  Optimized (Memopt): ${TOTAL_THROUGHPUT} tok/s"
+    echo "  Speedup: ${SPEEDUP}x"
+fi
 echo "======================================="
 
 # Stop monitoring
@@ -288,4 +333,8 @@ echo "Summary:"
 echo "  GPUs: $NUM_GPUS"
 echo "  Throughput: $TOTAL_THROUGHPUT tok/s"
 echo "  Scaling: ${SCALING_EFFICIENCY}%"
+if [ "$BASELINE_THROUGHPUT" != "0" ] && [ -n "$BASELINE_THROUGHPUT" ]; then
+    SPEEDUP=$(echo "scale=2; $TOTAL_THROUGHPUT / $BASELINE_THROUGHPUT" | bc)
+    echo "  Speedup: ${SPEEDUP}x vs baseline"
+fi
 echo "======================================="

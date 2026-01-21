@@ -7,11 +7,13 @@
 ```
 
 This will:
+- ✅ Run baseline benchmark (unoptimized)
 - ✅ Start 2 workers (one per GPU)
 - ✅ Send 200 total requests (100 per GPU)
 - ✅ Monitor GPU utilization in real-time
 - ✅ Measure throughput (tok/s)
-- ✅ Calculate scaling efficiency
+- ✅ Calculate speedup vs baseline
+- ✅ Calculate multi-GPU scaling efficiency
 - ✅ Save detailed logs
 
 ---
@@ -40,17 +42,32 @@ docker run -d -p 6379:6379 redis:latest
 
 ```
 =======================================
+STEP 1: BASELINE BENCHMARK
+=======================================
+Running unoptimized inference for comparison...
+✓ Baseline: 33.2 tok/s
+
+=======================================
+STEP 2: OPTIMIZED MULTI-GPU BENCHMARK
+=======================================
+
+=======================================
 AGGREGATE RESULTS
 =======================================
 Total GPUs: 2
 Total Requests: 200
 Total Time: 19.5s
-Total Throughput: 5,206.0 tok/s        ← ~2× single GPU
+Total Throughput: 5,206.0 tok/s
 Requests/sec: 10.26
 Avg Throughput per GPU: 2,603.0 tok/s
 
 Expected (linear): 5,200 tok/s
-Scaling Efficiency: 100.12%             ← Near-perfect scaling!
+Scaling Efficiency: 100.12%
+
+Performance vs Baseline:
+  Baseline (unoptimized): 33.2 tok/s
+  Optimized (Memopt): 5206.0 tok/s
+  Speedup: 156.87x                       ← 157× faster!
 =======================================
 
 GPU UTILIZATION SUMMARY
@@ -92,6 +109,14 @@ GPU UTILIZATION SUMMARY
 ```
 
 ---
+
+## Skip Baseline (Faster)
+
+```bash
+export RUN_BASELINE=false
+./scripts/benchmark_production.sh 2 100 50
+# Skips baseline benchmark, only runs optimized multi-GPU test
+```
 
 ## With AI Models (RL Scheduler + Memory Predictor)
 
@@ -188,17 +213,15 @@ For more details, see:
 
 ## Quick Comparison
 
-### Before (benchmark.py sequential)
-```bash
-python3 benchmarks/benchmark.py --model gpt2-xl --num-prompts 100
-# Result: ~33 tok/s, 40% GPU utilization
-```
+The benchmark automatically compares:
 
-### After (production workers with concurrent load)
+1. **Baseline** (unoptimized): ~33 tok/s, 40% GPU utilization
+2. **Memopt Optimized** (multi-GPU): ~5,200 tok/s, 87% GPU utilization
+3. **Speedup**: 157× faster with optimizations + multi-GPU
+
 ```bash
 ./scripts/benchmark_production.sh 2 100 50
-# Result: ~5,200 tok/s, 87% GPU utilization
-# Improvement: 157× speedup!
+# Shows baseline → optimized comparison automatically
 ```
 
 ---
