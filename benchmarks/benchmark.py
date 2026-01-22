@@ -352,62 +352,26 @@ def run_optimized(
     # Reset timer for actual measurement
     torch.cuda.synchronize() if torch.cuda.is_available() else None
 
-    # Check if we should use concurrent batching mode
-    # Concurrent mode is automatically enabled if:
-    # 1. RL scheduler is loaded, OR
-    # 2. Memory predictor is loaded
-    # This enables TRUE batching to demonstrate trained AI model performance
-    use_concurrent = (rl_scheduler_path is not None or memory_predictor_path is not None)
+    # ALWAYS use batching to avoid KV cache exhaustion
+    # Process in chunks
+    print(f"  Processing {len(prompts)} prompts with batching...")
+    chunk_size = 10
+    for i in range(0, len(prompts), chunk_size):
+        chunk = prompts[i:i+chunk_size]
+        chunk_num = i//chunk_size + 1
+        total_chunks = (len(prompts)-1)//chunk_size + 1
+        print(f"  Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} prompts)...")
 
-    if use_concurrent and len(prompts) >= 10:
-        print(f"  🚀 CONCURRENT BATCHING MODE ENABLED")
-        print(f"     RL Scheduler: {'✓' if rl_scheduler_path else '✗'}")
-        print(f"     Memory Predictor: {'✓' if memory_predictor_path else '✗'}")
-        print(f"  Processing {len(prompts)} prompts with concurrent batching...")
-        print(f"  RL scheduler will dynamically optimize batch sizes...")
+        # Use generate_batch
+        _ = model.generate_batch(
+            chunk,
+            max_tokens=max_tokens,
+            do_sample=False
+        )
 
-        # Process in chunks to avoid KV cache exhaustion
-        chunk_size = 10  # Conservative chunk size
-        for i in range(0, len(prompts), chunk_size):
-            chunk = prompts[i:i+chunk_size]
-            chunk_num = i//chunk_size + 1
-            total_chunks = (len(prompts)-1)//chunk_size + 1
-            print(f"    Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} prompts)...")
-
-            # Use generate_batch for true concurrent processing
-            _ = model.generate_batch(
-                chunk,
-                max_tokens=max_tokens,
-                do_sample=False
-            )
-
-            # Reset KV cache between chunks to free memory
-            if hasattr(model, 'reset_kv_cache'):
-                model.reset_kv_cache()
-    else:
-        # Sequential mode (original behavior)
-        if use_concurrent:
-            print(f"  ⚠️  Note: Concurrent mode disabled (need 10+ prompts)")
-
-        # Run inference - Stage 4 auto-tuning will adapt to varying lengths
-        for i, prompt in enumerate(prompts):
-            print(f"  Processing prompt {i+1}/{len(prompts)}...")
-
-            _ = model.generate(
-                prompt,
-                max_tokens=max_tokens,
-                do_sample=False
-            )
-
-            # Free this sequence from KV cache to prevent exhaustion
-            # This allows prefix sharing while avoiding OOM
-            if hasattr(model, 'kv_cache') and model.kv_cache:
-                # Find the most recent sequence ID and free it
-                if hasattr(model, '_last_seq_id'):
-                    try:
-                        model.kv_cache.free_sequence(model._last_seq_id)
-                    except:
-                        pass  # Ignore if already freed
+        # Reset KV cache between chunks to free memory
+        if hasattr(model, 'kv_cache') and model.kv_cache:
+            model.kv_cache.reset()
     
     # Get stats
     stats = model.get_profiling_stats()
@@ -986,7 +950,12 @@ def main():
 
     # === POINT 3: COMPETITIVE COMPARISON - vLLM ===
     if args.compare_vllm:
-        vllm_stats = run_vllm(args.model, prompts, args.max_tokens, args.vllm_tensor_parallel_size)
+        try:
+            vllm_stats = run_vllm(args.model, prompts, args.max_tokens, args.vllm_tensor_parallel_size)
+        except Exception as e:
+            print(f"\n⚠️  vLLM benchmark failed: {e}")
+            print("   Continuing with other tests...")
+            vllm_stats = None
 
     # === POINT 4: AI COMPONENT VALIDATION ===
     if args.validate_ai_components and (args.rl_scheduler_path or args.memory_predictor_path):
