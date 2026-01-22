@@ -48,7 +48,9 @@ if [ "$RUN_BASELINE" = "true" ]; then
     echo ""
 
     # Run baseline with benchmark.py (single GPU, no optimizations)
-    BASELINE_OUTPUT=$(python3 benchmarks/benchmark.py \
+    # Temporarily unset AI model paths for baseline
+    BASELINE_OUTPUT=$(env -u RL_SCHEDULER_PATH -u MEMORY_PREDICTOR_PATH \
+        python3 benchmarks/benchmark.py \
         --model $MODEL_NAME \
         --num-prompts 10 \
         --max-tokens 256 \
@@ -155,6 +157,24 @@ echo ""
 
 START_TIME=$(date +%s.%N)
 
+# Start progress monitor in background
+(
+    while true; do
+        sleep 2
+        COMPLETED=0
+        for ((gpu=0; gpu<NUM_GPUS; gpu++)); do
+            PORT=$((9000 + gpu))
+            METRICS=$(curl -s http://localhost:$PORT/metrics 2>/dev/null || echo '{"total_requests":0}')
+            GPU_COMPLETED=$(echo $METRICS | jq -r '.total_requests // 0' 2>/dev/null || echo 0)
+            COMPLETED=$((COMPLETED + GPU_COMPLETED))
+        done
+        TOTAL_EXPECTED=$((NUM_GPUS * NUM_REQUESTS))
+        PERCENT=$((COMPLETED * 100 / TOTAL_EXPECTED))
+        printf "\r  Progress: %d/%d requests (%d%%)..." $COMPLETED $TOTAL_EXPECTED $PERCENT
+    done
+) &
+PROGRESS_PID=$!
+
 # Send concurrent requests to all workers
 for ((gpu=0; gpu<NUM_GPUS; gpu++)); do
     PORT=$((9000 + gpu))
@@ -177,6 +197,10 @@ done
 
 # Wait for all requests to complete
 wait
+
+# Stop progress monitor
+kill $PROGRESS_PID 2>/dev/null || true
+printf "\r  Progress: %d/%d requests (100%%) \n" $((NUM_GPUS * NUM_REQUESTS)) $((NUM_GPUS * NUM_REQUESTS))
 
 END_TIME=$(date +%s.%N)
 ELAPSED=$(echo "$END_TIME - $START_TIME" | bc)
