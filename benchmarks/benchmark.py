@@ -243,11 +243,6 @@ def run_baseline(model_name: str, prompts: list, max_tokens: int = 256, enable_b
     
     print(f"\n✓ Baseline complete: {stats.tokens_per_second:.1f} tok/s")
     
-    # Cleanup
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
     return stats
 
 
