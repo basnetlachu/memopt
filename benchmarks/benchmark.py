@@ -38,25 +38,110 @@ from memopt import OptimizedLLM, ProfileStats
 from memopt.profiler import compare_profiles
 
 
-def run_baseline(model_name: str, prompts: list, max_tokens: int = 256):
+def run_vllm(model_name: str, prompts: list, max_tokens: int = 256, tensor_parallel_size: int = 1):
     """
-    Run baseline inference without optimizations.
-    
+    Run vLLM benchmark for competitive comparison.
+
+    Returns:
+        ProfileStats
+    """
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError:
+        print("\n❌ vLLM not installed. Install with: pip install vllm")
+        print("   Skipping vLLM comparison.")
+        return None
+
+    print("\n" + "="*70)
+    print("RUNNING vLLM (Industry Standard Baseline)")
+    print("="*70)
+    print(f"  Tensor Parallel Size: {tensor_parallel_size}")
+
+    # Load model with vLLM
+    print(f"Loading {model_name} with vLLM...")
+    llm = LLM(
+        model=model_name,
+        tensor_parallel_size=tensor_parallel_size,
+        dtype="float16",
+        trust_remote_code=True
+    )
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=max_tokens,
+        use_beam_search=False
+    )
+
+    # Reset memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    start_time = time.time()
+
+    # Run inference (vLLM automatically batches)
+    print(f"  Processing {len(prompts)} prompts with vLLM batching...")
+    outputs = llm.generate(prompts, sampling_params)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    end_time = time.time()
+    total_time = end_time - start_time
+
+    # Count tokens
+    total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
+
+    # Collect stats
+    stats = ProfileStats()
+    stats.total_tokens_generated = total_tokens
+    stats.total_time_seconds = total_time
+    stats.tokens_per_second = total_tokens / total_time
+    stats.latency_per_token_ms = (total_time / total_tokens) * 1000
+
+    if torch.cuda.is_available():
+        stats.peak_memory_allocated_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        stats.peak_memory_reserved_gb = torch.cuda.max_memory_reserved() / (1024**3)
+
+    # Cost estimate
+    gpu_hourly_cost = 5.0  # A100 80GB
+    stats.estimated_gpu_hours = total_time / 3600.0
+    cost_for_run = stats.estimated_gpu_hours * gpu_hourly_cost
+    stats.cost_per_1m_tokens_usd = (cost_for_run / total_tokens) * 1e6
+
+    print(f"\n✓ vLLM complete: {stats.tokens_per_second:.1f} tok/s")
+
+    return stats
+
+
+def run_baseline(model_name: str, prompts: list, max_tokens: int = 256, enable_batching: bool = False):
+    """
+    Run baseline inference without Memopt optimizations.
+
+    Args:
+        enable_batching: If True, processes prompts in batches (FAIR comparison to batched optimized)
+                        If False, processes sequentially (unfair but shows single-sequence performance)
+
     Returns:
         ProfileStats
     """
     print("\n" + "="*70)
-    print("RUNNING BASELINE (No Optimizations)")
+    if enable_batching:
+        print("RUNNING BASELINE WITH BATCHING (Fair Comparison Mode)")
+        print("  Using native HuggingFace batching WITHOUT Memopt optimizations")
+    else:
+        print("RUNNING BASELINE SEQUENTIAL (Single-Sequence Mode)")
+        print("  ⚠️  WARNING: This is UNFAIR vs batched optimized mode")
     print("="*70)
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Load model normally
     print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
@@ -64,35 +149,57 @@ def run_baseline(model_name: str, prompts: list, max_tokens: int = 256):
         low_cpu_mem_usage=True
     )
     model.eval()
-    
+
     # Reset memory stats
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
-    
+
     start_time = time.time()
     total_tokens = 0
-    
+
     # Run inference
     with torch.no_grad():
-        for i, prompt in enumerate(prompts):
-            print(f"  Processing prompt {i+1}/{len(prompts)}...")
-            
-            inputs = tokenizer(prompt, return_tensors="pt").to(device)
-            
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=tokenizer.eos_token_id
-            )
-            
-            total_tokens += len(outputs[0]) - len(inputs['input_ids'][0])
-    
+        if enable_batching:
+            # Process in batches (FAIR comparison)
+            batch_size = 8
+            for i in range(0, len(prompts), batch_size):
+                batch = prompts[i:i+batch_size]
+                print(f"  Processing batch {i//batch_size + 1}/{(len(prompts)-1)//batch_size + 1} ({len(batch)} prompts)...")
+
+                inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True).to(device)
+
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+                # Count tokens (excluding padding)
+                for output, input_ids in zip(outputs, inputs['input_ids']):
+                    total_tokens += len(output) - len(input_ids)
+        else:
+            # Sequential processing (UNFAIR but shows single-sequence perf)
+            for i, prompt in enumerate(prompts):
+                print(f"  Processing prompt {i+1}/{len(prompts)}...")
+
+                inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+                total_tokens += len(outputs[0]) - len(inputs['input_ids'][0])
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    
+
     end_time = time.time()
     total_time = end_time - start_time
     
@@ -756,6 +863,29 @@ def main():
         help="Use worker-per-GPU architecture for multi-GPU (recommended for 2+ GPUs)"
     )
 
+    # HONEST BENCHMARK FLAGS
+    parser.add_argument(
+        "--fair-comparison",
+        action="store_true",
+        help="Enable FAIR comparison: baseline also uses batching (apples-to-apples)"
+    )
+    parser.add_argument(
+        "--validate-ai-components",
+        action="store_true",
+        help="Run with/without RL scheduler and memory predictor to measure their impact"
+    )
+    parser.add_argument(
+        "--compare-vllm",
+        action="store_true",
+        help="Compare against vLLM (requires: pip install vllm)"
+    )
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="vLLM tensor parallel size (number of GPUs)"
+    )
+
     args = parser.parse_args()
 
     # Validate GPU count for worker mode
@@ -830,11 +960,49 @@ def main():
 
     # Run benchmarks
     baseline_stats = None
+    baseline_batched_stats = None
     optimized_stats = None
+    optimized_no_ai_stats = None
+    vllm_stats = None
     optimized_model = None
 
+    # === POINT 1: FAIR COMPARISON - Baseline with batching ===
     if args.mode in ["baseline", "both"]:
-        baseline_stats = run_baseline(args.model, prompts, args.max_tokens)
+        # Always run sequential baseline (for single-sequence comparison)
+        baseline_stats = run_baseline(args.model, prompts, args.max_tokens, enable_batching=False)
+
+        # If fair comparison requested, also run batched baseline
+        if args.fair_comparison:
+            print("\n" + "="*70)
+            print("FAIR COMPARISON MODE: Running baseline WITH batching")
+            print("="*70)
+            baseline_batched_stats = run_baseline(args.model, prompts, args.max_tokens, enable_batching=True)
+
+    # === POINT 3: COMPETITIVE COMPARISON - vLLM ===
+    if args.compare_vllm:
+        vllm_stats = run_vllm(args.model, prompts, args.max_tokens, args.vllm_tensor_parallel_size)
+
+    # === POINT 4: AI COMPONENT VALIDATION ===
+    if args.validate_ai_components and (args.rl_scheduler_path or args.memory_predictor_path):
+        print("\n" + "="*70)
+        print("AI COMPONENT VALIDATION MODE")
+        print("="*70)
+        print("Running benchmark WITHOUT AI components first...")
+
+        # Run without AI components
+        optimized_no_ai_stats, _ = run_optimized(
+            args.model, prompts, args.max_tokens, args.optimization_level, args.max_kv_blocks,
+            quantize_kv=args.quantize_kv,
+            enable_speculative=args.enable_speculative,
+            rl_scheduler_path=None,  # DISABLED
+            memory_predictor_path=None,  # DISABLED
+            enable_memory_tracing=args.enable_memory_tracing,
+            memory_trace_output=args.memory_trace_output
+        )
+
+        print("\n" + "="*70)
+        print("Now running WITH AI components...")
+        print("="*70)
 
     if args.mode in ["optimized", "both"]:
         # Check if we should use worker-per-GPU architecture
@@ -905,8 +1073,58 @@ def main():
         }
         print(f"  Enabled stages:     {stage_map.get(args.optimization_level, args.optimization_level)}")
     
+    # === HONEST COMPARISON RESULTS ===
+
+    # POINT 1: Fair comparison (batching vs batching)
+    if baseline_batched_stats and optimized_stats:
+        print("\n" + "="*70)
+        print("🔬 FAIR COMPARISON (Both using batching)")
+        print("="*70)
+        print(f"Baseline (HuggingFace + batching):  {baseline_batched_stats.tokens_per_second:.1f} tok/s")
+        print(f"Memopt (optimizations + batching):  {optimized_stats.tokens_per_second:.1f} tok/s")
+        fair_speedup = optimized_stats.tokens_per_second / baseline_batched_stats.tokens_per_second
+        print(f"Fair speedup:                       {fair_speedup:.2f}x ← HONEST COMPARISON")
+        print(f"\n⚠️  This is the REAL speedup from Memopt's optimizations alone")
+        print(f"    (not from batching, which baseline also has)")
+
+    # POINT 3: vLLM comparison
+    if vllm_stats and optimized_stats:
+        print("\n" + "="*70)
+        print("🏆 COMPETITIVE COMPARISON (vs vLLM)")
+        print("="*70)
+        print(f"vLLM (industry standard):     {vllm_stats.tokens_per_second:.1f} tok/s")
+        print(f"Memopt:                       {optimized_stats.tokens_per_second:.1f} tok/s")
+        vs_vllm = optimized_stats.tokens_per_second / vllm_stats.tokens_per_second
+        if vs_vllm > 1.0:
+            print(f"Memopt is {vs_vllm:.2f}x FASTER than vLLM ✅")
+        elif vs_vllm > 0.9:
+            print(f"Memopt is {vs_vllm:.2f}x (competitive with vLLM) ✅")
+        else:
+            print(f"Memopt is {vs_vllm:.2f}x (SLOWER than vLLM) ⚠️")
+            print(f"  ⚠️  vLLM is {1/vs_vllm:.2f}x faster - consider what Memopt provides beyond vLLM")
+
+    # POINT 4: AI component validation
+    if optimized_no_ai_stats and optimized_stats:
+        print("\n" + "="*70)
+        print("🤖 AI COMPONENT IMPACT ANALYSIS")
+        print("="*70)
+        print(f"Without RL/Neural predictor:  {optimized_no_ai_stats.tokens_per_second:.1f} tok/s")
+        print(f"With RL/Neural predictor:     {optimized_stats.tokens_per_second:.1f} tok/s")
+        ai_improvement = optimized_stats.tokens_per_second / optimized_no_ai_stats.tokens_per_second
+        ai_gain_pct = (ai_improvement - 1.0) * 100
+        print(f"AI component benefit:         {ai_improvement:.3f}x ({ai_gain_pct:+.1f}%)")
+
+        if ai_gain_pct > 5:
+            print(f"✅ AI components provide meaningful benefit ({ai_gain_pct:.1f}% improvement)")
+        elif ai_gain_pct > 0:
+            print(f"⚠️  AI components provide minor benefit ({ai_gain_pct:.1f}% improvement)")
+            print(f"    Consider if complexity is worth the gain")
+        else:
+            print(f"❌ AI components HURT performance ({ai_gain_pct:.1f}% degradation)")
+            print(f"    Simple heuristics would be better")
+
     if baseline_stats and optimized_stats:
-        print("\n💰 IMPROVEMENT:")
+        print("\n💰 IMPROVEMENT (vs Sequential Baseline):")
         speedup = optimized_stats.tokens_per_second / baseline_stats.tokens_per_second
         memory_reduction = (
             (baseline_stats.peak_memory_allocated_gb - optimized_stats.peak_memory_allocated_gb) /
@@ -917,15 +1135,17 @@ def main():
             baseline_stats.cost_per_1m_tokens_usd * 100
         )
         stall_reduction = baseline_stats.gpu_stall_pct - optimized_stats.gpu_stall_pct
-        
+
         print(f"  Speedup:            {speedup:.2f}x (measured)")
+        if baseline_batched_stats:
+            print(f"  ⚠️  WARNING: This includes batching benefit. See FAIR COMPARISON above.")
         if memory_reduction < 0:
             print(f"  Memory (peak):      {memory_reduction:.1f}% (optimized uses MORE memory due to caching)")
         else:
             print(f"  Memory (peak):      {memory_reduction:.1f}% reduction (measured)")
         print(f"  Cost reduction:     {cost_reduction:.1f}% (estimated)")
         print(f"  Stall reduction:    {stall_reduction:.1f}% (estimated)")
-        
+
         # Show detailed memory analysis
         if optimized_model:
             print_memory_analysis(
@@ -957,16 +1177,24 @@ def main():
     # Save results
     results = {}
     if baseline_stats:
-        results["baseline"] = baseline_stats.to_dict()
+        results["baseline_sequential"] = baseline_stats.to_dict()
+    if baseline_batched_stats:
+        results["baseline_batched"] = baseline_batched_stats.to_dict()
+    if vllm_stats:
+        results["vllm"] = vllm_stats.to_dict()
+    if optimized_no_ai_stats:
+        results["optimized_no_ai"] = optimized_no_ai_stats.to_dict()
     if optimized_stats:
         results["optimized"] = optimized_stats.to_dict()
-    
+
+    # Honest comparisons
     if baseline_stats and optimized_stats:
-        results["comparison"] = {
+        results["comparison_vs_sequential"] = {
             "speedup": speedup,
             "memory_reduction_pct": memory_reduction,
             "cost_reduction_pct": cost_reduction,
             "stall_reduction_pct": stall_reduction,
+            "warning": "This comparison includes batching benefit - see fair_comparison for honest metrics"
         }
         results["roi_analysis"] = {
             "tokens_per_day": 10e9,
@@ -976,10 +1204,39 @@ def main():
             "payback_days": 50000 / daily_savings,
             "first_year_roi": annual_savings / 50000
         }
-    
+
+    if baseline_batched_stats and optimized_stats:
+        fair_speedup = optimized_stats.tokens_per_second / baseline_batched_stats.tokens_per_second
+        results["fair_comparison"] = {
+            "baseline_batched_throughput": baseline_batched_stats.tokens_per_second,
+            "memopt_throughput": optimized_stats.tokens_per_second,
+            "honest_speedup": fair_speedup,
+            "note": "This is the REAL speedup from Memopt optimizations (both use batching)"
+        }
+
+    if vllm_stats and optimized_stats:
+        vs_vllm = optimized_stats.tokens_per_second / vllm_stats.tokens_per_second
+        results["vs_vllm"] = {
+            "vllm_throughput": vllm_stats.tokens_per_second,
+            "memopt_throughput": optimized_stats.tokens_per_second,
+            "memopt_vs_vllm": vs_vllm,
+            "verdict": "faster" if vs_vllm > 1.0 else ("competitive" if vs_vllm > 0.9 else "slower")
+        }
+
+    if optimized_no_ai_stats and optimized_stats:
+        ai_improvement = optimized_stats.tokens_per_second / optimized_no_ai_stats.tokens_per_second
+        ai_gain_pct = (ai_improvement - 1.0) * 100
+        results["ai_component_impact"] = {
+            "without_ai_throughput": optimized_no_ai_stats.tokens_per_second,
+            "with_ai_throughput": optimized_stats.tokens_per_second,
+            "ai_multiplier": ai_improvement,
+            "ai_gain_percent": ai_gain_pct,
+            "verdict": "meaningful" if ai_gain_pct > 5 else ("minor" if ai_gain_pct > 0 else "negative")
+        }
+
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
-    
+
     print(f"\n✓ Results saved to {args.output}")
     print("\n" + "="*70 + "\n")
 
