@@ -162,15 +162,26 @@ START_TIME=$(date +%s.%N)
     while true; do
         sleep 2
         COMPLETED=0
+        TOTAL_THROUGHPUT_NOW=0
+        GPU_UTIL=""
+
         for ((gpu=0; gpu<NUM_GPUS; gpu++)); do
             PORT=$((9000 + gpu))
-            METRICS=$(curl -s http://localhost:$PORT/metrics 2>/dev/null || echo '{"total_requests":0}')
+            METRICS=$(curl -s http://localhost:$PORT/metrics 2>/dev/null || echo '{"total_requests":0,"tokens_per_second":0}')
             GPU_COMPLETED=$(echo $METRICS | jq -r '.total_requests // 0' 2>/dev/null || echo 0)
+            GPU_THROUGHPUT=$(echo $METRICS | jq -r '.tokens_per_second // 0' 2>/dev/null || echo 0)
+
             COMPLETED=$((COMPLETED + GPU_COMPLETED))
+            TOTAL_THROUGHPUT_NOW=$(echo "$TOTAL_THROUGHPUT_NOW + $GPU_THROUGHPUT" | bc)
+            GPU_UTIL="${GPU_UTIL}GPU$gpu:${GPU_THROUGHPUT} "
         done
+
         TOTAL_EXPECTED=$((NUM_GPUS * NUM_REQUESTS))
         PERCENT=$((COMPLETED * 100 / TOTAL_EXPECTED))
-        printf "\r  Progress: %d/%d requests (%d%%)..." $COMPLETED $TOTAL_EXPECTED $PERCENT
+        THROUGHPUT_INT=$(printf "%.0f" $TOTAL_THROUGHPUT_NOW)
+
+        printf "\r  Progress: %d/%d (%d%%) | Throughput: %s tok/s | %s" \
+            $COMPLETED $TOTAL_EXPECTED $PERCENT "$THROUGHPUT_INT" "$GPU_UTIL"
     done
 ) &
 PROGRESS_PID=$!
@@ -184,6 +195,7 @@ for ((gpu=0; gpu<NUM_GPUS; gpu++)); do
             curl -X POST http://localhost:$PORT/generate \
               -H "Content-Type: application/json" \
               -d "{\"prompt\": \"Explain topic $req in detail\", \"max_tokens\": 256}" \
+              --max-time 300 \
               -s -o /dev/null &
 
             # Control concurrency per GPU
