@@ -369,9 +369,11 @@ def run_optimized(
             do_sample=False
         )
 
-        # Reset KV cache between chunks to free memory
+        # Free sequences between chunks to release KV cache memory
         if hasattr(model, 'kv_cache') and model.kv_cache:
-            model.kv_cache.reset()
+            # Free all sequences in the batch
+            for seq_id in list(model.kv_cache.block_tables.keys()):
+                model.kv_cache.free_sequence(seq_id)
     
     # Get stats
     stats = model.get_profiling_stats()
