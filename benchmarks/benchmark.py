@@ -225,8 +225,11 @@ def run_baseline(model_name: str, prompts: list, max_tokens: int = 256, enable_b
         stats.gpu_stall_pct = 100.0 - stats.memory_bandwidth_utilization_pct
 
     # Clean up model to free GPU memory
-    del model
-    del tokenizer
+    try:
+        del model
+        del tokenizer
+    except:
+        pass
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
