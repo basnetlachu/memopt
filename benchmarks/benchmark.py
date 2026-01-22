@@ -141,10 +141,7 @@ def run_optimized(
     max_kv_blocks: int = None,
     quantize_kv: bool = False,
     enable_speculative: bool = False,
-    num_gpus: int = 1,
-    multi_gpu_mode: str = "data_parallel",
-    enable_rl_routing: bool = False,
-    rl_router_path: str = None,
+    # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path (use production/ for multi-GPU)
     rl_scheduler_path: str = None,
     memory_predictor_path: str = None,
     enable_memory_tracing: bool = False,
@@ -172,21 +169,8 @@ def run_optimized(
         print(f"\n  📊 Memory tracing enabled")
         print(f"     • Auto-saving every 10 traces to {memory_trace_output}")
 
-    # Print multi-GPU info if enabled
-    if num_gpus > 1:
-        print(f"\n  🚀 Multi-GPU Mode: {multi_gpu_mode}")
-        print(f"     • Number of GPUs: {num_gpus}")
-        print(f"     • RL routing: {'Enabled' if enable_rl_routing else 'Disabled (load-aware fallback)'}")
-
-        from memopt.multi_gpu_router import calculate_scaling_efficiency, calculate_total_speedup
-        efficiency = calculate_scaling_efficiency(num_gpus)
-        print(f"     • Expected scaling efficiency: {efficiency*100:.1f}%")
-
-        # Show expected total speedup (assumes baseline single-GPU speedup will be measured)
-        # For display purposes, use typical 15.66× single-GPU speedup
-        typical_speedup = 15.66
-        total_speedup = calculate_total_speedup(typical_speedup, num_gpus, enable_rl_routing)
-        print(f"     • Expected total speedup: {total_speedup:.1f}× (vs baseline)")
+    # REMOVED: Multi-GPU display code (use production/ for multi-GPU)
+    # For multi-GPU inference, use: scripts/benchmark_production.sh
 
     # Determine if we'll use concurrent batching
     # This affects memory allocation
@@ -208,10 +192,7 @@ def run_optimized(
         expected_batch_size=expected_batch_size,  # Dynamic based on mode
         expected_seq_len=max_tokens * 2,  # Conservative estimate
         max_kv_blocks=max_kv_blocks,  # Apply user override if specified
-        num_gpus=num_gpus,  # Multi-GPU support
-        multi_gpu_mode=multi_gpu_mode,  # Data parallel or tensor parallel
-        enable_rl_routing=enable_rl_routing,  # RL-powered routing
-        rl_router_path=rl_router_path,  # Trained RL router agent
+        # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path (use production/ for multi-GPU)
         rl_scheduler_path=rl_scheduler_path,  # Trained RL batch scheduler agent
         memory_predictor_path=memory_predictor_path  # Trained neural memory predictor
     )
@@ -875,10 +856,7 @@ def main():
                 args.model, prompts, args.max_tokens, args.optimization_level, args.max_kv_blocks,
                 quantize_kv=args.quantize_kv,
                 enable_speculative=args.enable_speculative,
-                num_gpus=args.num_gpus,
-                multi_gpu_mode=args.multi_gpu_mode,
-                enable_rl_routing=args.enable_rl_routing,
-                rl_router_path=args.rl_router_path,
+                # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path
                 rl_scheduler_path=args.rl_scheduler_path,
                 memory_predictor_path=args.memory_predictor_path,
                 enable_memory_tracing=args.enable_memory_tracing,
