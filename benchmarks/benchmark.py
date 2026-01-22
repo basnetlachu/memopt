@@ -63,7 +63,8 @@ def run_vllm(model_name: str, prompts: list, max_tokens: int = 256, tensor_paral
         model=model_name,
         tensor_parallel_size=tensor_parallel_size,
         dtype="float16",
-        trust_remote_code=True
+        trust_remote_code=True,
+        gpu_memory_utilization=0.8  # Use 80% instead of 90% to leave room for baseline models
     )
 
     sampling_params = SamplingParams(
@@ -202,18 +203,18 @@ def run_baseline(model_name: str, prompts: list, max_tokens: int = 256, enable_b
 
     end_time = time.time()
     total_time = end_time - start_time
-    
+
     # Collect stats
     stats = ProfileStats()
     stats.total_tokens_generated = total_tokens
     stats.total_time_seconds = total_time
     stats.tokens_per_second = total_tokens / total_time
     stats.latency_per_token_ms = (total_time / total_tokens) * 1000
-    
+
     if torch.cuda.is_available():
         stats.peak_memory_allocated_gb = torch.cuda.max_memory_allocated() / (1024**3)
         stats.peak_memory_reserved_gb = torch.cuda.max_memory_reserved() / (1024**3)
-        
+
         # Estimate bandwidth usage (baseline is inefficient)
         bytes_per_token = 26e9  # 26GB for FP16 13B model
         achieved_bandwidth = stats.tokens_per_second * bytes_per_token
@@ -222,6 +223,13 @@ def run_baseline(model_name: str, prompts: list, max_tokens: int = 256, enable_b
             (achieved_bandwidth / theoretical_bandwidth) * 100, 100.0
         )
         stats.gpu_stall_pct = 100.0 - stats.memory_bandwidth_utilization_pct
+
+    # Clean up model to free GPU memory
+    del model
+    del tokenizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         stats.gpu_utilization_pct = 100.0 - stats.gpu_stall_pct
     
     # Cost estimate
