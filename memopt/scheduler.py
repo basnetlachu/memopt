@@ -103,8 +103,12 @@ class ContinuousBatchScheduler:
         enable_dynamic_batching: bool = False,  # Stage 4: Dynamic batching
         device: str = "cuda",
         max_queue_depth: int = 1000,  # Phase 1: Bounded queue for crash prevention
-        enable_rl_scheduling: bool = False,  # Stage 5: RL-powered scheduling
-        rl_agent_path: Optional[str] = None,  # Path to trained RL agent
+        enable_continuous_batching: bool = False,  # NEW: True continuous batching
+        batch_window_ms: float = 3.0,  # NEW: Batch formation window in milliseconds
+        max_tokens_per_step: Optional[int] = None,  # NEW (Step 3): Token-based batching
+        max_sequences_per_step: Optional[int] = None,  # NEW (Step 3): Sequence limit
+        enable_prefill_decode_split: bool = False,  # NEW (Step 4): Separate prefill/decode batching
+        max_prefill_batch_size: Optional[int] = None,  # NEW (Step 4): Prefill batch size (usually smaller)
     ):
         """
         Args:
@@ -115,8 +119,6 @@ class ContinuousBatchScheduler:
             enable_dynamic_batching: Enable Stage 4 optimizations
             device: torch device
             max_queue_depth: Maximum pending requests (Phase 1: prevents OOM)
-            enable_rl_scheduling: Enable Stage 5 RL-powered batch size optimization
-            rl_agent_path: Path to trained RL agent (e.g., 'scheduler_rl_agent.zip')
         """
         self.max_batch_size = max_batch_size
         self.max_total_tokens = max_total_tokens
@@ -126,30 +128,29 @@ class ContinuousBatchScheduler:
         self.device = device
         self.max_queue_depth = max_queue_depth  # Phase 1
 
-        # Stage 5: RL scheduling (optional, backward compatible)
-        self.enable_rl_scheduling = enable_rl_scheduling
-        self.rl_agent = None
-        self.batch_size_map = [1, 2, 4, 8, 16, 32, 64]
+        # NEW: Continuous batching parameters
+        self.enable_continuous_batching = enable_continuous_batching
+        self.batch_window_ms = batch_window_ms
+        self._last_batch_time = 0.0  # Track last batch formation time
 
-        if enable_rl_scheduling:
-            # Try to load RL agent
-            if rl_agent_path is None:
-                rl_agent_path = "scheduler_rl_agent.zip"
+        # NEW: Length bucketing (Step 2) - reduces padding waste
+        # Define length buckets: [0-64, 64-128, 128-256, 256-512, 512-1024, 1024+]
+        self.length_buckets = [64, 128, 256, 512, 1024, float('inf')]
+        self.enable_length_bucketing = enable_continuous_batching  # Auto-enable with continuous batching
+        self._bucket_stats = defaultdict(int)  # Track requests per bucket
 
-            try:
-                from .rl_scheduler import RLSchedulerAgent
-                self.rl_agent = RLSchedulerAgent.load(rl_agent_path, self.batch_size_map)
-                print(f"✓ RL scheduler agent loaded from {rl_agent_path}")
-            except FileNotFoundError:
-                print(f"⚠ RL agent not found at {rl_agent_path}, falling back to rule-based scheduling")
-                self.enable_rl_scheduling = False
-            except ImportError as e:
-                print(f"⚠ RL dependencies not installed ({e}), falling back to rule-based scheduling")
-                self.enable_rl_scheduling = False
+        # NEW (Step 3): Token-based batching limits
+        # Defaults: max_tokens_per_step = half of max_total_tokens, max_sequences_per_step = max_batch_size
+        self.max_tokens_per_step = max_tokens_per_step or (max_total_tokens // 2)
+        self.max_sequences_per_step = max_sequences_per_step or max_batch_size
 
-        # Stage 5: Neural memory predictor (optional)
-        self.neural_memory_predictor = None
-        self.use_neural_memory_predictor = False
+        # NEW (Step 4): Prefill vs Decode scheduling
+        # Prefill (first token) is compute-bound, decode is memory-bound
+        # Use smaller batches for prefill to avoid blocking decode
+        self.enable_prefill_decode_split = enable_prefill_decode_split
+        self.max_prefill_batch_size = max_prefill_batch_size or (max_batch_size // 4)  # Default: 1/4 of decode batch
+        self._prefill_queue = []  # Separate queue for prefill requests
+        self._decode_batch = []  # Current decode batch
 
         # Request queues
         # Phase 1: Keep as list for heapq (heapq requires list, not deque)
@@ -171,32 +172,12 @@ class ContinuousBatchScheduler:
         self._avg_seq_len_history: List[float] = []
         self._grouping_savings: int = 0  # Tokens saved by smart grouping
 
-    def enable_neural_memory_predictor(self, model_path: str = "memory_predictor.pth", model_config: Dict = None):
-        """
-        Enable neural memory predictor for more accurate memory estimation.
-
-        Args:
-            model_path: Path to trained neural memory predictor
-            model_config: Model configuration (hidden_size, num_layers, etc.)
-        """
-        try:
-            from .neural_memory_predictor import NeuralMemoryPredictor
-            self.neural_memory_predictor = NeuralMemoryPredictor.load(model_path)
-            self.use_neural_memory_predictor = True
-            self.model_config = model_config or {}
-            print(f"✓ Neural memory predictor loaded from {model_path}")
-        except FileNotFoundError:
-            print(f"⚠ Neural memory predictor not found at {model_path}")
-            self.use_neural_memory_predictor = False
-        except ImportError as e:
-            print(f"⚠ Could not load neural memory predictor ({e})")
-            self.use_neural_memory_predictor = False
-
     def add_request(self, request: InferenceRequest):
         """
         Add a new inference request to the queue.
 
         Phase 1: Now enforces queue depth limit to prevent unbounded growth.
+        NEW (Step 4): Routes to prefill or decode queue based on request state.
 
         Args:
             request: Inference request to add
@@ -214,7 +195,17 @@ class ContinuousBatchScheduler:
                 f"System overloaded - reject with HTTP 429."
             )
 
-        # UNCHANGED: Same priority queue logic
+        # NEW (Step 4): Route to prefill queue if this is a new request (no tokens generated yet)
+        if self.enable_prefill_decode_split and len(request.generated_ids) == 0:
+            # This is a prefill request (first token generation)
+            heapq.heappush(
+                self._prefill_queue,
+                (-request.priority, request.created_at, self._request_counter, request)
+            )
+            self._request_counter += 1
+            return
+
+        # UNCHANGED: Same priority queue logic for decode requests
         # Priority queue: (negative priority, timestamp, counter, request)
         # Negative priority so higher priority comes first
         # Counter acts as tie-breaker to avoid comparing InferenceRequest objects
@@ -240,18 +231,7 @@ class ContinuousBatchScheduler:
         Returns:
             Optimal batch size for current conditions
         """
-        # Stage 5: Use RL agent if enabled and available
-        if self.enable_rl_scheduling and self.rl_agent is not None:
-            try:
-                # RL agent predicts batch size based on current state
-                batch_size = self.rl_agent.predict(self, deterministic=True)
-                return batch_size
-            except Exception as e:
-                # Fallback to rule-based on error
-                print(f"⚠ RL prediction failed ({e}), using rule-based scheduling")
-                # Continue to rule-based fallback below
-
-        # Stage 4: Rule-based fallback (original logic)
+        # Stage 4: Rule-based dynamic batch sizing
         if not self.enable_dynamic_batching or not self._avg_seq_len_history:
             return self.max_batch_size
 
@@ -273,6 +253,31 @@ class ContinuousBatchScheduler:
 
         return optimal_size
 
+    def _get_length_bucket(self, request: InferenceRequest) -> int:
+        """
+        NEW (Step 2): Determine which length bucket a request belongs to.
+
+        Buckets prevent mixing short and long requests, reducing padding waste.
+
+        Args:
+            request: The inference request
+
+        Returns:
+            Bucket index (0-5)
+        """
+        if not self.enable_length_bucketing:
+            return 0  # Single bucket if disabled
+
+        # Total length = prompt + max_new_tokens
+        total_length = request.current_length + request.tokens_remaining
+
+        # Find appropriate bucket
+        for bucket_idx, bucket_limit in enumerate(self.length_buckets):
+            if total_length <= bucket_limit:
+                return bucket_idx
+
+        return len(self.length_buckets) - 1  # Last bucket for overflow
+
     def _estimate_memory_with_reuse(self, request: InferenceRequest, current_batch: List[InferenceRequest]) -> float:
         """
         Stage 5 Optimization: Neural memory prediction OR rule-based estimation.
@@ -286,35 +291,7 @@ class ContinuousBatchScheduler:
         Returns:
             Estimated memory in MB
         """
-        # Stage 5: Use neural predictor if enabled and available
-        if self.use_neural_memory_predictor and self.neural_memory_predictor is not None:
-            try:
-                # Calculate batch characteristics
-                batch_size = len(current_batch) + 1  # Current batch + new request
-                all_requests = current_batch + [request]
-                seq_lengths = [req.current_length + req.tokens_remaining for req in all_requests]
-                avg_seq_len = sum(seq_lengths) / len(seq_lengths)
-
-                # Get model config
-                model_config = getattr(self, 'model_config', {})
-
-                # Predict memory using neural network
-                memory_mb = self.neural_memory_predictor.predict(
-                    batch_size=batch_size,
-                    avg_seq_len=avg_seq_len,
-                    model_config=model_config,
-                    quantize_kv=model_config.get('quantize_kv', False),
-                    use_flash_attention=model_config.get('use_flash_attention', True)
-                )
-
-                return memory_mb
-
-            except Exception as e:
-                # Fallback to rule-based on error
-                print(f"⚠ Neural memory prediction failed ({e}), using rule-based estimation")
-                # Continue to rule-based fallback below
-
-        # Stage 4: Rule-based fallback (original logic)
+        # Stage 4: Rule-based memory estimation
         if not self.enable_dynamic_batching:
             # Naive estimation
             bytes_per_token = 200 * 1024
@@ -352,8 +329,11 @@ class ContinuousBatchScheduler:
         Check if request can be added to current running batch.
 
         Considers:
-        - Dynamic batch size limit (Stage 4: auto-tuned)
-        - Total tokens limit
+        - NEW (Step 2): Length bucket compatibility (reduce padding waste)
+        - NEW (Step 3): Token-based batching (max_tokens_per_step limit)
+        - NEW (Step 3): Sequence count limit (max_sequences_per_step)
+        - Dynamic batch size limit (Stage 4: auto-tuned, legacy)
+        - Total tokens limit (legacy)
         - Memory limit (Stage 4: improved estimation)
 
         Args:
@@ -362,7 +342,39 @@ class ContinuousBatchScheduler:
         Returns:
             True if request can be added
         """
-        # Stage 4: Use dynamic batch size
+        # NEW (Step 2): Check length bucket compatibility
+        if self.enable_length_bucketing and self.running_batch:
+            # Get bucket for new request
+            new_bucket = self._get_length_bucket(request)
+
+            # Check if any request in current batch is from same bucket
+            batch_buckets = set(self._get_length_bucket(req) for req in self.running_batch)
+
+            # Only allow same bucket (with ±1 bucket tolerance for flexibility)
+            if new_bucket not in batch_buckets:
+                # Allow adjacent buckets for flexibility
+                adjacent_ok = any(abs(new_bucket - b) <= 1 for b in batch_buckets)
+                if not adjacent_ok:
+                    return False
+
+        # NEW (Step 3): Token-based admission control
+        # Count total tokens in current batch (both already generated + remaining)
+        if self.running_batch:
+            current_total_tokens = sum(
+                req.current_length + len(req.generated_ids)
+                for req in self.running_batch
+            )
+            new_req_tokens = request.current_length + request.tokens_remaining
+
+            # Check token limit (more important than sequence count for GPU efficiency)
+            if current_total_tokens + new_req_tokens > self.max_tokens_per_step:
+                return False
+
+        # NEW (Step 3): Sequence count limit (secondary constraint)
+        if len(self.running_batch) >= self.max_sequences_per_step:
+            return False
+
+        # Stage 4: Use dynamic batch size (legacy, now superseded by token-based)
         effective_batch_size = self._compute_dynamic_batch_size() if self.enable_dynamic_batching else self.max_batch_size
 
         if len(self.running_batch) >= effective_batch_size:
@@ -429,17 +441,49 @@ class ContinuousBatchScheduler:
         - Dynamic batch size adjustment
         - Memory-aware scheduling
 
+        NEW: True continuous batching (if enabled):
+        - Don't wait for batch completion
+        - Form batches every batch_window_ms
+        - Admit new requests while GPU is decoding
+
+        NEW (Step 4): Prefill/Decode split scheduling:
+        - Prefill (first token) uses smaller batches
+        - Decode continues with larger batches
+        - Prevents prefill from blocking decode throughput
+
         Returns:
             List of requests to process, or None if no requests ready
         """
         # Remove finished requests from running batch
         self.running_batch = [req for req in self.running_batch if not req.finished]
 
+        # NEW (Step 4): Handle prefill batch separately if enabled
+        if self.enable_prefill_decode_split and self._prefill_queue:
+            # Prioritize decode if we have active decode batch (decode is faster)
+            if not self.running_batch:
+                # No active decode - process prefill requests
+                return self._schedule_prefill_batch()
+
+        # NEW: Continuous batching timing check
+        current_time = time.time()
+        if self.enable_continuous_batching:
+            # Check if we should wait for batch window before forming new batch
+            time_since_last_batch = (current_time - self._last_batch_time) * 1000  # ms
+            if time_since_last_batch < self.batch_window_ms and self.running_batch:
+                # Still within window and have running batch - keep processing
+                # This allows GPU to continue decoding while we accumulate more requests
+                if self.running_batch:
+                    self._update_metrics()
+                    return self.running_batch
+                # No running batch but within window - wait for more requests
+                if not self.waiting_queue:
+                    return None
+
         # Stage 4: Smart request grouping
         if self.enable_dynamic_batching and len(self.waiting_queue) > 1:
             self.waiting_queue = self._group_requests_by_length()
 
-        # Try to add new requests from waiting queue
+        # Try to add new requests from waiting queue (decode requests)
         requests_added = 0
         while self.waiting_queue:
             # Peek at highest priority request
@@ -454,6 +498,10 @@ class ContinuousBatchScheduler:
                 # Can't fit, put back in queue
                 heapq.heappush(self.waiting_queue, (neg_priority, timestamp, counter, request))
                 break
+
+        # NEW: Update batch formation time
+        if requests_added > 0:
+            self._last_batch_time = current_time
 
         # Stage 4: Track grouping efficiency
         if self.enable_dynamic_batching and requests_added > 1:
@@ -472,19 +520,57 @@ class ContinuousBatchScheduler:
             return self.running_batch
 
         return None
-    
+
+    def _schedule_prefill_batch(self) -> Optional[List[InferenceRequest]]:
+        """
+        NEW (Step 4): Schedule a prefill batch (first token generation).
+
+        Prefill is compute-bound and uses smaller batches to avoid blocking decode.
+        After prefill completes, requests move to decode queue automatically.
+
+        Returns:
+            List of prefill requests to process, or None if no prefill requests ready
+        """
+        prefill_batch = []
+        current_time = time.time()
+
+        # Form smaller prefill batch (default: 1/4 of decode batch size)
+        while self._prefill_queue and len(prefill_batch) < self.max_prefill_batch_size:
+            neg_priority, timestamp, counter, request = heapq.heappop(self._prefill_queue)
+
+            # Start timing for this request
+            request.start_time = current_time
+            prefill_batch.append(request)
+
+        if prefill_batch:
+            self._last_batch_time = current_time
+            return prefill_batch
+
+        return None
+
     def update_batch(self, new_tokens: List[int]):
         """
         Update running batch with newly generated tokens.
-        
+
+        NEW (Step 4): After prefill completes (first token generated),
+        move request to decode queue automatically.
+
         Args:
             new_tokens: List of token IDs for each request in batch
         """
+        requests_to_requeue = []  # NEW (Step 4): Track prefill->decode transitions
+
         for i, request in enumerate(self.running_batch):
             if i < len(new_tokens):
                 token_id = new_tokens[i]
                 request.generated_ids.append(token_id)
-                
+
+                # NEW (Step 4): If this was prefill (first token), move to decode queue
+                if self.enable_prefill_decode_split and len(request.generated_ids) == 1:
+                    # Just completed prefill - move to decode queue for next iteration
+                    requests_to_requeue.append(request)
+                    continue
+
                 # Check if finished
                 if (token_id == 2 or  # EOS token (model-specific)
                     len(request.generated_ids) >= request.max_tokens):
@@ -492,6 +578,18 @@ class ContinuousBatchScheduler:
                     request.end_time = time.time()
                     self.total_requests_processed += 1
                     self.total_tokens_generated += len(request.generated_ids)
+
+        # NEW (Step 4): Move prefill->decode transitions to decode queue
+        if requests_to_requeue:
+            for request in requests_to_requeue:
+                # Add to decode queue (waiting_queue) with same priority
+                heapq.heappush(
+                    self.waiting_queue,
+                    (-request.priority, request.created_at, self._request_counter, request)
+                )
+                self._request_counter += 1
+                # Remove from running batch (will be re-scheduled in decode batch)
+                self.running_batch.remove(request)
     
     def get_batch_input(self) -> Tuple[torch.Tensor, List[int]]:
         """

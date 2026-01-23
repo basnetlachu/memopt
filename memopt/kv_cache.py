@@ -73,7 +73,8 @@ class PagedKVCache:
         enable_prefix_sharing: bool = False,
         eviction_policy: str = "lru",
         enable_sliding_window: bool = True,
-        window_size: int = 4096
+        window_size: int = 4096,
+        enable_lazy_allocation: bool = False  # NEW (Step 8): Lazy block allocation
     ):
         """
         Args:
@@ -101,46 +102,69 @@ class PagedKVCache:
         self.enable_prefix_sharing = enable_prefix_sharing
         self.eviction_policy = eviction_policy
         self.enable_sliding_window = enable_sliding_window
+        self.enable_lazy_allocation = enable_lazy_allocation  # NEW (Step 8)
         
         # Determine which layers to keep in HBM vs stream
         # Early layers (first 25%) stay resident - they're accessed most
         self.resident_layers = set(range(math.ceil(num_layers * 0.25)))
-        
-        # Physical memory: [num_layers, max_blocks, block_size, num_heads, head_dim]
-        # We store K and V separately for better memory access patterns
-        if quantize:
-            # INT8 storage
-            self.k_cache = torch.zeros(
-                num_layers, max_blocks, block_size, num_heads, head_dim,
-                dtype=torch.int8, device=device
-            )
-            self.v_cache = torch.zeros(
-                num_layers, max_blocks, block_size, num_heads, head_dim,
-                dtype=torch.int8, device=device
-            )
-            # Scale and zero-point for dequantization
-            self.k_scales = torch.zeros(
-                num_layers, max_blocks, device=device
-            )
-            self.v_scales = torch.zeros(
-                num_layers, max_blocks, device=device
-            )
-            self.k_zeros = torch.zeros(
-                num_layers, max_blocks, device=device
-            )
-            self.v_zeros = torch.zeros(
-                num_layers, max_blocks, device=device
-            )
+
+        # NEW (Step 8): Lazy allocation - only allocate blocks when needed
+        if enable_lazy_allocation:
+            # Don't pre-allocate the full cache, create empty containers
+            # Blocks will be allocated on-demand in _allocate_block()
+            self.k_cache = {}  # layer -> {block_id -> tensor}
+            self.v_cache = {}  # layer -> {block_id -> tensor}
+            if quantize:
+                self.k_scales = {}  # layer -> {block_id -> scale}
+                self.v_scales = {}  # layer -> {block_id -> scale}
+                self.k_zeros = {}  # layer -> {block_id -> zero}
+                self.v_zeros = {}  # layer -> {block_id -> zero}
+            # Initialize empty dicts for each layer
+            for layer in range(num_layers):
+                self.k_cache[layer] = {}
+                self.v_cache[layer] = {}
+                if quantize:
+                    self.k_scales[layer] = {}
+                    self.v_scales[layer] = {}
+                    self.k_zeros[layer] = {}
+                    self.v_zeros[layer] = {}
         else:
-            # FP16 storage (fallback)
-            self.k_cache = torch.zeros(
-                num_layers, max_blocks, block_size, num_heads, head_dim,
-                dtype=torch.float16, device=device
-            )
-            self.v_cache = torch.zeros(
-                num_layers, max_blocks, block_size, num_heads, head_dim,
-                dtype=torch.float16, device=device
-            )
+            # Original: Pre-allocate all blocks upfront
+            # Physical memory: [num_layers, max_blocks, block_size, num_heads, head_dim]
+            # We store K and V separately for better memory access patterns
+            if quantize:
+                # INT8 storage
+                self.k_cache = torch.zeros(
+                    num_layers, max_blocks, block_size, num_heads, head_dim,
+                    dtype=torch.int8, device=device
+                )
+                self.v_cache = torch.zeros(
+                    num_layers, max_blocks, block_size, num_heads, head_dim,
+                    dtype=torch.int8, device=device
+                )
+                # Scale and zero-point for dequantization
+                self.k_scales = torch.zeros(
+                    num_layers, max_blocks, device=device
+                )
+                self.v_scales = torch.zeros(
+                    num_layers, max_blocks, device=device
+                )
+                self.k_zeros = torch.zeros(
+                    num_layers, max_blocks, device=device
+                )
+                self.v_zeros = torch.zeros(
+                    num_layers, max_blocks, device=device
+                )
+            else:
+                # FP16 storage (fallback)
+                self.k_cache = torch.zeros(
+                    num_layers, max_blocks, block_size, num_heads, head_dim,
+                    dtype=torch.float16, device=device
+                )
+                self.v_cache = torch.zeros(
+                    num_layers, max_blocks, block_size, num_heads, head_dim,
+                    dtype=torch.float16, device=device
+                )
         
         # Block allocation tracking
         self.free_blocks = set(range(max_blocks))
@@ -264,6 +288,102 @@ class PagedKVCache:
 
         return evicted_count
 
+    def _allocate_physical_block(self, layer: int, block_id: int):
+        """
+        NEW (Step 8): Allocate physical memory for a single block (lazy allocation).
+
+        Only called when enable_lazy_allocation=True.
+        Creates the actual tensor storage for a block on first use.
+
+        Args:
+            layer: Layer index
+            block_id: Block index to allocate
+        """
+        if not self.enable_lazy_allocation:
+            return  # Physical memory already pre-allocated
+
+        # Check if already allocated
+        if block_id in self.k_cache[layer]:
+            return  # Already allocated
+
+        # Allocate the physical memory for this block
+        if self.quantize:
+            # INT8 storage
+            self.k_cache[layer][block_id] = torch.zeros(
+                self.block_size, self.num_heads, self.head_dim,
+                dtype=torch.int8, device=self.device
+            )
+            self.v_cache[layer][block_id] = torch.zeros(
+                self.block_size, self.num_heads, self.head_dim,
+                dtype=torch.int8, device=self.device
+            )
+            # Scale and zero-point
+            self.k_scales[layer][block_id] = torch.tensor(0.0, device=self.device)
+            self.v_scales[layer][block_id] = torch.tensor(0.0, device=self.device)
+            self.k_zeros[layer][block_id] = torch.tensor(0.0, device=self.device)
+            self.v_zeros[layer][block_id] = torch.tensor(0.0, device=self.device)
+        else:
+            # FP16 storage
+            self.k_cache[layer][block_id] = torch.zeros(
+                self.block_size, self.num_heads, self.head_dim,
+                dtype=torch.float16, device=self.device
+            )
+            self.v_cache[layer][block_id] = torch.zeros(
+                self.block_size, self.num_heads, self.head_dim,
+                dtype=torch.float16, device=self.device
+            )
+
+    def _get_cache_block(self, cache, layer: int, block_id: int, start: int = None, end: int = None):
+        """
+        NEW (Step 8): Unified accessor for cache blocks (works with both dict and tensor).
+
+        Args:
+            cache: k_cache or v_cache
+            layer: Layer index
+            block_id: Block index
+            start: Optional start index within block
+            end: Optional end index within block
+
+        Returns:
+            Cache block tensor or slice
+        """
+        if self.enable_lazy_allocation:
+            # Dict-based lazy cache
+            block = cache[layer][block_id]
+            if start is not None and end is not None:
+                return block[start:end]
+            return block
+        else:
+            # Pre-allocated tensor cache
+            if start is not None and end is not None:
+                return cache[layer, block_id, start:end]
+            return cache[layer, block_id]
+
+    def _set_cache_block(self, cache, layer: int, block_id: int, value, start: int = None, end: int = None):
+        """
+        NEW (Step 8): Unified setter for cache blocks (works with both dict and tensor).
+
+        Args:
+            cache: k_cache or v_cache
+            layer: Layer index
+            block_id: Block index
+            value: Tensor to write
+            start: Optional start index within block
+            end: Optional end index within block
+        """
+        if self.enable_lazy_allocation:
+            # Dict-based lazy cache
+            if start is not None and end is not None:
+                cache[layer][block_id][start:end] = value
+            else:
+                cache[layer][block_id] = value
+        else:
+            # Pre-allocated tensor cache
+            if start is not None and end is not None:
+                cache[layer, block_id, start:end] = value
+            else:
+                cache[layer, block_id] = value
+
     def allocate_blocks(self, seq_id: int, num_blocks: int) -> List[int]:
         """
         Allocate physical blocks for a sequence.
@@ -302,6 +422,11 @@ class PagedKVCache:
             # Phase 1: Track ownership for eviction
             self.block_owner[block_id] = seq_id
             self.block_last_used[block_id] = time.time()
+
+            # NEW (Step 8): Allocate physical memory for this block if lazy allocation enabled
+            if self.enable_lazy_allocation:
+                for layer in range(self.num_layers):
+                    self._allocate_physical_block(layer, block_id)
 
         self.block_tables[seq_id] = blocks
         self.stats.used_pages += num_blocks

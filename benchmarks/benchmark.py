@@ -255,8 +255,6 @@ def run_optimized(
     quantize_kv: bool = False,
     enable_speculative: bool = False,
     # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path (use production/ for multi-GPU)
-    rl_scheduler_path: str = None,
-    memory_predictor_path: str = None,
     enable_memory_tracing: bool = False,
     memory_trace_output: str = "memory_traces.csv"
 ):
@@ -285,29 +283,18 @@ def run_optimized(
     # REMOVED: Multi-GPU display code (use production/ for multi-GPU)
     # For multi-GPU inference, use: scripts/benchmark_production.sh
 
-    # Determine if we'll use concurrent batching
-    # This affects memory allocation
-    use_concurrent = (rl_scheduler_path is not None or memory_predictor_path is not None)
-    num_prompts = len(prompts) if prompts else 10
-
-    # Set appropriate batch size for concurrent mode
-    if use_concurrent and num_prompts >= 10:
-        expected_batch_size = min(10, num_prompts)  # Chunk size for concurrent batching
-        print(f"\n  🚀 Concurrent batching enabled ({expected_batch_size}-prompt chunks)")
-    else:
-        expected_batch_size = 8  # Default for sequential mode
+    # Set appropriate batch size
+    expected_batch_size = 8  # Default batch size
 
     # Load with Memopt
     model = OptimizedLLM(
         model=model_name,
         optimization_level=optimization_level,
         enable_profiling=True,
-        expected_batch_size=expected_batch_size,  # Dynamic based on mode
+        expected_batch_size=expected_batch_size,
         expected_seq_len=max_tokens * 2,  # Conservative estimate
-        max_kv_blocks=max_kv_blocks,  # Apply user override if specified
+        max_kv_blocks=max_kv_blocks  # Apply user override if specified
         # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path (use production/ for multi-GPU)
-        rl_scheduler_path=rl_scheduler_path,  # Trained RL batch scheduler agent
-        memory_predictor_path=memory_predictor_path  # Trained neural memory predictor
     )
 
     # Override quantization if requested (must be done BEFORE cache initialization)
@@ -469,8 +456,6 @@ def worker_process(
     model_name: str,
     optimization_level: str,
     max_tokens: int,
-    rl_scheduler_path: str,
-    memory_predictor_path: str,
     prompt_queue: mp.Queue,
     result_queue: mp.Queue,
     ready_queue: mp.Queue
@@ -504,12 +489,6 @@ def worker_process(
         'enable_profiling': True,
         'device': 'cuda',  # Will use GPU 0 in this process (which is actually GPU worker_id)
     }
-
-    # Add AI models if provided
-    if rl_scheduler_path:
-        model_kwargs['rl_scheduler_path'] = rl_scheduler_path
-    if memory_predictor_path:
-        model_kwargs['memory_predictor_path'] = memory_predictor_path
 
     try:
         model = OptimizedLLM(**model_kwargs)
@@ -581,9 +560,7 @@ def run_worker_benchmark(
     num_gpus: int,
     prompts: list,
     max_tokens: int,
-    optimization_level: str,
-    rl_scheduler_path: str,
-    memory_predictor_path: str
+    optimization_level: str
 ):
     """Run worker-per-GPU benchmark."""
     print("\n" + "="*70)
@@ -604,7 +581,6 @@ def run_worker_benchmark(
             target=worker_process,
             args=(
                 worker_id, model_name, optimization_level, max_tokens,
-                rl_scheduler_path, memory_predictor_path,
                 prompt_queue, result_queue, ready_queue
             )
         )
@@ -807,21 +783,9 @@ def main():
         help="Path to trained RL router agent (e.g., multi_gpu_router.zip)"
     )
     parser.add_argument(
-        "--rl-scheduler-path",
-        type=str,
-        default=None,
-        help="Path to trained RL batch scheduler agent (e.g., scheduler_rl_agent.zip)"
-    )
-    parser.add_argument(
-        "--memory-predictor-path",
-        type=str,
-        default=None,
-        help="Path to trained neural memory predictor (e.g., memory_predictor.pth)"
-    )
-    parser.add_argument(
         "--enable-memory-tracing",
         action="store_true",
-        help="Enable memory tracing for neural predictor training (saves to memory_traces.csv)"
+        help="Enable memory tracing (saves to memory_traces.csv)"
     )
     parser.add_argument(
         "--memory-trace-output",
@@ -840,11 +804,6 @@ def main():
         "--fair-comparison",
         action="store_true",
         help="Enable FAIR comparison: baseline also uses batching (apples-to-apples)"
-    )
-    parser.add_argument(
-        "--validate-ai-components",
-        action="store_true",
-        help="Run with/without RL scheduler and memory predictor to measure their impact"
     )
     parser.add_argument(
         "--compare-vllm",
@@ -934,7 +893,6 @@ def main():
     baseline_stats = None
     baseline_batched_stats = None
     optimized_stats = None
-    optimized_no_ai_stats = None
     vllm_stats = None
     optimized_model = None
 
@@ -959,28 +917,6 @@ def main():
             print("   Continuing with other tests...")
             vllm_stats = None
 
-    # === POINT 4: AI COMPONENT VALIDATION ===
-    if args.validate_ai_components and (args.rl_scheduler_path or args.memory_predictor_path):
-        print("\n" + "="*70)
-        print("AI COMPONENT VALIDATION MODE")
-        print("="*70)
-        print("Running benchmark WITHOUT AI components first...")
-
-        # Run without AI components
-        optimized_no_ai_stats, _ = run_optimized(
-            args.model, prompts, args.max_tokens, args.optimization_level, args.max_kv_blocks,
-            quantize_kv=args.quantize_kv,
-            enable_speculative=args.enable_speculative,
-            rl_scheduler_path=None,  # DISABLED
-            memory_predictor_path=None,  # DISABLED
-            enable_memory_tracing=args.enable_memory_tracing,
-            memory_trace_output=args.memory_trace_output
-        )
-
-        print("\n" + "="*70)
-        print("Now running WITH AI components...")
-        print("="*70)
-
     if args.mode in ["optimized", "both"]:
         # Check if we should use worker-per-GPU architecture
         if args.use_workers and args.num_gpus >= 2:
@@ -990,9 +926,7 @@ def main():
                 args.num_gpus,
                 prompts,
                 args.max_tokens,
-                args.optimization_level,
-                args.rl_scheduler_path,
-                args.memory_predictor_path
+                args.optimization_level
             )
             optimized_model = None  # No single model instance in worker mode
         else:
@@ -1002,8 +936,6 @@ def main():
                 quantize_kv=args.quantize_kv,
                 enable_speculative=args.enable_speculative,
                 # REMOVED: num_gpus, multi_gpu_mode, enable_rl_routing, rl_router_path
-                rl_scheduler_path=args.rl_scheduler_path,
-                memory_predictor_path=args.memory_predictor_path,
                 enable_memory_tracing=args.enable_memory_tracing,
                 memory_trace_output=args.memory_trace_output
             )
@@ -1080,26 +1012,6 @@ def main():
             print(f"Memopt is {vs_vllm:.2f}x (SLOWER than vLLM) ⚠️")
             print(f"  ⚠️  vLLM is {1/vs_vllm:.2f}x faster - consider what Memopt provides beyond vLLM")
 
-    # POINT 4: AI component validation
-    if optimized_no_ai_stats and optimized_stats:
-        print("\n" + "="*70)
-        print("🤖 AI COMPONENT IMPACT ANALYSIS")
-        print("="*70)
-        print(f"Without RL/Neural predictor:  {optimized_no_ai_stats.tokens_per_second:.1f} tok/s")
-        print(f"With RL/Neural predictor:     {optimized_stats.tokens_per_second:.1f} tok/s")
-        ai_improvement = optimized_stats.tokens_per_second / optimized_no_ai_stats.tokens_per_second
-        ai_gain_pct = (ai_improvement - 1.0) * 100
-        print(f"AI component benefit:         {ai_improvement:.3f}x ({ai_gain_pct:+.1f}%)")
-
-        if ai_gain_pct > 5:
-            print(f"✅ AI components provide meaningful benefit ({ai_gain_pct:.1f}% improvement)")
-        elif ai_gain_pct > 0:
-            print(f"⚠️  AI components provide minor benefit ({ai_gain_pct:.1f}% improvement)")
-            print(f"    Consider if complexity is worth the gain")
-        else:
-            print(f"❌ AI components HURT performance ({ai_gain_pct:.1f}% degradation)")
-            print(f"    Simple heuristics would be better")
-
     if baseline_stats and optimized_stats:
         print("\n💰 IMPROVEMENT (vs Sequential Baseline):")
         speedup = optimized_stats.tokens_per_second / baseline_stats.tokens_per_second
@@ -1159,8 +1071,6 @@ def main():
         results["baseline_batched"] = baseline_batched_stats.to_dict()
     if vllm_stats:
         results["vllm"] = vllm_stats.to_dict()
-    if optimized_no_ai_stats:
-        results["optimized_no_ai"] = optimized_no_ai_stats.to_dict()
     if optimized_stats:
         results["optimized"] = optimized_stats.to_dict()
 
@@ -1198,17 +1108,6 @@ def main():
             "memopt_throughput": optimized_stats.tokens_per_second,
             "memopt_vs_vllm": vs_vllm,
             "verdict": "faster" if vs_vllm > 1.0 else ("competitive" if vs_vllm > 0.9 else "slower")
-        }
-
-    if optimized_no_ai_stats and optimized_stats:
-        ai_improvement = optimized_stats.tokens_per_second / optimized_no_ai_stats.tokens_per_second
-        ai_gain_pct = (ai_improvement - 1.0) * 100
-        results["ai_component_impact"] = {
-            "without_ai_throughput": optimized_no_ai_stats.tokens_per_second,
-            "with_ai_throughput": optimized_stats.tokens_per_second,
-            "ai_multiplier": ai_improvement,
-            "ai_gain_percent": ai_gain_pct,
-            "verdict": "meaningful" if ai_gain_pct > 5 else ("minor" if ai_gain_pct > 0 else "negative")
         }
 
     with open(args.output, 'w') as f:
