@@ -1,32 +1,61 @@
 """
-Memopt - GPU Memory Bandwidth Optimization Engine for LLM Inference
+MemOpt - GPU Memory Bandwidth Profiling & Optimization Platform
 
-Reduces memory bandwidth usage by 40-60% through:
-- INT8 KV cache quantization
-- Page-based KV cache management
-- Memory-efficient attention (FlashAttention-2)
-- Continuous batching with memory awareness
-- Real-time profiling and cost tracking
-
-Usage:
-    from Memopt import OptimizedLLM
-
-    model = OptimizedLLM(
-        model="meta-llama/Llama-2-13b-hf",
-        optimization_level="high"
-    )
-
-    response = model.generate("Your prompt here", max_tokens=512)
+Professional bandwidth profiler for GPU-bound AI workloads.
 """
 
-__version__ = "0.1.0"
-__author__ = "Memopt Team"
+__version__ = "0.2.0"
 
-from .model import OptimizedLLM
-from .profiler import MemoryProfiler, ProfileStats
+# Core bandwidth profiling
+from .bandwidth_profiler import (
+    BandwidthProfiler,
+    BandwidthStats,
+    compare_bandwidth_profiles,
+)
+
+from .bandwidth_analyzer import (
+    BandwidthAnalyzer,
+    ModelBandwidthProfile,
+    profile_model,
+)
+
+from .bottleneck_detector import (
+    BottleneckDetector,
+    Bottleneck,
+    BottleneckType,
+    BottleneckSeverity,
+)
+
+# KV Cache (for lazy allocation optimization - Phase 3)
+from .kv_cache import PagedKVCache, CacheStats
+
+# Exceptions
+from .exceptions import (
+    CacheEvictionError,
+    QueueFullError,
+    ResourceExhaustedError,
+    RequestRejectedError,
+)
 
 __all__ = [
-    "OptimizedLLM",
-    "MemoryProfiler",
-    "ProfileStats"
+    # Bandwidth profiling
+    "BandwidthProfiler",
+    "BandwidthStats",
+    "BandwidthAnalyzer",
+    "ModelBandwidthProfile",
+    "profile_model",
+    "compare_bandwidth_profiles",
+    # Bottleneck detection
+    "BottleneckDetector",
+    "Bottleneck",
+    "BottleneckType",
+    "BottleneckSeverity",
+    # KV Cache (Phase 3)
+    "PagedKVCache",
+    "CacheStats",
+    # Exceptions
+    "CacheEvictionError",
+    "QueueFullError",
+    "ResourceExhaustedError",
+    "RequestRejectedError",
 ]
