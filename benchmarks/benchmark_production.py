@@ -77,13 +77,15 @@ class BenchmarkMetrics:
 
     # Cost Model (estimated)
     cost_per_1m_tokens_usd: float
-    gpu_hourly_cost_usd: float = 5.0  # Configurable, defaults to A100
 
     # Workload info
     num_prompts: int
     max_tokens: int
     total_tokens_generated: int
     total_time_seconds: float
+
+    # Fields with defaults MUST come last
+    gpu_hourly_cost_usd: float = 5.0  # Configurable, defaults to A100
 
     def to_dict(self):
         return asdict(self)
