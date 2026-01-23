@@ -304,7 +304,12 @@ def run_vllm_baseline(
 
     # Collect metrics
     total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
-    request_latencies = []  # vLLM doesn't expose per-request timing easily
+
+    # CRITICAL: Validate tokens were generated
+    if total_tokens == 0:
+        raise RuntimeError(f"vLLM generated zero tokens for {len(prompts)} prompts")
+    if total_time == 0:
+        raise RuntimeError("vLLM benchmark: zero elapsed time")
 
     # Estimate per-request latency (uniform distribution)
     mean_latency_ms = (total_time / len(prompts)) * 1000
@@ -314,9 +319,9 @@ def run_vllm_baseline(
         model_name=model_name,
         timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
         hardware=get_hardware_info(),
-        tokens_per_second=total_tokens / total_time,
-        requests_per_second=len(prompts) / total_time,
-        mean_latency_per_token_ms=(total_time / total_tokens) * 1000,
+        tokens_per_second=total_tokens / total_time if total_time > 0 else 0.0,
+        requests_per_second=len(prompts) / total_time if total_time > 0 else 0.0,
+        mean_latency_per_token_ms=(total_time / total_tokens) * 1000 if total_tokens > 0 else 0.0,
         p50_request_latency_ms=mean_latency_ms,
         p95_request_latency_ms=mean_latency_ms * 1.2,  # Estimate
         p99_request_latency_ms=mean_latency_ms * 1.5,  # Estimate
@@ -432,15 +437,21 @@ def run_tgi_baseline(
     if gpu_monitor:
         gpu_metrics = gpu_monitor.stop()
 
+    # CRITICAL: Validate tokens were generated
+    if total_tokens == 0:
+        raise RuntimeError(f"TGI baseline generated zero tokens for {len(prompts)} prompts")
+    if total_time == 0:
+        raise RuntimeError("TGI benchmark: zero elapsed time")
+
     # Calculate metrics
     metrics = BenchmarkMetrics(
         mode="tgi",
         model_name=model_name,
         timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
         hardware=get_hardware_info(),
-        tokens_per_second=total_tokens / total_time,
-        requests_per_second=len(prompts) / total_time,
-        mean_latency_per_token_ms=(total_time / total_tokens) * 1000,
+        tokens_per_second=total_tokens / total_time if total_time > 0 else 0.0,
+        requests_per_second=len(prompts) / total_time if total_time > 0 else 0.0,
+        mean_latency_per_token_ms=(total_time / total_tokens) * 1000 if total_tokens > 0 else 0.0,
         p50_request_latency_ms=np.percentile(request_latencies, 50),
         p95_request_latency_ms=np.percentile(request_latencies, 95),
         p99_request_latency_ms=np.percentile(request_latencies, 99),
@@ -595,17 +606,32 @@ def run_memopt_optimized(
     # Get stats from profiler
     stats = model.get_profiling_stats()
 
+    # CRITICAL: Validate that we actually generated tokens
+    if stats.total_tokens_generated == 0:
+        raise RuntimeError(
+            f"Memopt benchmark failed: zero tokens generated\n"
+            f"  Processed {len(prompts)} prompts over {total_time:.2f}s\n"
+            f"  This indicates a bug in generate_batch() token counting\n"
+            f"  Profiler stats: {stats.to_dict()}"
+        )
+
+    if total_time == 0:
+        raise RuntimeError("Memopt benchmark failed: zero elapsed time")
+
+    # Calculate metrics with guards
+    mean_latency = (total_time / stats.total_tokens_generated) * 1000 if stats.total_tokens_generated > 0 else 0.0
+
     metrics = BenchmarkMetrics(
         mode="memopt",
         model_name=model_name,
         timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
         hardware=get_hardware_info(),
         tokens_per_second=stats.tokens_per_second,
-        requests_per_second=len(prompts) / total_time,
-        mean_latency_per_token_ms=(total_time / stats.total_tokens_generated) * 1000,
-        p50_request_latency_ms=np.percentile(request_latencies, 50),
-        p95_request_latency_ms=np.percentile(request_latencies, 95),
-        p99_request_latency_ms=np.percentile(request_latencies, 99),
+        requests_per_second=len(prompts) / total_time if total_time > 0 else 0.0,
+        mean_latency_per_token_ms=mean_latency,
+        p50_request_latency_ms=np.percentile(request_latencies, 50) if request_latencies else 0.0,
+        p95_request_latency_ms=np.percentile(request_latencies, 95) if request_latencies else 0.0,
+        p99_request_latency_ms=np.percentile(request_latencies, 99) if request_latencies else 0.0,
         avg_gpu_utilization_pct=gpu_metrics.get('avg_gpu_utilization_pct', 0.0),
         peak_gpu_memory_gb=gpu_metrics.get('peak_memory_gb', 0.0),
         steady_gpu_memory_gb=gpu_metrics.get('steady_memory_gb', 0.0),

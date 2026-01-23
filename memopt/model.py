@@ -17,7 +17,7 @@ import warnings
 import time
 
 from .kv_cache import PagedKVCache
-from .scheduler import SimpleScheduler, ContinuousBatchScheduler, InferenceRequest
+from .scheduler import SimpleScheduler, ContinuousBatchScheduler, InferenceRequest, RequestStatus
 from .profiler import MemoryProfiler, ProfileStats
 from .memory_manager import SmartMemoryManager
 from .batch_utils import pad_sequences, update_attention_mask
@@ -1411,10 +1411,10 @@ class OptimizedLLM:
         # This is the 1.2-2x improvement over chunk-based batching
 
         # Create inference requests
-        requests = []
-        request_map = {}  # Map request_id to index for ordering
+        # INVARIANT: request_map tracks ALL requests created, never deleted
+        request_map = {}  # Map request_id → (index, request_object)
         for idx, prompt in enumerate(prompts):
-            request_id = f"batch_{id(self)}_{idx}_{time.time()}"
+            request_id = f"gen_{idx}"  # Simple, deterministic ID
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
 
             request = InferenceRequest(
@@ -1422,16 +1422,17 @@ class OptimizedLLM:
                 prompt=prompt,
                 input_ids=input_ids,
                 max_tokens=max_tokens,
-                priority=2  # Normal priority
+                priority=2,  # Normal priority
+                status=RequestStatus.CREATED
             )
-            requests.append(request)
-            request_map[request_id] = idx
+            request_map[request_id] = (idx, request)
 
             # Add to scheduler queue
             self.scheduler.add_request(request)
 
         # Process batch continuously until all requests complete
         results = [None] * len(prompts)  # Pre-allocate results array
+        total_tokens_generated = 0  # Track actual tokens for profiler
 
         while True:
             # Schedule next batch (may add new requests to running batch)
@@ -1490,13 +1491,34 @@ class OptimizedLLM:
             new_tokens = next_tokens.tolist()
             self.scheduler.update_batch(new_tokens)
 
-            # Collect finished requests
+            # Collect finished requests and count tokens
+            # INVARIANT: Only collect from requests we created (in request_map)
             for req in batch:
-                if req.finished and request_map[req.request_id] < len(results):
-                    idx = request_map[req.request_id]
+                if req.request_id not in request_map:
+                    continue  # Skip requests not from this batch call
+
+                idx, request_obj = request_map[req.request_id]
+
+                # Update token count (track delta per iteration)
+                prev_count = request_obj.tokens_generated
+                current_count = len(req.generated_ids)
+                tokens_added_this_step = current_count - prev_count
+                request_obj.tokens_generated = current_count
+                total_tokens_generated += tokens_added_this_step
+
+                # Collect result if finished
+                if req.finished and results[idx] is None:
+                    # Mark as completed
+                    request_obj.status = RequestStatus.COMPLETED
+                    request_obj.end_time = time.time()
+
                     # Decode generated tokens to text
                     generated_text = self.tokenizer.decode(req.generated_ids, skip_special_tokens=True)
                     results[idx] = generated_text
+
+        # Update profiler with actual tokens generated (CRITICAL: must be > 0)
+        if self.profiler:
+            self.profiler.total_tokens_generated += total_tokens_generated
 
         return results
     

@@ -32,21 +32,42 @@ class Priority:
     BACKGROUND = 4  # Run when idle
 
 
+class RequestStatus:
+    """Request lifecycle states - NEVER skip states"""
+    CREATED = "created"      # Request registered, not yet started
+    PREFILL = "prefill"      # First forward pass (compute prompt KV cache)
+    DECODE = "decode"        # Generating tokens one by one
+    COMPLETED = "completed"  # Generation finished (EOS or max_tokens)
+    FAILED = "failed"        # Error occurred
+
+
 @dataclass
 class InferenceRequest:
-    """Single inference request."""
+    """
+    Single inference request with strict lifecycle tracking.
+
+    INVARIANT: Request transitions CREATED → PREFILL → DECODE → COMPLETED
+    INVARIANT: Request ID is immutable and unique
+    INVARIANT: Request is never deleted until explicitly marked COMPLETED
+    """
     request_id: str
     prompt: str
     input_ids: torch.Tensor
     max_tokens: int
     created_at: float = field(default_factory=time.time)
     priority: int = 2  # Default: Priority.NORMAL (lower number = higher priority)
-    
+
+    # Lifecycle state (MANDATORY - never skip states)
+    status: str = RequestStatus.CREATED
+
     # Generation state
     generated_ids: List[int] = field(default_factory=list)
-    finished: bool = False
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
+    finished: bool = False  # Legacy field for compatibility
+    start_time: Optional[float] = None  # When generation actually started
+    end_time: Optional[float] = None    # When generation completed
+
+    # Metrics (MUST be set by scheduler/model, NOT benchmark)
+    tokens_generated: int = 0  # Actual count of tokens generated
     
     @property
     def current_length(self) -> int:
