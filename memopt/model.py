@@ -1410,6 +1410,10 @@ class OptimizedLLM:
         # NEW: True continuous batching - process multiple requests concurrently
         # This is the 1.2-2x improvement over chunk-based batching
 
+        # Start profiling timing
+        if self.profiler:
+            self.profiler.start_profiling()
+
         # Create inference requests
         # INVARIANT: request_map tracks ALL requests created, never deleted
         request_map = {}  # Map request_id → (index, request_object)
@@ -1516,9 +1520,10 @@ class OptimizedLLM:
                     generated_text = self.tokenizer.decode(req.generated_ids, skip_special_tokens=True)
                     results[idx] = generated_text
 
-        # Update profiler with actual tokens generated (CRITICAL: must be > 0)
+        # End profiling timing and update token count
         if self.profiler:
             self.profiler.tokens_generated += total_tokens_generated
+            self.profiler.end_profiling()
 
         return results
     
