@@ -3,7 +3,7 @@ Configuration management for production serving.
 """
 import os
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List
 import yaml
 
 
@@ -14,10 +14,6 @@ class WorkerConfig:
     # Model configuration
     model_name: str = "gpt2-xl"
     optimization_level: str = "batch"
-
-    # AI model paths
-    rl_scheduler_path: Optional[str] = None
-    memory_predictor_path: Optional[str] = None
 
     # Worker configuration
     worker_id: int = 0
@@ -54,8 +50,6 @@ class WorkerConfig:
         return cls(
             model_name=os.getenv("MODEL_NAME", "gpt2-xl"),
             optimization_level=os.getenv("OPTIMIZATION_LEVEL", "batch"),
-            rl_scheduler_path=os.getenv("RL_SCHEDULER_PATH"),
-            memory_predictor_path=os.getenv("MEMORY_PREDICTOR_PATH"),
             worker_id=int(os.getenv("WORKER_ID", "0")),
             gpu_id=int(os.getenv("GPU_ID", "0")),
             host=os.getenv("WORKER_HOST", "0.0.0.0"),
@@ -129,8 +123,6 @@ class ClusterConfig:
     # Shared configuration
     model_name: str = "gpt2-xl"
     optimization_level: str = "batch"
-    rl_scheduler_path: Optional[str] = None
-    memory_predictor_path: Optional[str] = None
 
     # Registry
     registry_host: str = "redis.cluster.local"

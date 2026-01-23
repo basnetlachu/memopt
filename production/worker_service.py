@@ -356,11 +356,6 @@ class WorkerService:
             'device': 'cuda',
         }
 
-        if self.config.rl_scheduler_path:
-            model_kwargs['rl_scheduler_path'] = self.config.rl_scheduler_path
-        if self.config.memory_predictor_path:
-            model_kwargs['memory_predictor_path'] = self.config.memory_predictor_path
-
         self.model = OptimizedLLM(**model_kwargs)
         logger.info(f"Model loaded successfully")
 
