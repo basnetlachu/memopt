@@ -1518,7 +1518,7 @@ class OptimizedLLM:
 
         # Update profiler with actual tokens generated (CRITICAL: must be > 0)
         if self.profiler:
-            self.profiler.total_tokens_generated += total_tokens_generated
+            self.profiler.tokens_generated += total_tokens_generated
 
         return results
     
