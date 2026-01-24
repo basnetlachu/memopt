@@ -38,27 +38,80 @@ def run_with_nsight(script_content: str, ncu_path: str = 'ncu') -> dict:
         ]
 
         print(f"  Running Nsight (this takes 60-120s)...")
-        subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
-        # Parse CSV output
-        if not os.path.exists(output_file):
-            raise ValueError(f"Nsight output file not found: {output_file}")
+        # DEBUG: Save both stdout and file output
+        debug_file = output_file + '.debug'
+        with open(debug_file, 'w') as f:
+            f.write("=== STDOUT ===\n")
+            f.write(result.stdout)
+            f.write("\n\n=== STDERR ===\n")
+            f.write(result.stderr)
+            f.write("\n\n=== CSV FILE ===\n")
+            if os.path.exists(output_file):
+                with open(output_file, 'r') as csvf:
+                    f.write(csvf.read())
+            else:
+                f.write("(CSV file not found)")
 
-        with open(output_file, 'r') as f:
-            content = f.read()
+        # Try parsing stdout first (newer Nsight versions)
+        content = result.stdout
 
-        # Parse DRAM bytes from CSV
+        # Fallback to CSV file if stdout empty
+        if not content.strip() and os.path.exists(output_file):
+            with open(output_file, 'r') as f:
+                content = f.read()
+
+        # Parse DRAM bytes - try multiple patterns
         dram_read = 0
         dram_write = 0
 
+        # Pattern 1: CSV format with quotes
         for match in re.finditer(r'dram__bytes_read\.sum[",\s]+(\d+)', content):
             dram_read += int(match.group(1))
-
         for match in re.finditer(r'dram__bytes_write\.sum[",\s]+(\d+)', content):
             dram_write += int(match.group(1))
 
+        # Pattern 2: Space-separated format
         if dram_read == 0 and dram_write == 0:
-            raise ValueError(f"No DRAM metrics found in Nsight output")
+            for match in re.finditer(r'dram__bytes_read\.sum\s+(\d+)', content):
+                dram_read += int(match.group(1))
+            for match in re.finditer(r'dram__bytes_write\.sum\s+(\d+)', content):
+                dram_write += int(match.group(1))
+
+        # Pattern 3: Just look for any number after the metric name
+        if dram_read == 0 and dram_write == 0:
+            import csv
+            import io
+
+            # Find CSV header
+            lines = content.split('\n')
+            header_idx = -1
+            for i, line in enumerate(lines):
+                if '"ID"' in line or 'Metric Name' in line:
+                    header_idx = i
+                    break
+
+            if header_idx >= 0:
+                csv_lines = lines[header_idx:]
+                reader = csv.DictReader(csv_lines)
+
+                for row in reader:
+                    metric = row.get('Metric Name', '') if 'Metric Name' in row else row.get('"Metric Name"', '')
+                    value_str = row.get('Metric Value', '0') if 'Metric Value' in row else row.get('"Metric Value"', '0')
+
+                    try:
+                        value = int(value_str.replace('"', '').replace(',', ''))
+                    except:
+                        continue
+
+                    if 'dram__bytes_read' in metric:
+                        dram_read += value
+                    elif 'dram__bytes_write' in metric:
+                        dram_write += value
+
+        if dram_read == 0 and dram_write == 0:
+            raise ValueError(f"No DRAM metrics found in Nsight output. Debug saved to: {debug_file}")
 
         return {'dram_read': dram_read, 'dram_write': dram_write, 'total': dram_read + dram_write}
 
