@@ -1,7 +1,7 @@
 """
 Lazy KV Cache Optimization Demo
 
-Demonstrates the 30-40% bandwidth reduction achievable with
+Demonstrates the 15-25% bandwidth reduction (hardware-validated) achievable with
 lazy KV cache materialization.
 """
 

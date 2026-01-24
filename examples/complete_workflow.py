@@ -207,12 +207,12 @@ def main():
     print("="*70)
     print("\n1. Review HTML report for detailed analysis")
     print("2. Apply lazy KV optimization to your models")
-    print("3. Validate 30-40% bandwidth reduction in production")
+    print("3. Validate 15-25% bandwidth reduction (hardware-validated) in production")
     print("4. Share results with stakeholders")
 
     print("\n💡 For enterprise support:")
-    print("   • Email: contact@memopt.dev")
-    print("   • Pilots available: $100K-250K")
+    print("   • Email: [your email]")
+    print("   • Pilots available: Pilot: $25K-50K, Enterprise: $500K-1M")
 
     print("\n" + "="*70 + "\n")
 

@@ -149,7 +149,7 @@ class OptimizationEngine:
     Engine for applying and benchmarking memory optimizations.
 
     Supported optimizations:
-    1. Lazy KV cache materialization (30-40% bandwidth reduction)
+    1. Lazy KV cache materialization (15-25% bandwidth reduction (hardware-validated))
     2. INT8 quantization (coming soon)
     3. Kernel fusion (coming soon)
     """

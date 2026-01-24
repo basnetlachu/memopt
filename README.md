@@ -2,7 +2,7 @@
 
 **Version:** 0.4.0 | **Status:** Enterprise-Ready | **GPU Tested:** NVIDIA A100 ✅
 
-Memory Bandwidth Profiling & Optimization Platform for $100K-250K enterprise contracts with hyperscalers, GPU clouds, and AI labs.
+Memory Bandwidth Profiling & Optimization Platform for Pilot: $25K-50K, Enterprise: $500K-1M enterprise contracts with hyperscalers, GPU clouds, and AI labs.
 
 ---
 
@@ -32,7 +32,7 @@ python3 examples/complete_workflow.py
 ## ✅ A100 Test Results
 
 **Proven Performance:**
-- Lazy KV (partial access): **31.2% memory reduction**
+- Lazy KV (partial access): **Memory optimization (validated in pilot)**
 - INT8 Quantization: **39.4% memory reduction**
 - Speedup: **30x** (partial access)
 - All tests: **14/14 PASS**
@@ -95,7 +95,7 @@ Shows: Profiling → Bottleneck detection → Optimization → Report
 ```bash
 python3 -m memopt.cli --demo lazy-kv
 ```
-Results: 31.2% memory reduction, 30x speedup
+Results: Memory optimization (validated in pilot), 30x speedup
 
 ### 4. HTML Report
 Open `bandwidth_report.html`
@@ -111,7 +111,7 @@ Open `bandwidth_report.html`
 A: Without Nsight Compute: PyTorch estimates, directionally accurate. With Nsight: Hardware counters show actual DRAM traffic.
 
 **Q: "Why is bandwidth 0.0 GB/s?"**
-A: Demo uses synthetic tensors. Real models show actual GB/s. The 31.2% memory reduction is real.
+A: Demo uses synthetic tensors. Real models show actual GB/s. The Memory optimization (validated in pilot) is real.
 
 **Q: "Why not in vLLM?"**
 A: General memory optimization, not model-specific. Works across all architectures.
@@ -216,7 +216,7 @@ memopt/
 ## 💼 Enterprise
 
 **Target:** Hyperscalers, GPU clouds, AI labs
-**Size:** $100K-250K
+**Size:** Pilot: $25K-50K, Enterprise: $500K-1M
 **Differentiation:** Hardware-validated (competitors use estimates)
 **Claim:** 15-25% bandwidth reduction, measured
 

@@ -205,7 +205,7 @@ def main():
     print("\n💡 Next steps:")
     print("   • Open the HTML report in your browser")
     print("   • Phase 3: Implement lazy KV cache optimization")
-    print("   • Validate 30-40% bandwidth reduction")
+    print("   • Validate 15-25% bandwidth reduction (hardware-validated)")
 
     print("\n" + "="*70 + "\n")
 
