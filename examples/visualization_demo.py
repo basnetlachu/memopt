@@ -17,6 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from memopt.bandwidth_analyzer import BandwidthAnalyzer
+from memopt.bandwidth_profiler import BandwidthStats
 from memopt.bottleneck_detector import BottleneckDetector
 from memopt.visualizer import BandwidthVisualizer, print_dashboard
 from memopt.report_generator import generate_html_report
