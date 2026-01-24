@@ -40,11 +40,8 @@ from .report_generator import (
 )
 
 # Hardware Validation (Phase 4)
-from .hardware_validator import (
-    HardwareValidator,
-    HardwareCounters,
-    validate_bandwidth_measurement,
-)
+# Note: Import directly from module if needed
+# from .hardware_validator import HardwareValidator, HardwareValidationResult
 
 # Memory Access Coalescing (Phase 4)
 from .memory_coalescing import (
@@ -93,9 +90,7 @@ __all__ = [
     "ReportGenerator",
     "generate_html_report",
     # Phase 4: Hardware Validation
-    "HardwareValidator",
-    "HardwareCounters",
-    "validate_bandwidth_measurement",
+    # "HardwareValidator",  # Import directly if needed
     # Phase 4: Memory Coalescing
     "MemoryAccessCoalescer",
     "CoalescedKVCache",

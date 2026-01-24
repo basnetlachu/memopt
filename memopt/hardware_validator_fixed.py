@@ -20,7 +20,10 @@ class HardwareValidator:
     def __init__(self, ncu_path: str = "/usr/local/cuda-12.4/bin/ncu"):
         self.ncu_path = ncu_path
         if not os.path.exists(ncu_path):
-            possible_paths = ["/usr/local/cuda/bin/ncu", "/usr/local/cuda-12.4/bin/ncu"]
+            possible_paths = [
+                "/usr/local/cuda/bin/ncu",
+                "/usr/local/cuda-12.4/bin/ncu",
+            ]
             for path in possible_paths:
                 if os.path.exists(path):
                     self.ncu_path = path
@@ -31,7 +34,7 @@ class HardwareValidator:
 
     def validate_script(self, script_content: str, timeout: int = 300) -> HardwareValidationResult:
         if not self.is_available():
-            return HardwareValidationResult(False, note=f"ncu not found")
+            return HardwareValidationResult(False, note=f"ncu not found at {self.ncu_path}")
 
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
             f.write(script_content)
@@ -49,9 +52,11 @@ class HardwareValidator:
                 'python3', script_path
             ]
 
-            subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             return self._parse_csv(output_file)
 
+        except subprocess.TimeoutExpired:
+            return HardwareValidationResult(False, note=f"Timeout after {timeout}s")
         except Exception as e:
             return HardwareValidationResult(False, note=str(e))
         finally:
@@ -60,52 +65,32 @@ class HardwareValidator:
 
     def _parse_csv(self, csv_file: str) -> HardwareValidationResult:
         if not os.path.exists(csv_file):
-            return HardwareValidationResult(False, note="CSV not found")
+            return HardwareValidationResult(False, note="CSV file not found")
 
         try:
             dram_read = 0
             dram_write = 0
 
             with open(csv_file, 'r') as f:
-                # Skip lines until we find the CSV header
-                lines = f.readlines()
-                header_idx = -1
-                for i, line in enumerate(lines):
-                    if line.startswith('"ID"'):
-                        header_idx = i
-                        break
-                
-                if header_idx == -1:
-                    return HardwareValidationResult(False, note="No CSV header found")
-
-                # Parse CSV from header onwards
-                csv_content = lines[header_idx:]
-                import io
-                reader = csv.DictReader(io.StringIO(''.join(csv_content)))
-                
+                reader = csv.DictReader(f)
                 for row in reader:
                     metric = row.get('Metric Name', '')
-                    value_str = row.get('Metric Value', '0')
-                    
-                    try:
-                        value = int(value_str)
-                    except:
-                        continue
+                    value = row.get('Metric Value', '0')
                     
                     if 'dram__bytes_read' in metric:
-                        dram_read += value
+                        dram_read += int(value)
                     elif 'dram__bytes_write' in metric:
-                        dram_write += value
+                        dram_write += int(value)
 
             if dram_read == 0 and dram_write == 0:
-                return HardwareValidationResult(False, note="No DRAM metrics")
+                return HardwareValidationResult(False, note="No DRAM metrics found")
 
             return HardwareValidationResult(
                 validated=True,
                 dram_read_gb=dram_read / 1e9,
                 dram_write_gb=dram_write / 1e9,
                 total_dram_gb=(dram_read + dram_write) / 1e9,
-                note="✅ Hardware-validated"
+                note="Hardware-validated"
             )
 
         except Exception as e:
@@ -118,11 +103,11 @@ a = torch.randn(1024, 1024, device='cuda')
 b = torch.matmul(a, a)
 torch.cuda.synchronize()
 """
-        print("Testing Nsight Compute (30-60s)...")
+        print("Testing Nsight Compute...")
         result = self.validate_script(test_script, timeout=120)
         
         if result.validated:
-            print(f"  ✅ DRAM read: {result.dram_read_gb:.3f} GB, write: {result.dram_write_gb:.3f} GB, total: {result.total_dram_gb:.3f} GB")
+            print(f"  ✅ Works! DRAM read: {result.dram_read_gb:.3f} GB, write: {result.dram_write_gb:.3f} GB")
         else:
             print(f"  ❌ Failed: {result.note}")
         

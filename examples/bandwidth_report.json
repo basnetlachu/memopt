@@ -1,0 +1,30 @@
+{
+  "model": {
+    "name": "SimpleTransformer",
+    "total_params": 29164304
+  },
+  "baseline": {
+    "total_time_seconds": 0.8756928100585938,
+    "peak_memory_allocated_gb": 0.16047239303588867,
+    "peak_memory_reserved_gb": 0.18359375,
+    "hbm_read_gb": 0.0,
+    "hbm_write_gb": 0.0,
+    "total_hbm_traffic_gb": 0.0,
+    "achieved_bandwidth_gbs": 0.0,
+    "gpu_name": "NVIDIA A100-SXM4-80GB",
+    "theoretical_bandwidth_gbs": 2039,
+    "bandwidth_utilization_pct": 0.0,
+    "compute_time_seconds": 0.0,
+    "memory_time_seconds": 0.0,
+    "is_memory_bound": true,
+    "memory_bound_pct": 100.0,
+    "total_flops": 0.0,
+    "operational_intensity": 0.0,
+    "layer_bandwidths": null,
+    "layer_bottlenecks": null,
+    "optimization_applied": "baseline",
+    "memory_saved_gb": 0.0,
+    "bandwidth_improvement_pct": 0.0
+  },
+  "optimized": null
+}
