@@ -1,0 +1,143 @@
+================================================================================
+MEMOPT GPU TESTING - COPY-PASTE COMMANDS
+================================================================================
+
+STEP 1: SETUP (Run these on GPU server)
+================================================================================
+
+cd /root/memopt  # Or wherever you transferred the code
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
+python3 apply_pytorch_fix.py
+
+
+STEP 2: RUN TESTS
+================================================================================
+
+python3 test_installation.py
+python3 tests/test_memory_coalescing.py
+python3 -m memopt.cli --gpu-info
+
+
+STEP 3: RUN DEMO
+================================================================================
+
+# Without hardware validation (fast - 30 seconds)
+python3 -m memopt.cli --demo lazy-kv
+
+# With hardware validation (slow - 5-10 minutes, requires Nsight Compute)
+python3 -m memopt.cli --demo lazy-kv --validate-hardware
+
+
+VERIFY PYTORCH
+================================================================================
+
+python3 -c "import torch; print(f'PyTorch: {torch.__version__}')"
+python3 -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+python3 -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
+
+
+CHECK FOR ERRORS
+================================================================================
+
+# If you see: AttributeError: 'FunctionEventAvg' object has no attribute 'cuda_time_total'
+# Run this:
+python3 apply_pytorch_fix.py
+
+
+VIEW GENERATED REPORTS
+================================================================================
+
+ls -lh bandwidth_report.html
+cat bandwidth_profile.txt
+
+
+NSIGHT COMPUTE INSTALLATION (Optional - for hardware validation)
+================================================================================
+
+python3 -m memopt.cli --validation-setup
+
+# Then download from: https://developer.nvidia.com/nsight-compute
+# For Ubuntu:
+# wget [URL from Nsight Compute download page]
+# sudo dpkg -i nsight-compute-*.deb
+# ncu --version
+
+
+LOG DEMO SESSION FOR CUSTOMERS
+================================================================================
+
+script -c "python3 -m memopt.cli --demo lazy-kv --validate-hardware" customer_demo_log.txt
+
+
+TRANSFER FILES BACK TO MAC (from GPU server)
+================================================================================
+
+# HTML report
+scp /root/memopt/bandwidth_report.html user@macbook:/path/to/destination/
+
+# Demo log
+scp /root/memopt/customer_demo_log.txt user@macbook:/path/to/destination/
+
+
+TROUBLESHOOTING
+================================================================================
+
+# If "No module named 'memopt'":
+pip install -e .
+
+# If CUDA not available:
+nvidia-smi
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+# If OOM (Out of Memory):
+# This is normal for the demo - it uses large batch sizes for testing
+# Your actual models will work fine
+
+# If permission denied for ncu:
+sudo -E python3 -m memopt.cli --demo lazy-kv --validate-hardware
+
+
+SUCCESS INDICATORS
+================================================================================
+
+✅ test_installation.py shows "3/3 tests passed"
+✅ test_memory_coalescing.py shows "ALL TESTS PASSED"
+✅ GPU info shows your GPU model
+✅ Demo completes without errors
+✅ bandwidth_report.html file is created
+✅ Report shows either green ✅ (with ncu) or yellow ⚠️ (without ncu) banner
+
+
+EXPECTED TIMING
+================================================================================
+
+Setup: 2-3 minutes
+Tests: 2-3 minutes
+Demo (no validation): 30-60 seconds
+Demo (with validation): 5-10 minutes
+
+Total time to verify everything works: ~10 minutes
+
+
+WHAT TO SEND BACK TO MAC
+================================================================================
+
+1. bandwidth_report.html (visual proof)
+2. Test output (screenshot or text)
+3. GPU info output (shows what GPU you tested on)
+4. Any error messages (if tests fail)
+
+
+CUSTOMER DEMO CHECKLIST
+================================================================================
+
+Before showing to customers, verify:
+□ All tests pass (14/14 total)
+□ Nsight Compute installed (for hardware validation)
+□ Demo with --validate-hardware works
+□ Generated report has green ✅ validation banner
+□ Logged demo session ready to share
+
+================================================================================

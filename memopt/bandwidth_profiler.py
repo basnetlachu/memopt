@@ -226,7 +226,14 @@ class BandwidthProfiler:
         for event in events:
             # Sum CUDA time
             if event.device_type == torch.profiler.DeviceType.CUDA:
-                total_cuda_time_us += event.cuda_time_total
+                # Handle both old and new PyTorch API
+                if hasattr(event, 'cuda_time_total'):
+                    total_cuda_time_us += event.cuda_time_total
+                elif hasattr(event, 'device_time_total'):
+                    total_cuda_time_us += event.device_time_total
+                else:
+                    # Fallback to self_cuda_time_total if available
+                    total_cuda_time_us += getattr(event, 'self_cuda_time_total', 0)
 
                 # Estimate memory traffic from tensor sizes
                 # This is approximate - PyTorch doesn't expose exact HBM traffic
