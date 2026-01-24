@@ -1,49 +1,20 @@
-# Memopt Requirements
-# Production-ready LLM inference optimization
+# MemOpt Requirements
+# GPU Memory Bandwidth Profiling & Optimization Platform
 
-# ============================================================================
-# CORE DEPENDENCIES (Required)
-# ============================================================================
-torch>=2.1.0
-transformers>=4.36.0
-accelerate>=0.25.0
+# Core dependencies (minimal install)
+torch>=2.0.0
 numpy>=1.24.0
-tqdm>=4.66.0
 
-# ============================================================================
-# STAGE 7: Flash Attention (HIGHLY RECOMMENDED for 30-60x speedup)
-# ============================================================================
-# Install with: pip install flash-attn --no-build-isolation
-# Requirements: CUDA 11.6+ and NVIDIA GPU with compute capability 7.0+
-# Without this, you'll get 16-20x speedup (PyTorch SDPA fallback)
-# With this, you'll get 30-60x speedup (Flash Attention 2)
-#flash-attn>=2.3.0
+# Optional: For LLM profiling examples
+transformers>=4.30.0
+accelerate>=0.20.0
 
-# ============================================================================
-# OPTIONAL PERFORMANCE LIBRARIES
-# ============================================================================
-# Triton for custom kernels (alternative to Flash Attention)
-triton>=2.1.0
-
-# ============================================================================
-# OPTIONAL: API SERVER
-# ============================================================================
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.6.0
-
-# ============================================================================
-# STAGE 5: RL-POWERED OPTIMIZATION (OPTIONAL)
-# ============================================================================
-# Install with: pip install stable-baselines3 gymnasium
-# Required for AI-powered batch scheduler (+15-25% throughput improvement)
-# Skip if you want rule-based scheduling only
-stable-baselines3>=2.2.0
-gymnasium>=0.29.0
-tensorboard>=2.15.0  # For training visualization
-
-# ============================================================================
-# DEVELOPMENT TOOLS
-# ============================================================================
+# Optional: Development tools
 pytest>=7.4.0
 black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0
+
+# Optional: Enhanced visualization
+matplotlib>=3.7.0
+plotly>=5.14.0

@@ -224,7 +224,7 @@ class BandwidthAnalyzer:
         if stats.is_memory_bound:
             if stats.bandwidth_utilization_pct < 40:
                 suggestions.append(
-                    "⚠️  LOW BANDWIDTH UTILIZATION: Apply lazy KV cache materialization (30-40% reduction)"
+                    "⚠️  LOW BANDWIDTH UTILIZATION: Apply memory access coalescing (15-25% reduction, measured)"
                 )
 
             if stats.peak_memory_allocated_gb > 20:

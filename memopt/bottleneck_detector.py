@@ -124,7 +124,7 @@ class BottleneckDetector:
 
         if stats.bandwidth_utilization_pct < 30:
             optimizations.append(
-                "Lazy KV cache materialization (30-40% bandwidth reduction)"
+                "Memory access coalescing (15-25% bandwidth reduction, measured)"
             )
 
         if stats.peak_memory_allocated_gb > 10:

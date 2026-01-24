@@ -69,7 +69,7 @@ class PagedKVCache:
         layer_retention_strategy: str = "keep_early",
         enable_prefix_sharing: bool = False,
         eviction_policy: str = "lru",
-        enable_sliding_window: bool = False,
+        enable_sliding_window: bool = True,
         window_size: int = 4096,
         enable_lazy_allocation: bool = False  # NEW (Step 8): Lazy block allocation
     ):
@@ -177,10 +177,26 @@ class PagedKVCache:
         self.prefix_cache: Dict[str, List[int]] = {}  # prefix_hash -> block_ids
         self.prefix_min_length = 32  # Minimum tokens for prefix sharing
 
-        # Sliding window and prefix dedup disabled (archived)
+        # Trillion-token scale: Sliding window manager
         self.sliding_window = None
-        self.sequence_blocks: Dict[int, dict] = {}
+        if self.enable_sliding_window:
+            self.sliding_window = SlidingWindowManager(
+                window_size=window_size,
+                min_window_size=1024,
+                enable_dynamic_window=True
+            )
+
+        # Track sequence info for sliding window integration
+        self.sequence_blocks: Dict[int, dict] = {}  # seq_id -> {blocks, current_length}
+
+        # Cross-request prefix deduplication (Stage 3 enhancement)
         self.prefix_dedup = None
+        if self.enable_prefix_sharing:
+            self.prefix_dedup = PrefixDeduplicationManager(
+                min_prefix_length=max(32, self.prefix_min_length),
+                max_prefix_length=2048,
+                enable_auto_detection=True
+            )
 
         # Statistics
         self.stats = CacheStats(total_pages=max_blocks)
@@ -437,7 +453,20 @@ class PagedKVCache:
         if seq_id not in self.block_tables:
             return
 
-        # Prefix deduplication disabled (archived in archive/inference_engine/)
+        # Cross-request prefix dedup: Decrement ref count for shared prefix
+        if self.prefix_dedup:
+            evictable_prefix = self.prefix_dedup.decrement_ref(seq_id)
+            if evictable_prefix:
+                # Prefix is no longer used, can evict its blocks
+                prefix_blocks = self.prefix_dedup.evict_prefix(evictable_prefix)
+                if prefix_blocks:
+                    for block_id in prefix_blocks:
+                        if block_id in self.block_ref_counts:
+                            self.block_ref_counts[block_id] -= 1
+                            if self.block_ref_counts[block_id] == 0:
+                                self.free_blocks.add(block_id)
+                                self.stats.used_pages -= 1
+                                del self.block_ref_counts[block_id]
 
         blocks = self.block_tables[seq_id]
         for block_id in blocks:
@@ -501,7 +530,28 @@ class PagedKVCache:
         # Phase 1: Update LRU timestamp for all blocks touched (O(1) per block)
         current_time = time.time()
 
-        # Sliding window disabled (archived)
+        # Trillion-token scale: Apply sliding window BEFORE writing if needed
+        if self.enable_sliding_window and self.sliding_window and seq_id in self.sequence_blocks:
+            seq_info = self.sequence_blocks[seq_id]
+            current_length = seq_info['current_length']
+
+            # Check if we need to apply sliding window
+            if self.sliding_window.should_apply_window(current_length):
+                # Apply sliding window eviction to free old blocks
+                apply_sliding_window_to_kv_cache(self, self.sliding_window, seq_id)
+
+                # Adjust start_pos after windowing
+                # After windowing, we keep only last W tokens
+                # So if we had 5000 tokens and window is 4096, we keep tokens 904-5000
+                # New start_pos should be relative to the windowed sequence
+                if current_length > self.sliding_window.window_size:
+                    # Calculate new effective start position
+                    tokens_evicted = current_length - self.sliding_window.window_size
+                    if start_pos < tokens_evicted:
+                        # This write is for tokens that should be evicted, skip it
+                        return
+                    # Adjust start_pos to be relative to windowed cache
+                    start_pos = start_pos - tokens_evicted
         # Handle different input shapes
         if k.dim() == 3:
             # [num_heads, seq_len, head_dim] -> add batch dimension
@@ -704,11 +754,15 @@ class PagedKVCache:
         """
         Adjust cache behavior based on memory pressure.
 
+        Production-critical for trillion-token scale:
+        - Adjusts sliding window size dynamically
+        - Can trigger aggressive eviction if needed
+
         Args:
             memory_pressure: 0.0 to 1.0
         """
-        # Sliding window disabled (archived)
-        pass
+        if self.enable_sliding_window and self.sliding_window:
+            self.sliding_window.adjust_window_size(memory_pressure)
 
     def get_stats(self) -> dict:
         """Return current cache statistics including sliding window and prefix dedup stats."""
@@ -722,8 +776,13 @@ class PagedKVCache:
             'hit_rate': self.stats.hit_rate,
         }
 
-        # Sliding window and prefix deduplication archived in archive/inference_engine/
-        # No additional stats to include
+        # Add sliding window stats if enabled
+        if self.enable_sliding_window and self.sliding_window:
+            stats_dict['sliding_window'] = self.sliding_window.get_stats()
+
+        # Add prefix deduplication stats if enabled
+        if self.enable_prefix_sharing and self.prefix_dedup:
+            stats_dict['prefix_dedup'] = self.prefix_dedup.get_stats()
 
         return stats_dict
 
@@ -731,7 +790,11 @@ class PagedKVCache:
         """Reset statistics counters."""
         self.stats.cache_hits = 0
         self.stats.cache_misses = 0
-        # Sliding window and prefix deduplication archived in archive/inference_engine/
+
+        # Reset sliding window stats if enabled
+        if self.enable_sliding_window and self.sliding_window:
+            # Note: sliding window counters are fleet-wide, don't reset them
+            pass
 
     # ========================================================================
     # Phase 1: Request Lifecycle Management (for eviction safety)

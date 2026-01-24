@@ -4,9 +4,9 @@ MemOpt - GPU Memory Bandwidth Profiling & Optimization Platform
 Professional bandwidth profiler for GPU-bound AI workloads.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"  # Phase 3 complete
 
-# Core bandwidth profiling
+# Core bandwidth profiling (Phase 1)
 from .bandwidth_profiler import (
     BandwidthProfiler,
     BandwidthStats,
@@ -26,7 +26,43 @@ from .bottleneck_detector import (
     BottleneckSeverity,
 )
 
-# KV Cache (for lazy allocation optimization - Phase 3)
+# Visualization & Reporting (Phase 2)
+from .visualizer import (
+    BandwidthVisualizer,
+    print_bandwidth_chart,
+    print_comparison,
+    print_dashboard,
+)
+
+from .report_generator import (
+    ReportGenerator,
+    generate_html_report,
+)
+
+# Hardware Validation (Phase 4)
+from .hardware_validator import (
+    HardwareValidator,
+    HardwareCounters,
+    validate_bandwidth_measurement,
+)
+
+# Memory Access Coalescing (Phase 4)
+from .memory_coalescing import (
+    MemoryAccessCoalescer,
+    CoalescedKVCache,
+    CoalescingStats,
+)
+
+# Optimization Engine (Phase 3)
+from .optimization_engine import (
+    OptimizationEngine,
+    OptimizationResult,
+    LazyKVCache,
+    LazyTensorAllocator,
+    run_optimization_demo,
+)
+
+# KV Cache
 from .kv_cache import PagedKVCache, CacheStats
 
 # Exceptions
@@ -38,19 +74,38 @@ from .exceptions import (
 )
 
 __all__ = [
-    # Bandwidth profiling
+    # Phase 1: Bandwidth profiling
     "BandwidthProfiler",
     "BandwidthStats",
     "BandwidthAnalyzer",
     "ModelBandwidthProfile",
     "profile_model",
     "compare_bandwidth_profiles",
-    # Bottleneck detection
     "BottleneckDetector",
     "Bottleneck",
     "BottleneckType",
     "BottleneckSeverity",
-    # KV Cache (Phase 3)
+    # Phase 2: Visualization
+    "BandwidthVisualizer",
+    "print_bandwidth_chart",
+    "print_comparison",
+    "print_dashboard",
+    "ReportGenerator",
+    "generate_html_report",
+    # Phase 4: Hardware Validation
+    "HardwareValidator",
+    "HardwareCounters",
+    "validate_bandwidth_measurement",
+    # Phase 4: Memory Coalescing
+    "MemoryAccessCoalescer",
+    "CoalescedKVCache",
+    "CoalescingStats",
+    # Phase 3: Optimization
+    "OptimizationEngine",
+    "OptimizationResult",
+    "LazyKVCache",
+    "LazyTensorAllocator",
+    "run_optimization_demo",
     "PagedKVCache",
     "CacheStats",
     # Exceptions
