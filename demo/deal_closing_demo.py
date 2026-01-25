@@ -35,7 +35,7 @@ def run_deal_closing_demo():
     print(f"   Optimized DRAM: {proof['optimized_gb']:.2f} GB (with coalescing)")
     print(f"   ✅ Reduction:   {proof['reduction_pct']:.1f}%")
     print(f"   ✅ Bytes saved:  {proof['bytes_saved_gb']:.2f} GB")
-    print(f"   ✅ Validated via: {proof['validation_method']}\n")
+    print(f"   ✅ Validated via: {proof.get('validation_method', proof.get('method', 'N/A'))}\n")
 
     # Show hardware validation files
     if 'nsight_baseline' in proof and 'nsight_optimized' in proof:
