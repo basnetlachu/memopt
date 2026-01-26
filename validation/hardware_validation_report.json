@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-01-26T03:54:50.651142",
+  "device": "NVIDIA A100 80GB PCIe",
+  "config": {
+    "num_prompts": 10,
+    "max_tokens": 50,
+    "model": "gpt2"
+  },
+  "baseline": {
+    "label": "baseline",
+    "peak_memory_allocated": 526041600,
+    "peak_memory_reserved": 574619648,
+    "total_memory_allocated": 5213754880,
+    "cuda_time_ms": 3926.780517578125,
+    "cpu_time_ms": 3926.906137000003,
+    "kernel_count": 0,
+    "memory_operations": 10,
+    "peak_memory_gb": 0.4899144172668457,
+    "total_memory_gb": 4.855687618255615
+  },
+  "optimized": {
+    "label": "optimized",
+    "peak_memory_allocated": 526833152,
+    "peak_memory_reserved": 576716800,
+    "total_memory_allocated": 5221670400,
+    "cuda_time_ms": 4209.4453125,
+    "cpu_time_ms": 4209.522955000011,
+    "kernel_count": 0,
+    "memory_operations": 10,
+    "peak_memory_gb": 0.49065160751342773,
+    "total_memory_gb": 4.8630595207214355
+  },
+  "coalescing": {
+    "layers_optimized": 12,
+    "total_accesses": 24000,
+    "cache_hits": 5988,
+    "cache_misses": 12000,
+    "hit_rate": 24.95,
+    "bandwidth_reduction": 33.27719577939374
+  },
+  "results": {
+    "memory_reduction_bytes": -791552,
+    "memory_reduction_pct": -0.15047327055502835,
+    "speedup": 0.9328498711974001,
+    "correctness_verified": true,
+    "bandwidth_reduction_potential": 33.27719577939374
+  },
+  "proof_files": {
+    "baseline_csv": "/home/ubuntu/memopt/validation/baseline_hardware.csv",
+    "optimized_csv": "/home/ubuntu/memopt/validation/optimized_hardware.csv"
+  }
+}

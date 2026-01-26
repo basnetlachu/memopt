@@ -1,0 +1,10 @@
+Metric,Value,Unit
+Label,baseline,
+Peak Memory Allocated,526041600,bytes
+Peak Memory Reserved,574619648,bytes
+Peak Memory GB,0.489914,GB
+Total Memory Allocated,5213754880,bytes
+CUDA Time,3926.781,ms
+CPU Time,3926.906,ms
+Memory Operations,10,count
+Timestamp,2026-01-26T03:54:46.429092,
