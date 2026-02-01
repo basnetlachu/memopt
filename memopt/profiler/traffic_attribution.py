@@ -546,12 +546,32 @@ class TrafficAttributor:
         self._layout_analyzer = LayoutAnalyzer()
 
     def _detect_l2_cache_size(self) -> int:
-        """Detect GPU L2 cache size."""
+        """Detect GPU L2 cache size.
+
+        Tries CUDA property query first, falls back to lookup table.
+        """
+        # Try direct CUDA query first (most accurate)
+        try:
+            from .hardware_metrics import get_l2_cache_size_bytes
+            return get_l2_cache_size_bytes()
+        except ImportError:
+            pass
+
+        # Fallback to CUDA property query
         if torch.cuda.is_available():
+            try:
+                props = torch.cuda.get_device_properties(0)
+                if hasattr(props, 'l2_cache_size') and props.l2_cache_size > 0:
+                    return props.l2_cache_size
+            except Exception:
+                pass
+
+            # Fallback to name lookup
             gpu_name = torch.cuda.get_device_name(0)
             for key, size in GPU_L2_CACHE_SIZES.items():
                 if key in gpu_name:
                     return size
+
         return GPU_L2_CACHE_SIZES["default"]
 
     def analyze_model(self, model: nn.Module, sample_input: torch.Tensor):

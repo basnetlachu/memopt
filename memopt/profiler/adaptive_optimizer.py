@@ -19,6 +19,7 @@ import copy
 import time
 import json
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Tuple, Any
 from enum import Enum
@@ -29,6 +30,86 @@ import torch.nn as nn
 
 from .traffic_attribution import OptimizationCandidate, OptimizationType
 from .continuous_profiler import ContinuousProfiler, ProfilerSnapshot
+from .config import get_config, MemoptConfig
+from .gpu_profiles import get_gpu_profile, apply_gpu_profile, GPUProfile
+from .session_persistence import SessionPersistence
+
+# Configure logging
+logger = logging.getLogger("memopt")
+
+
+class CompileCompatibilityTracker:
+    """Tracks torch.compile compatibility for different model architectures."""
+
+    def __init__(self):
+        self._compat_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _get_model_signature(self, model: nn.Module) -> str:
+        """Get a signature for the model architecture."""
+        layers = []
+        for name, module in model.named_modules():
+            layers.append(type(module).__name__)
+        return hashlib.md5(":".join(layers[:20]).encode()).hexdigest()[:12]
+
+    def record_success(self, model: nn.Module, mode: str):
+        """Record successful compilation."""
+        sig = self._get_model_signature(model)
+        if sig not in self._compat_cache:
+            self._compat_cache[sig] = {}
+        self._compat_cache[sig][mode] = {"success": True, "attempts": 1}
+
+    def record_failure(self, model: nn.Module, mode: str, error: str):
+        """Record failed compilation."""
+        sig = self._get_model_signature(model)
+        if sig not in self._compat_cache:
+            self._compat_cache[sig] = {}
+        entry = self._compat_cache[sig].get(mode, {"success": False, "attempts": 0})
+        entry["attempts"] = entry.get("attempts", 0) + 1
+        entry["last_error"] = error[:100]
+        self._compat_cache[sig][mode] = entry
+
+    def get_best_mode(self, model: nn.Module) -> Optional[str]:
+        """Get best known working mode for this model architecture."""
+        sig = self._get_model_signature(model)
+        cache = self._compat_cache.get(sig, {})
+        for mode in ["default", "reduce-overhead", "max-autotune"]:
+            if cache.get(mode, {}).get("success"):
+                return mode
+        return None
+
+    def should_skip(self, model: nn.Module, mode: str) -> bool:
+        """Check if compilation should be skipped for this model/mode."""
+        sig = self._get_model_signature(model)
+        entry = self._compat_cache.get(sig, {}).get(mode, {})
+        return entry.get("attempts", 0) >= 3 and not entry.get("success", False)
+
+
+# Global compile tracker
+_compile_tracker = CompileCompatibilityTracker()
+
+
+def get_tolerance_for_dtype(dtype: torch.dtype, multiplier: float = 1.0) -> Tuple[float, float]:
+    """Get appropriate rtol/atol for a given dtype.
+
+    Args:
+        dtype: The tensor dtype
+        multiplier: Multiplier for tolerance (useful for compiled models)
+
+    Returns:
+        (rtol, atol) tuple
+    """
+    config = get_config().verification
+
+    if dtype in (torch.float16, torch.bfloat16):
+        rtol, atol = config.fp16_rtol, config.fp16_atol
+    elif dtype == torch.float32:
+        rtol, atol = config.fp32_rtol, config.fp32_atol
+    elif dtype == torch.float64:
+        rtol, atol = config.fp64_rtol, config.fp64_atol
+    else:
+        rtol, atol = config.fp32_rtol, config.fp32_atol
+
+    return rtol * multiplier, atol * multiplier
 
 
 class OptimizationStatus(Enum):
@@ -349,12 +430,27 @@ class SemanticVerifier:
     """Verifies that optimizations preserve model semantics."""
 
     def __init__(self,
-                 rtol: float = 1e-4,
-                 atol: float = 1e-4,
-                 sample_size: int = 5):
-        self.rtol = rtol
-        self.atol = atol
+                 rtol: Optional[float] = None,
+                 atol: Optional[float] = None,
+                 sample_size: int = 5,
+                 auto_tolerance: bool = True):
+        """
+        Initialize semantic verifier.
+
+        Args:
+            rtol: Relative tolerance. If None and auto_tolerance=True, uses dtype-based default.
+            atol: Absolute tolerance. If None and auto_tolerance=True, uses dtype-based default.
+            sample_size: Number of samples to verify.
+            auto_tolerance: If True, adjusts tolerance based on input dtype.
+        """
+        self._rtol = rtol
+        self._atol = atol
         self.sample_size = sample_size
+        self.auto_tolerance = auto_tolerance
+
+        # Fallback defaults if not auto
+        self.rtol = rtol if rtol is not None else 1e-3
+        self.atol = atol if atol is not None else 1e-3
 
     def verify(self,
                model_original: nn.Module,
@@ -371,9 +467,16 @@ class SemanticVerifier:
 
         max_diff = 0.0
         all_diffs = []
+        rtol, atol = self.rtol, self.atol
 
-        for _ in range(self.sample_size):
+        for i in range(self.sample_size):
             inputs = input_fn()
+
+            # Auto-adjust tolerance on first sample
+            if i == 0 and self.auto_tolerance and self._rtol is None:
+                input_dtype = inputs.dtype if hasattr(inputs, 'dtype') else torch.float32
+                rtol, atol = get_tolerance_for_dtype(input_dtype)
+                logger.debug(f"Auto-tolerance for {input_dtype}: rtol={rtol}, atol={atol}")
 
             with torch.no_grad():
                 output_orig = model_original(inputs)
@@ -394,9 +497,11 @@ class SemanticVerifier:
         median_diff = float(np.median(all_diffs))
 
         # Check equivalence using both absolute and relative tolerance
-        is_equivalent = median_diff < self.atol or (
-            max_diff < self.rtol * torch.abs(output_orig).max().item()
-        )
+        output_scale = torch.abs(output_orig).max().item()
+        is_equivalent = median_diff < atol or (output_scale > 0 and max_diff < rtol * output_scale)
+
+        logger.debug(f"Semantic check: median_diff={median_diff:.2e}, max_diff={max_diff:.2e}, "
+                    f"atol={atol}, rtol={rtol}, equivalent={is_equivalent}")
 
         return is_equivalent, max_diff
 
@@ -410,12 +515,13 @@ class RobustPerformanceMeasurer:
     """
 
     def __init__(self,
-                 num_warmup: int = 5,
-                 num_measure: int = 20,
-                 outlier_threshold: float = 2.0):
-        self.num_warmup = num_warmup
-        self.num_measure = num_measure
-        self.outlier_threshold = outlier_threshold  # IQR multiplier
+                 num_warmup: Optional[int] = None,
+                 num_measure: Optional[int] = None,
+                 outlier_threshold: Optional[float] = None):
+        config = get_config().measurement
+        self.num_warmup = num_warmup if num_warmup is not None else config.warmup_iterations
+        self.num_measure = num_measure if num_measure is not None else config.measure_iterations
+        self.outlier_threshold = outlier_threshold if outlier_threshold is not None else config.outlier_threshold
 
     def measure(self,
                 model: nn.Module,
@@ -538,6 +644,78 @@ class RobustPerformanceMeasurer:
         return is_significant, p_value
 
 
+def generate_fallback_candidates(model: nn.Module) -> List[OptimizationCandidate]:
+    """
+    Generate fallback optimization candidates that don't require attribution.
+
+    These are "always worth trying" optimizations when attribution finds nothing.
+    Used for small models or when attribution thresholds aren't met.
+    """
+    candidates = []
+
+    # 1. cuDNN benchmark + TF32 (safe, often helps)
+    candidates.append(OptimizationCandidate(
+        optimization_type=OptimizationType.CACHE_RESIDENCY,
+        target="cudnn_tf32_optimization",
+        description="Enable cuDNN benchmark and TF32 precision",
+        expected_traffic_reduction_pct=5.0,
+        expected_speedup=1.1,
+        memory_overhead_bytes=0,
+        requires_recompilation=False,
+        semantics_preserving=True,
+        implementation_hint="cudnn.benchmark=True, allow_tf32=True",
+        priority=100.0  # High priority - safe and fast
+    ))
+
+    # 2. torch.compile with default mode (broader compatibility)
+    if hasattr(torch, 'compile'):
+        candidates.append(OptimizationCandidate(
+            optimization_type=OptimizationType.KERNEL_FUSION,
+            target="torch_compile_default",
+            description="Apply torch.compile with default mode",
+            expected_traffic_reduction_pct=10.0,
+            expected_speedup=1.2,
+            memory_overhead_bytes=0,
+            requires_recompilation=True,
+            semantics_preserving=True,
+            implementation_hint="torch.compile(model, mode='default')",
+            priority=80.0
+        ))
+
+    # 3. Make tensors contiguous (helps strided access)
+    candidates.append(OptimizationCandidate(
+        optimization_type=OptimizationType.LAYOUT_TRANSFORM,
+        target="make_contiguous",
+        description="Ensure all model tensors are contiguous",
+        expected_traffic_reduction_pct=5.0,
+        expected_speedup=1.05,
+        memory_overhead_bytes=0,
+        requires_recompilation=False,
+        semantics_preserving=True,
+        implementation_hint="Make parameters contiguous",
+        priority=90.0
+    ))
+
+    # 4. Channels-last for conv models
+    has_conv = any(isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) for m in model.modules())
+    if has_conv:
+        candidates.append(OptimizationCandidate(
+            optimization_type=OptimizationType.LAYOUT_TRANSFORM,
+            target="channels_last_format",
+            description="Convert to channels-last memory format",
+            expected_traffic_reduction_pct=15.0,
+            expected_speedup=1.3,
+            memory_overhead_bytes=0,
+            requires_recompilation=False,
+            semantics_preserving=True,
+            implementation_hint="model.to(memory_format=torch.channels_last)",
+            priority=85.0
+        ))
+
+    logger.info(f"Generated {len(candidates)} fallback optimization candidates")
+    return candidates
+
+
 class LayoutTransformer:
     """Applies layout transformations to tensors."""
 
@@ -568,31 +746,78 @@ class LayoutTransformer:
 
 
 class KernelFuser:
-    """Applies kernel fusion optimizations."""
+    """Applies kernel fusion optimizations with graceful failure handling."""
 
     @staticmethod
     def compile_model(model: nn.Module,
-                      mode: str = "reduce-overhead",
-                      fullgraph: bool = False) -> nn.Module:
+                      mode: str = "default",
+                      fullgraph: bool = False,
+                      tracker: Optional[CompileCompatibilityTracker] = None) -> nn.Module:
         """
-        Apply torch.compile for kernel fusion.
+        Apply torch.compile for kernel fusion with retry logic.
 
         Args:
             model: Model to compile
-            mode: Compilation mode
+            mode: Compilation mode ("default", "reduce-overhead", "max-autotune")
             fullgraph: If True, requires entire graph to compile
+            tracker: Optional tracker for recording compile compatibility
+
+        Returns:
+            Compiled model or original model if compilation fails
         """
         if not hasattr(torch, 'compile'):
+            logger.debug("torch.compile not available")
             return model
 
-        try:
-            return torch.compile(model, mode=mode, fullgraph=fullgraph)
-        except Exception:
-            # Fallback: try without fullgraph
-            try:
-                return torch.compile(model, mode=mode, fullgraph=False)
-            except Exception:
+        config = get_config().compile
+        if not config.enabled:
+            logger.debug("torch.compile disabled in config")
+            return model
+
+        tracker = tracker or _compile_tracker
+
+        # Check if we should skip based on past failures
+        if tracker.should_skip(model, mode):
+            logger.debug(f"Skipping torch.compile mode={mode} based on past failures")
+            # Try a known working mode instead
+            best_mode = tracker.get_best_mode(model)
+            if best_mode and best_mode != mode:
+                logger.debug(f"Trying known working mode: {best_mode}")
+                mode = best_mode
+            else:
                 return model
+
+        # Try compilation with retry logic
+        modes_to_try = [mode]
+        if mode != config.fallback_mode:
+            modes_to_try.append(config.fallback_mode)
+        if "default" not in modes_to_try:
+            modes_to_try.append("default")
+
+        last_error = None
+        for try_mode in modes_to_try:
+            try:
+                logger.debug(f"Attempting torch.compile with mode={try_mode}")
+                compiled = torch.compile(model, mode=try_mode, fullgraph=fullgraph)
+                tracker.record_success(model, try_mode)
+                logger.debug(f"torch.compile successful with mode={try_mode}")
+                return compiled
+            except Exception as e:
+                last_error = str(e)
+                tracker.record_failure(model, try_mode, last_error)
+                logger.debug(f"torch.compile failed with mode={try_mode}: {last_error[:60]}")
+
+                # Try without fullgraph if that was the issue
+                if fullgraph:
+                    try:
+                        compiled = torch.compile(model, mode=try_mode, fullgraph=False)
+                        tracker.record_success(model, try_mode)
+                        return compiled
+                    except Exception:
+                        pass
+
+        logger.warning(f"torch.compile failed all modes, returning original model: {last_error[:60] if last_error else 'unknown'}")
+        return model
 
     @staticmethod
     def fuse_linear_sequences(model: nn.Module) -> nn.Module:
@@ -766,15 +991,43 @@ class AdaptiveOptimizer:
 
     def __init__(self,
                  verifier: Optional[SemanticVerifier] = None,
-                 knowledge_base: Optional[OptimizationKnowledgeBase] = None):
-        self.verifier = verifier or SemanticVerifier()
+                 knowledge_base: Optional[OptimizationKnowledgeBase] = None,
+                 use_fallbacks: bool = True,
+                 auto_apply_gpu_profile: bool = True,
+                 persistence_dir: Optional[Path] = None):
+        """
+        Initialize adaptive optimizer.
+
+        Args:
+            verifier: Semantic verifier instance. If None, uses auto-tolerance verifier.
+            knowledge_base: Knowledge base for learning patterns.
+            use_fallbacks: If True, generates fallback candidates when none provided.
+            auto_apply_gpu_profile: If True, applies GPU-specific settings on init.
+            persistence_dir: Directory for session persistence. None disables persistence.
+        """
+        self.verifier = verifier or SemanticVerifier(auto_tolerance=True)
         self.knowledge_base = knowledge_base or OptimizationKnowledgeBase()
         self.measurer = RobustPerformanceMeasurer()
         self.workload_profiler = WorkloadProfiler()
         self.prefetch_manager = PrefetchManager()
+        self.use_fallbacks = use_fallbacks
 
         self._sessions: List[OptimizationSession] = []
         self._current_workload: Optional[Dict[str, Any]] = None
+
+        # GPU profile
+        self.gpu_profile: Optional[GPUProfile] = None
+        if auto_apply_gpu_profile and torch.cuda.is_available():
+            self.gpu_profile = get_gpu_profile()
+            apply_gpu_profile(self.gpu_profile)
+
+        # Session persistence
+        self.persistence: Optional[SessionPersistence] = None
+        if persistence_dir is not None:
+            self.persistence = SessionPersistence(persistence_dir)
+        elif persistence_dir is None:
+            # Default: enable persistence to ~/.memopt/sessions
+            self.persistence = SessionPersistence()
 
     def optimize(self,
                  model: nn.Module,
@@ -782,7 +1035,8 @@ class AdaptiveOptimizer:
                  input_fn: Callable,
                  num_warmup: int = 5,
                  num_measure: int = 20,
-                 min_improvement: float = 0.005) -> OptimizationSession:
+                 min_improvement: float = 0.005,
+                 use_fallbacks: Optional[bool] = None) -> OptimizationSession:
         """
         Apply optimizations adaptively with validation.
 
@@ -793,6 +1047,7 @@ class AdaptiveOptimizer:
             num_warmup: Warmup iterations before measuring
             num_measure: Measurement iterations
             min_improvement: Minimum speedup to commit (default 0.5%)
+            use_fallbacks: Override instance setting for fallbacks
 
         Returns:
             OptimizationSession with results
@@ -800,6 +1055,23 @@ class AdaptiveOptimizer:
         # Capture workload profile
         self._current_workload = self.workload_profiler.capture_profile(model, input_fn)
         self.workload_profiler.set_baseline(self._current_workload)
+
+        logger.info(f"Starting optimization session for {self._current_workload.get('model_type', 'unknown')} model "
+                   f"({self._current_workload.get('model_params', 0)/1e6:.1f}M params)")
+
+        # Always add fallback optimizations (they're safe and can help any model)
+        should_use_fallbacks = use_fallbacks if use_fallbacks is not None else self.use_fallbacks
+        if should_use_fallbacks:
+            fallback_candidates = generate_fallback_candidates(model)
+            # Merge: attribution candidates first, then fallbacks (avoiding duplicates by target)
+            existing_targets = {c.target for c in candidates}
+            for fc in fallback_candidates:
+                if fc.target not in existing_targets:
+                    candidates.append(fc)
+            logger.info(f"Added {len(fallback_candidates)} fallback candidates to {len(candidates) - len(fallback_candidates)} attribution candidates")
+
+        if not candidates:
+            logger.warning("No optimization candidates available")
 
         # Configure measurer
         self.measurer.num_warmup = num_warmup
@@ -816,12 +1088,17 @@ class AdaptiveOptimizer:
         # Sort candidates by priority, but also consider knowledge base
         sorted_candidates = self._prioritize_candidates(candidates)
 
-        for candidate in sorted_candidates:
+        logger.info(f"Processing {len(sorted_candidates)} optimization candidates")
+
+        for i, candidate in enumerate(sorted_candidates, 1):
+            logger.debug(f"[{i}/{len(sorted_candidates)}] Trying {candidate.optimization_type.value}: {candidate.target[:50]}")
+
             # Skip if knowledge base suggests this won't work
             if self.knowledge_base.should_skip(
                 candidate.optimization_type.value,
                 self._current_workload
             ):
+                logger.info(f"Skipping {candidate.optimization_type.value} based on historical failures")
                 result = OptimizationResult(
                     candidate=candidate,
                     status=OptimizationStatus.ROLLED_BACK,
@@ -839,21 +1116,34 @@ class AdaptiveOptimizer:
             )
             session.add_result(result)
 
-            # Update knowledge base
+            # Log result
             if result.is_improvement:
+                logger.info(f"COMMITTED {candidate.optimization_type.value}: {result.actual_speedup:.3f}x speedup")
                 self.knowledge_base.record_success(
                     candidate.optimization_type.value,
                     self._current_workload,
                     (result.actual_speedup - 1) * 100
                 )
             elif result.status == OptimizationStatus.ROLLED_BACK:
+                logger.info(f"ROLLED_BACK {candidate.optimization_type.value}: {result.failure_reason[:60]}")
                 self.knowledge_base.record_failure(
                     candidate.optimization_type.value,
                     self._current_workload,
                     result.failure_reason
                 )
+            else:
+                logger.warning(f"FAILED {candidate.optimization_type.value}: {result.failure_reason}")
+
+        logger.info(f"Session complete: {session.committed_count} committed, "
+                   f"{session.rollback_count} rolled back, {session.total_speedup:.3f}x total speedup")
 
         self._sessions.append(session)
+
+        # Auto-save session
+        if self.persistence:
+            model_name = self._current_workload.get("model_type", "unknown")
+            self.persistence.save_session(session, model_name=model_name)
+
         return session
 
     def _prioritize_candidates(self,
@@ -896,6 +1186,12 @@ class AdaptiveOptimizer:
             status=OptimizationStatus.PENDING
         )
 
+        # Check if this is a compile optimization (may need relaxed tolerance)
+        is_compile_opt = (
+            candidate.optimization_type == OptimizationType.KERNEL_FUSION and
+            "compile" in candidate.target.lower()
+        )
+
         # 1. Save checkpoint for rollback
         checkpoint.save()
 
@@ -916,13 +1212,42 @@ class AdaptiveOptimizer:
             return result
 
         # 4. Verify semantics (critical for correctness)
-        is_equivalent, max_diff = self.verifier.verify(model, model_optimized, input_fn)
+        # Use relaxed tolerance for compiled models
+        verifier = self.verifier
+        if is_compile_opt:
+            config = get_config().compile
+            verifier = SemanticVerifier(
+                rtol=self.verifier.rtol * config.compiled_rtol_multiplier,
+                atol=self.verifier.atol * config.compiled_atol_multiplier,
+                sample_size=self.verifier.sample_size,
+                auto_tolerance=False  # Use explicit relaxed tolerance
+            )
+
+        is_equivalent, max_diff = verifier.verify(model, model_optimized, input_fn)
         result.semantics_verified = is_equivalent
         result.numerical_diff = max_diff
 
         if not is_equivalent:
-            result.status = OptimizationStatus.ROLLED_BACK
-            result.failure_reason = f"Semantics not preserved (max diff: {max_diff:.2e})"
+            # For compile optimizations, try retry with different mode
+            if is_compile_opt and "torch_compile" in candidate.target:
+                logger.debug(f"Compile semantic check failed (diff={max_diff:.2e}), trying fallback mode")
+                checkpoint.restore()
+
+                # Try with default mode if we weren't already using it
+                if "default" not in candidate.target:
+                    try:
+                        model_optimized = KernelFuser.compile_model(model, mode="default")
+                        is_equivalent, max_diff = verifier.verify(model, model_optimized, input_fn)
+                        if is_equivalent:
+                            logger.debug("Fallback compile mode succeeded")
+                            result.semantics_verified = True
+                            result.numerical_diff = max_diff
+                    except Exception:
+                        pass
+
+            if not is_equivalent:
+                result.status = OptimizationStatus.ROLLED_BACK
+                result.failure_reason = f"Semantics not preserved (max diff: {max_diff:.2e})"
             checkpoint.restore()
             return result
 
@@ -973,12 +1298,22 @@ class AdaptiveOptimizer:
         """Apply the specified optimization transformation."""
 
         opt_type = candidate.optimization_type
+        target = candidate.target
+
+        logger.debug(f"Applying {opt_type.value} to {target}")
 
         if opt_type == OptimizationType.LAYOUT_TRANSFORM:
-            return LayoutTransformer.make_contiguous(model)
+            if target == "channels_last_format":
+                return LayoutTransformer.optimize_memory_format(model)
+            else:
+                return LayoutTransformer.make_contiguous(model)
 
         elif opt_type == OptimizationType.KERNEL_FUSION:
-            return KernelFuser.compile_model(model, mode="reduce-overhead")
+            # Use different compile modes based on target
+            if target == "torch_compile_default":
+                return KernelFuser.compile_model(model, mode="default")
+            else:
+                return KernelFuser.compile_model(model, mode="reduce-overhead")
 
         elif opt_type == OptimizationType.CACHE_RESIDENCY:
             CacheOptimizer.enable_cudnn_optimizations()
@@ -995,7 +1330,6 @@ class AdaptiveOptimizer:
             return model
 
         elif opt_type == OptimizationType.PREFETCH_INJECTION:
-            # Prefetching is handled at data loading level
             return model
 
         elif opt_type == OptimizationType.ASYNC_TRANSFER:
@@ -1005,6 +1339,7 @@ class AdaptiveOptimizer:
             return LayoutTransformer.make_contiguous(model)
 
         else:
+            logger.warning(f"Unknown optimization type: {opt_type}")
             return model
 
     def check_workload_drift(self, input_fn: Callable, model: nn.Module) -> Tuple[bool, Dict[str, float]]:

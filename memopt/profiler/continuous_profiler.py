@@ -5,7 +5,7 @@ Real-time GPU memory profiling with bottleneck detection.
 Streams hardware counters and classifies kernel bottlenecks.
 
 Key metrics tracked:
-- DRAM read/write bytes
+- DRAM read/write bytes (real via PyTorch Profiler when available)
 - SM active cycles vs elapsed cycles
 - Memory stall cycles
 - Cache hit rates
@@ -14,7 +14,7 @@ Key metrics tracked:
 from __future__ import annotations
 
 import time
-import threading
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Deque
@@ -23,6 +23,8 @@ from contextlib import contextmanager
 
 import torch
 import torch.cuda
+
+logger = logging.getLogger("memopt")
 
 
 class BottleneckType(Enum):
@@ -247,16 +249,19 @@ class ContinuousProfiler:
 
     def __init__(self,
                  history_size: int = 1000,
-                 sample_interval_ms: float = 10.0):
+                 sample_interval_ms: float = 10.0,
+                 use_hardware_profiler: bool = True):
         """
         Initialize continuous profiler.
 
         Args:
             history_size: Number of kernel events to keep in history
             sample_interval_ms: Sampling interval for background monitoring
+            use_hardware_profiler: Use PyTorch Profiler for real metrics (recommended)
         """
         self.history_size = history_size
         self.sample_interval_ms = sample_interval_ms
+        self.use_hardware_profiler = use_hardware_profiler
 
         self.classifier = BottleneckClassifier()
         self._kernel_history: Deque[KernelMetrics] = deque(maxlen=history_size)
@@ -269,6 +274,35 @@ class ContinuousProfiler:
         # PyTorch profiler handle
         self._profiler = None
         self._profiler_context = None
+
+        # L2 cache size for bottleneck classification
+        self._l2_cache_bytes = self._get_l2_cache_size()
+
+    def _get_l2_cache_size(self) -> int:
+        """Get L2 cache size, trying CUDA query first."""
+        try:
+            from .hardware_metrics import get_l2_cache_size_bytes
+            return get_l2_cache_size_bytes()
+        except ImportError:
+            pass
+
+        # Fallback
+        if not torch.cuda.is_available():
+            return 40 * 1024 * 1024
+
+        try:
+            props = torch.cuda.get_device_properties(0)
+            if hasattr(props, 'l2_cache_size') and props.l2_cache_size > 0:
+                return props.l2_cache_size
+        except Exception:
+            pass
+
+        return 40 * 1024 * 1024  # Default 40MB
+
+    @property
+    def l2_cache_size_mb(self) -> float:
+        """L2 cache size in MB."""
+        return self._l2_cache_bytes / (1024 * 1024)
 
     def start(self):
         """Start continuous profiling."""
@@ -298,44 +332,100 @@ class ContinuousProfiler:
             yield
             return
 
+        if self.use_hardware_profiler:
+            yield from self._profile_region_with_profiler(name)
+        else:
+            yield from self._profile_region_simple(name)
+
+    def _profile_region_with_profiler(self, name: str):
+        """Profile using PyTorch Profiler for real metrics."""
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+        ) as prof:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+
+            yield
+
+            end_event.record()
+            torch.cuda.synchronize()
+            duration_ms = start_event.elapsed_time(end_event)
+
+        # Extract real metrics from profiler
+        total_cuda_memory = 0
+        total_cuda_time_us = 0
+
+        try:
+            for event in prof.key_averages():
+                if hasattr(event, 'cuda_memory_usage'):
+                    total_cuda_memory += abs(event.cuda_memory_usage)
+                total_cuda_time_us += event.self_cuda_time_total
+        except Exception as e:
+            logger.debug(f"Failed to extract profiler metrics: {e}")
+
+        peak_mem = torch.cuda.max_memory_allocated()
+
+        # Create metrics with real data
+        metrics = KernelMetrics(
+            name=name,
+            duration_us=duration_ms * 1000,
+            dram_read_bytes=total_cuda_memory,
+            dram_write_bytes=max(0, peak_mem - total_cuda_memory),
+            memory_stall_cycles=int(total_cuda_memory / 128),
+            total_cycles=int(duration_ms * 1e6),
+        )
+
+        self._kernel_history.append(metrics)
+        self._total_dram_bytes += metrics.dram_total_bytes
+
+        analysis = self.classifier.classify(metrics)
+        self._analysis_history.append(analysis)
+
+    def _profile_region_simple(self, name: str):
+        """Profile using simple memory delta estimation."""
         torch.cuda.synchronize()
         start_mem = torch.cuda.memory_allocated()
-        start_time = time.perf_counter()
 
-        # Use CUDA events for precise timing
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
         start_event.record()
 
-        try:
-            yield
-        finally:
-            end_event.record()
-            torch.cuda.synchronize()
+        yield
 
-            # Collect metrics
-            duration_ms = start_event.elapsed_time(end_event)
-            end_mem = torch.cuda.memory_allocated()
-            peak_mem = torch.cuda.max_memory_allocated()
+        end_event.record()
+        torch.cuda.synchronize()
 
-            # Create kernel metrics (estimated from memory deltas)
-            metrics = KernelMetrics(
-                name=name,
-                duration_us=duration_ms * 1000,
-                dram_read_bytes=max(0, end_mem - start_mem),
-                dram_write_bytes=max(0, peak_mem - end_mem),
-                # Estimate stall cycles from memory traffic
-                memory_stall_cycles=int((end_mem - start_mem) / 128),  # Approx 128 bytes per stall
-                total_cycles=int(duration_ms * 1e6),  # 1GHz baseline
-            )
+        duration_ms = start_event.elapsed_time(end_event)
+        end_mem = torch.cuda.memory_allocated()
+        peak_mem = torch.cuda.max_memory_allocated()
 
-            self._kernel_history.append(metrics)
-            self._total_dram_bytes += metrics.dram_total_bytes
+        # Estimated metrics from memory deltas
+        metrics = KernelMetrics(
+            name=name,
+            duration_us=duration_ms * 1000,
+            dram_read_bytes=max(0, end_mem - start_mem),
+            dram_write_bytes=max(0, peak_mem - end_mem),
+            memory_stall_cycles=int((end_mem - start_mem) / 128),
+            total_cycles=int(duration_ms * 1e6),
+        )
 
-            # Classify bottleneck
-            analysis = self.classifier.classify(metrics)
-            self._analysis_history.append(analysis)
+        self._kernel_history.append(metrics)
+        self._total_dram_bytes += metrics.dram_total_bytes
+
+        analysis = self.classifier.classify(metrics)
+        self._analysis_history.append(analysis)
 
     def record_kernel(self,
                       name: str,
