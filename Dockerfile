@@ -33,21 +33,15 @@ RUN pip install --no-cache-dir /app/memopt-*.whl && rm /app/memopt-*.whl
 
 # Create example script
 RUN echo '#!/usr/bin/env python3\n\
-"""\n\
-memopt Docker Example\n\
-\n\
-Mount your model directory and run:\n\
-    docker run --gpus all -v /path/to/model:/model memopt:0.4.0\n\
-"""\n\
-\n\
 import torch\n\
 from memopt.profiler import api\n\
 \n\
 print("=" * 60)\n\
 print("MEMOPT - GPU Memory Optimization")\n\
 print("=" * 60)\n\
-print(f"Version: {api.__version__}")\n\
-print(f"GPU: {api.get_gpu_info()["name"]}")\n\
+print("Version:", api.__version__)\n\
+gpu_info = api.get_gpu_info()\n\
+print("GPU:", gpu_info.get("name", "N/A"))\n\
 print()\n\
 print("Usage:")\n\
 print("  from memopt.profiler import api")\n\
