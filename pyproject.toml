@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memopt"
+version = "0.4.0"
+description = "GPU Memory Bandwidth Profiling & Optimization Platform"
+readme = "README.md"
+license = {text = "Proprietary"}
+authors = [
+    {name = "MemOpt Team", email = "hello@memopt.ai"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+]
+keywords = [
+    "gpu", "memory", "bandwidth", "profiling",
+    "optimization", "llm", "inference", "hbm"
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "cython>=3.0",
+    "black>=23.0.0",
+]
+
+[project.urls]
+Homepage = "https://memopt.ai"
+Documentation = "https://docs.memopt.ai"
+
+[project.scripts]
+memopt = "memopt.cli:main"
+
+[tool.setuptools]
+packages = ["memopt", "memopt.profiler", "memopt.measurement", "memopt.optimization", "memopt.validation"]
