@@ -1,137 +1,105 @@
-# Memopt: Memory Bandwidth Profiling for AI
+# Memopt: GPU Memory Optimization Platform
 
-**Professional GPU memory bandwidth profiler for LLM workloads.**
+**Professional GPU memory optimization for AI workloads.**
 
 ## The Problem
 
 AI workloads waste **60-80% of GPU time** on memory stalls. This costs companies hundreds of thousands annually in underutilized hardware.
 
-- GPUs sit idle waiting for memory
-- Redundant data transfers consume bandwidth
-- No visibility into memory access patterns
-
 ## The Solution
 
-Memopt profiles memory bandwidth usage in LLM workloads and identifies optimization opportunities with **hardware-validated proof**.
+Memopt profiles memory bandwidth usage in AI workloads and applies hardware-validated optimizations.
 
-## What We Provide
+## Features
 
-### Profiling Service ($25K-50K)
-
-| Deliverable | Description |
-|-------------|-------------|
-| **Memory Access Analysis** | Track 24,000+ accesses across all transformer layers |
-| **Hardware Validation** | Nsight Compute-compatible CSV proof files |
-| **Bottleneck Identification** | Pinpoint exactly where memory stalls occur |
-| **Optimization Roadmap** | Custom recommendations for your workload |
-
-### What You Get
-
-- 20-35% bandwidth reduction potential (typical)
-- Hardware-validated metrics (not estimates)
-- Layer-by-layer analysis
-- ROI projection based on your infrastructure
-
-## Proven Results
-
-**GPT-2 Validation on NVIDIA A100:**
-
-| Metric | Result |
-|--------|--------|
-| Memory Accesses Tracked | 24,000 |
-| Transformer Layers Hooked | 12 |
-| Cache Hit Rate | 24.9% |
-| Bandwidth Reduction Potential | **33.3%** |
-| Correctness | Verified (lossless) |
-| Test Suite | 21/21 passing |
+| Feature | Description |
+|---------|-------------|
+| **Profiler** | 3-step pipeline: profile → attribute → optimize |
+| **Daemon** | Background GPU monitoring service |
+| **Training** | Zero-code training optimization |
+| **Dashboard** | Real-time fleet monitoring |
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
+pip install memopt
 ```
 
 ### Basic Usage
 
 ```python
-from memopt import MemoryCoalescer, BandwidthTracker
+from memopt.profiler import api
 
-# Load your model
-model = load_your_model()
+model = YourModel().cuda()
+sample = torch.randn(8, 512, 1024).cuda()
 
-# Initialize profiling
-tracker = BandwidthTracker()
-coalescer = MemoryCoalescer(model, mode='inference')
-coalescer.enable()
-
-# Run workload with measurement
-with tracker.measure("inference"):
-    output = model.generate(prompt)
-
-# Get results
-stats = coalescer.get_stats()
-print(f"Accesses tracked: {stats.total_accesses:,}")
-print(f"Cache hit rate: {stats.hit_rate:.1f}%")
-print(f"Bandwidth reduction potential: {stats.bandwidth_reduction:.1f}%")
+# Optimize
+optimized_model, session = api.optimize(model, sample)
+print(f"Speedup: {session.total_speedup:.2f}x")
 ```
 
-### Run Examples
+### Daemon Mode
 
 ```bash
-# Inference profiling demo
-python examples/inference_optimization.py
+# Start background monitoring
+memopt daemon start
 
-# Training profiling demo
-python examples/training_optimization.py
+# Check status
+memopt daemon status
+
+# Stop daemon
+memopt daemon stop
 ```
 
-### Run Validation
+### Training Optimization
+
+```python
+from memopt import optimize_training
+
+@optimize_training(check_interval=100)
+def train(model, dataloader, optimizer):
+    for batch in dataloader:
+        loss = model(batch)
+        loss.backward()
+        optimizer.step()
+```
+
+### Dashboard
 
 ```bash
-# Core validation (5 tests)
-python validation/final_validation.py
-
-# Hardware validation with CSV proof
-python validation/hardware_validation.py
-
-# Full test suite (21 tests)
-python -m pytest tests/test_optimization.py -v
+cd dashboard
+docker-compose up -d
+# Access at http://localhost:3000
 ```
 
-## Technical Validation
+## Documentation
 
-See [TECHNICAL_VALIDATION.md](TECHNICAL_VALIDATION.md) for complete validation results, hardware metrics, and CSV proof files.
+See [MEMOPT_EXPLAINED.md](MEMOPT_EXPLAINED.md) for complete documentation.
 
 ## Project Structure
 
 ```
 memopt/
-├── memopt/
-│   ├── optimization/          # Core coalescing engine
-│   │   └── memory_coalescer.py
-│   ├── measurement/           # GPU bandwidth tracking
-│   │   └── bandwidth_tracker.py
-│   └── validation/            # Hardware validation
-│       └── hardware_validator.py
-├── examples/                  # Demo scripts
-├── tests/                     # Test suite (21 tests)
-└── validation/                # Proof files (CSV)
+├── memopt/                # Main package
+│   ├── profiler/          # Core optimization
+│   ├── daemon/            # Background service
+│   ├── training/          # Training wrappers
+│   ├── measurement/       # Bandwidth tracking
+│   └── validation/        # Validation tools
+├── dashboard/             # Web monitoring
+├── tests/                 # Test suite
+├── examples/              # Usage examples
+└── config/                # Configuration
 ```
 
 ## Requirements
 
 - Python 3.8+
 - PyTorch 2.0+
-- CUDA 11.0+ (for GPU profiling)
-- transformers (for LLM demos)
+- CUDA 11.0+
 
 ## License
 
 Proprietary - Contact for licensing.
-
-## Contact
-
-For pilot program inquiries and enterprise licensing.

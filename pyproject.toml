@@ -40,6 +40,11 @@ dev = [
     "cython>=3.0",
     "black>=23.0.0",
 ]
+daemon = [
+    "pynvml>=11.0.0",
+    "pyyaml>=6.0",
+    "httpx>=0.24.0",
+]
 
 [project.urls]
 Homepage = "https://memopt.ai"
@@ -49,4 +54,4 @@ Documentation = "https://docs.memopt.ai"
 memopt = "memopt.cli:main"
 
 [tool.setuptools]
-packages = ["memopt", "memopt.profiler", "memopt.measurement", "memopt.optimization", "memopt.validation"]
+packages = ["memopt", "memopt.profiler", "memopt.measurement", "memopt.optimization", "memopt.validation", "memopt.daemon", "memopt.training"]

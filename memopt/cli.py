@@ -7,11 +7,14 @@ Usage:
     memopt profile --model path/to/model.pt
     memopt info
     memopt sessions
+    memopt daemon start|stop|status|logs
 """
 
 import argparse
+import os
 import sys
 import json
+from pathlib import Path
 
 
 def cmd_info(args):
@@ -110,6 +113,129 @@ def cmd_profile(args):
     print(f"Memory-Bound: {snapshot.memory_bound_pct:.1f}%")
 
 
+def cmd_daemon(args):
+    """Daemon management commands."""
+    from memopt.daemon import MemoptDaemon, DaemonConfig
+
+    # Load config if specified
+    config = None
+    if hasattr(args, 'config') and args.config:
+        config = DaemonConfig.from_yaml(args.config)
+    else:
+        # Check default locations
+        default_config = Path(os.path.expanduser("~/.memopt/daemon_config.yaml"))
+        if default_config.exists():
+            config = DaemonConfig.from_yaml(str(default_config))
+        else:
+            config = DaemonConfig()
+
+    action = args.action
+
+    if action == "start":
+        daemon = MemoptDaemon(config)
+
+        if daemon.is_running():
+            print("Daemon is already running")
+            return
+
+        foreground = getattr(args, 'foreground', False)
+
+        if foreground:
+            print("Starting memopt daemon in foreground (Ctrl+C to stop)...")
+            daemon.start(foreground=True)
+        else:
+            print("Starting memopt daemon...")
+            daemon.start(foreground=False)
+            print(f"Daemon started (PID: {os.getpid()})")
+            print(f"Log file: {config.log_file}")
+            print("Use 'memopt daemon status' to check status")
+            print("Use 'memopt daemon stop' to stop")
+
+            # Keep main thread alive
+            import time
+            try:
+                while daemon._running:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                daemon.stop()
+
+    elif action == "stop":
+        pid = MemoptDaemon.get_running_pid(config)
+        if pid is None:
+            print("Daemon is not running")
+            return
+
+        print(f"Stopping daemon (PID: {pid})...")
+        if MemoptDaemon.stop_running(config):
+            print("Daemon stopped")
+        else:
+            print("Failed to stop daemon")
+
+    elif action == "status":
+        pid = MemoptDaemon.get_running_pid(config)
+
+        if pid is None:
+            print("Daemon is not running")
+            return
+
+        print(f"Daemon is running (PID: {pid})")
+
+        # Try to get detailed status from state file
+        state_file = Path(os.path.expanduser(config.state_file))
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+                print(f"Started: {state.get('start_time', 'unknown')}")
+                print(f"Last update: {state.get('last_update', 'unknown')}")
+                print(f"Profiled processes: {len(state.get('profiled_pids', {}))}")
+            except Exception:
+                pass
+
+        # Show current GPU state
+        try:
+            from memopt.daemon import ProcessMonitor
+            monitor = ProcessMonitor()
+            states = monitor.get_gpu_states()
+
+            print("\nGPU Status:")
+            for state in states:
+                print(f"  GPU {state.index}: {state.name}")
+                print(f"    Memory: {state.memory_used_mb:.0f}/{state.memory_total_mb:.0f} MB")
+                print(f"    Utilization: {state.utilization_pct:.0f}%")
+                print(f"    Processes: {len(state.processes)}")
+            monitor.shutdown()
+        except Exception as e:
+            print(f"Could not get GPU status: {e}")
+
+    elif action == "logs":
+        log_file = Path(os.path.expanduser(config.log_file))
+
+        if not log_file.exists():
+            print("No log file found")
+            return
+
+        lines = getattr(args, 'lines', 50)
+        follow = getattr(args, 'follow', False)
+
+        if follow:
+            # Tail -f behavior
+            import subprocess
+            try:
+                subprocess.run(["tail", "-f", str(log_file)])
+            except KeyboardInterrupt:
+                pass
+        else:
+            # Show last N lines
+            with open(log_file) as f:
+                all_lines = f.readlines()
+                for line in all_lines[-lines:]:
+                    print(line, end="")
+
+    else:
+        print(f"Unknown action: {action}")
+        print("Use: memopt daemon start|stop|status|logs")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="memopt",
@@ -138,6 +264,19 @@ def main():
     prof_parser.add_argument("--input-shape", required=True, help="Input shape (e.g., 8,512,1024)")
     prof_parser.add_argument("--iterations", type=int, default=5, help="Profile iterations")
     prof_parser.set_defaults(func=cmd_profile)
+
+    # daemon command
+    daemon_parser = subparsers.add_parser("daemon", help="Daemon management")
+    daemon_parser.add_argument("action", choices=["start", "stop", "status", "logs"],
+                               help="Daemon action")
+    daemon_parser.add_argument("--config", help="Path to config file")
+    daemon_parser.add_argument("--foreground", "-f", action="store_true",
+                               help="Run in foreground (start only)")
+    daemon_parser.add_argument("--lines", "-n", type=int, default=50,
+                               help="Number of log lines to show (logs only)")
+    daemon_parser.add_argument("--follow", "-F", action="store_true",
+                               help="Follow log output (logs only)")
+    daemon_parser.set_defaults(func=cmd_daemon)
 
     args = parser.parse_args()
 
