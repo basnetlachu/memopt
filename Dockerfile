@@ -11,7 +11,7 @@
 #   docker load < memopt-0.4.0-docker.tar.gz
 #   docker run --gpus all -v /path/to/model:/model memopt:0.4.0 python optimize.py
 
-FROM nvidia/cuda:12.1-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
 LABEL maintainer="hello@memopt.ai"
 LABEL version="0.4.0"
@@ -20,19 +20,9 @@ LABEL description="GPU Memory Optimization Platform"
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set Python alias
-RUN ln -s /usr/bin/python3.10 /usr/bin/python
-
-# Install PyTorch (CUDA 12.1)
-RUN pip install --no-cache-dir \
-    torch==2.2.0 \
-    numpy>=1.24.0
+# PyTorch base image already has Python and PyTorch installed
+# Just install numpy if needed
+RUN pip install --no-cache-dir numpy>=1.24.0
 
 # Create app directory
 WORKDIR /app

@@ -69,3 +69,8 @@ models/
 
 # Claude Code
 .claude/
+dist/
+*.tar.gz
+dist/
+.venv/
+*.tar.gz
