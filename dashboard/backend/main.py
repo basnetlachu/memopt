@@ -741,6 +741,150 @@ async def acknowledge_alert(alert_id: int, db: AsyncSession = Depends(get_sessio
 
 
 # =============================================================================
+# Bottleneck Analysis (Phase 1 Enhancement)
+# =============================================================================
+
+class BottleneckData(BaseModel):
+    kernel_name: str
+    bottleneck_type: str
+    confidence: float
+    gpu_time_pct: float
+    memory_stall_pct: float
+    dram_traffic_gb: float
+    recoverable_pct: float
+    recommendations: List[dict]
+
+
+class BottleneckReport(BaseModel):
+    server_hostname: Optional[str] = None
+    total_kernels: int
+    optimizable_kernels: int
+    total_gpu_time_ms: float
+    total_recoverable_ms: float
+    avg_memory_stall_pct: float
+    bottlenecks: List[dict]
+
+
+@app.post("/api/bottleneck/report")
+async def submit_bottleneck_report(report: BottleneckReport):
+    """Submit a bottleneck analysis report from a daemon."""
+    # Store report in session details for historical tracking
+    # Broadcast to dashboard for real-time display
+    await manager.broadcast({
+        "type": "bottleneck_report",
+        "server": report.server_hostname,
+        "total_kernels": report.total_kernels,
+        "optimizable_kernels": report.optimizable_kernels,
+        "total_gpu_time_ms": report.total_gpu_time_ms,
+        "total_recoverable_ms": report.total_recoverable_ms,
+        "avg_memory_stall_pct": report.avg_memory_stall_pct,
+        "bottlenecks": report.bottlenecks[:10],  # Top 10
+    })
+
+    return {"status": "received", "kernels_analyzed": report.total_kernels}
+
+
+@app.get("/api/bottleneck/types")
+async def get_bottleneck_types():
+    """Get bottleneck type definitions."""
+    return {
+        "types": [
+            {
+                "id": "memory_bound_dram",
+                "name": "Memory Bound (DRAM)",
+                "description": ">70% stalls on main memory. High DRAM traffic, poor cache reuse.",
+                "color": "#ef4444",  # red
+            },
+            {
+                "id": "memory_bound_cache",
+                "name": "Memory Bound (Cache)",
+                "description": "High L2 miss rate, cache thrashing. Working set exceeds cache.",
+                "color": "#f97316",  # orange
+            },
+            {
+                "id": "compute_bound",
+                "name": "Compute Bound",
+                "description": "Low stalls, high arithmetic intensity. OPTIMAL - no optimization needed.",
+                "color": "#22c55e",  # green
+            },
+            {
+                "id": "pipeline_bound_occupancy",
+                "name": "Pipeline Bound",
+                "description": "Low warp occupancy, underutilized SMs.",
+                "color": "#eab308",  # yellow
+            },
+            {
+                "id": "mixed",
+                "name": "Mixed",
+                "description": "Multiple bottlenecks present requiring multi-faceted approach.",
+                "color": "#8b5cf6",  # purple
+            },
+        ]
+    }
+
+
+class KernelCounters(BaseModel):
+    kernel_name: str
+    duration_us: float
+    dram_bytes_read: int
+    dram_bytes_write: int
+    memory_stall_ratio: float
+    sm_efficiency: float
+    achieved_occupancy: float
+    l2_hit_rate: float
+
+
+@app.post("/api/bottleneck/analyze")
+async def analyze_kernel_bottleneck(counters: KernelCounters):
+    """Analyze a single kernel's bottleneck type (stateless analysis)."""
+    # Classification thresholds
+    MEMORY_BOUND_DRAM_THRESHOLD = 0.70
+    MEMORY_BOUND_CACHE_THRESHOLD = 0.40
+    COMPUTE_BOUND_THRESHOLD = 0.60
+
+    stall_ratio = counters.memory_stall_ratio
+    l2_miss_rate = 1.0 - counters.l2_hit_rate
+    occupancy = counters.achieved_occupancy
+    sm_efficiency = counters.sm_efficiency
+
+    # Determine bottleneck type
+    if sm_efficiency > COMPUTE_BOUND_THRESHOLD and stall_ratio < 0.30:
+        bottleneck_type = "compute_bound"
+        confidence = sm_efficiency
+        recoverable_pct = 0.0
+    elif stall_ratio > MEMORY_BOUND_DRAM_THRESHOLD:
+        bottleneck_type = "memory_bound_dram"
+        confidence = stall_ratio
+        recoverable_pct = stall_ratio * 50
+    elif l2_miss_rate > MEMORY_BOUND_CACHE_THRESHOLD and stall_ratio > 0.30:
+        bottleneck_type = "memory_bound_cache"
+        confidence = l2_miss_rate
+        recoverable_pct = l2_miss_rate * 40
+    elif occupancy < 0.30:
+        bottleneck_type = "pipeline_bound_occupancy"
+        confidence = 1.0 - occupancy
+        recoverable_pct = (1.0 - occupancy) * 30
+    else:
+        bottleneck_type = "mixed"
+        confidence = 0.6
+        recoverable_pct = stall_ratio * 35
+
+    dram_traffic_gb = (counters.dram_bytes_read + counters.dram_bytes_write) / (1024**3)
+    gpu_time_ms = counters.duration_us / 1000
+
+    return {
+        "kernel_name": counters.kernel_name,
+        "bottleneck_type": bottleneck_type,
+        "confidence": confidence,
+        "gpu_time_ms": gpu_time_ms,
+        "memory_stall_pct": stall_ratio * 100,
+        "dram_traffic_gb": dram_traffic_gb,
+        "recoverable_pct": recoverable_pct,
+        "recoverable_ms": gpu_time_ms * (recoverable_pct / 100),
+    }
+
+
+# =============================================================================
 # WebSocket
 # =============================================================================
 

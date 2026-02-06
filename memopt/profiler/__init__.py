@@ -1,54 +1,77 @@
 """
-Memopt Advanced Profiler
+Memopt Advanced Profiler - Phase 1 Complete
 
-Three-step memory optimization pipeline:
-1. Continuous Profiling + Bottleneck Detection
-2. Traffic Attribution + Optimization Synthesis
-3. Adaptive Execution + Feedback Loop
+Phase 1: Continuous Memory Profiling + Bottleneck Detection
+- CUPTI-based hardware counter collection (7 critical counters)
+- 5-way bottleneck classification with confidence scores
+- Multi-factor priority scoring
+- Live performance dashboard
+- <2% profiling overhead target
 
 Usage:
-    from memopt.profiler import optimize_model_memory
+    from memopt.profiler import Phase1Profiler
 
-    # One-line optimization
-    optimized_model, session = optimize_model_memory(
-        model=model,
-        sample_input=sample_input
-    )
-    print(f"Speedup: {session.total_speedup:.2f}x")
+    profiler = Phase1Profiler()
+    report = profiler.profile_model(model, sample_input)
+    print(report)
 
-    # Or step-by-step:
-    from memopt.profiler import (
-        ContinuousProfiler,
-        TrafficAttributor,
-        AdaptiveOptimizer
-    )
-
-    # Step 1: Profile
-    profiler = ContinuousProfiler()
-    profiler.start()
-    model(inputs)
-    snapshot = profiler.snapshot()
-
-    # Step 2: Attribute
-    attributor = TrafficAttributor()
-    attributor.analyze_model(model, inputs)
-    candidates = attributor.get_optimization_candidates()
-
-    # Step 3: Optimize
-    optimizer = AdaptiveOptimizer()
-    session = optimizer.optimize(model, candidates, lambda: inputs)
+    # Get top optimization targets
+    targets = profiler.get_optimization_targets(top_n=5)
+    for t in targets:
+        print(f"{t.kernel_name}: {t.bottleneck_type.value}")
 """
 
-# Step 1: Continuous Profiling
+# Phase 1: Hardware Counter Collection
+from .hardware_counters import (
+    HardwareCounterCollector,
+    HardwareCounters,
+    KernelProfile,
+    CounterCollectionMode,
+    GPUSpec,
+    get_gpu_spec,
+    profile_model_counters,
+    counters_from_ncu,
+)
+
+# Phase 1: NCU Profiler for REAL CUPTI measurements
+from .ncu_profiler import (
+    NCUProfiler,
+    NCUCounters,
+    check_ncu_availability,
+)
+
+# Phase 1: Bottleneck Classification
+from .bottleneck_classifier import (
+    BottleneckClassifier,
+    BottleneckClassification,
+    BottleneckType,
+    Severity,
+    PriorityScore,
+    OptimizationRecommendation,
+)
+
+# Phase 1: Main Profiler
+from .phase1_profiler import (
+    Phase1Profiler,
+    ProfileReport,
+    LiveDashboard,
+    profile_model_bottlenecks,
+)
+
+# Legacy imports for backward compatibility
 from .continuous_profiler import (
     ContinuousProfiler,
-    BottleneckClassifier,
-    BottleneckType,
+    BottleneckClassifier as LegacyBottleneckClassifier,
+    BottleneckType as LegacyBottleneckType,
     BottleneckAnalysis,
     KernelMetrics,
     ProfilerSnapshot,
-    profile_model_bottlenecks,
+    profile_model_bottlenecks as legacy_profile_model_bottlenecks,
 )
+
+# Aliases for Phase 1 enhanced classes
+EnhancedBottleneckClassifier = BottleneckClassifier
+EnhancedBottleneckType = BottleneckType
 
 # Step 2: Traffic Attribution
 from .traffic_attribution import (
@@ -75,15 +98,40 @@ from .adaptive_optimizer import (
 )
 
 __all__ = [
-    # Step 1
-    "ContinuousProfiler",
+    # Phase 1: Hardware Counters
+    "HardwareCounterCollector",
+    "HardwareCounters",
+    "KernelProfile",
+    "CounterCollectionMode",
+    "GPUSpec",
+    "get_gpu_spec",
+    "profile_model_counters",
+    "counters_from_ncu",
+    # Phase 1: NCU Profiler (REAL CUPTI measurements)
+    "NCUProfiler",
+    "NCUCounters",
+    "check_ncu_availability",
+    # Phase 1: Bottleneck Classification
     "BottleneckClassifier",
+    "BottleneckClassification",
     "BottleneckType",
+    "Severity",
+    "PriorityScore",
+    "OptimizationRecommendation",
+    # Phase 1: Main Profiler
+    "Phase1Profiler",
+    "ProfileReport",
+    "LiveDashboard",
+    "profile_model_bottlenecks",
+    # Aliases
+    "EnhancedBottleneckClassifier",
+    "EnhancedBottleneckType",
+    # Legacy
+    "ContinuousProfiler",
     "BottleneckAnalysis",
     "KernelMetrics",
     "ProfilerSnapshot",
-    "profile_model_bottlenecks",
-    # Step 2
+    # Step 2: Traffic Attribution
     "TrafficAttributor",
     "Attribution",
     "AttributionType",
@@ -91,7 +139,7 @@ __all__ = [
     "OptimizationType",
     "TensorAccessPattern",
     "TensorTracker",
-    # Step 3
+    # Step 3: Adaptive Optimization
     "AdaptiveOptimizer",
     "OptimizationResult",
     "OptimizationSession",
@@ -100,6 +148,5 @@ __all__ = [
     "LayoutTransformer",
     "KernelFuser",
     "CacheOptimizer",
-    # High-level API
     "optimize_model_memory",
 ]
