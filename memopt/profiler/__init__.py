@@ -1,5 +1,5 @@
 """
-Memopt Advanced Profiler - Phase 1 Complete
+Memopt Advanced Profiler - Phase 1 + Phase 2 Complete
 
 Phase 1: Continuous Memory Profiling + Bottleneck Detection
 - CUPTI-based hardware counter collection (7 critical counters)
@@ -8,17 +8,31 @@ Phase 1: Continuous Memory Profiling + Bottleneck Detection
 - Live performance dashboard
 - <2% profiling overhead target
 
-Usage:
-    from memopt.profiler import Phase1Profiler
+Phase 2: Intelligent Traffic Attribution + Optimization Synthesis
+- Access pattern analysis (coalescing, redundant fetches, cache thrashing)
+- Optimization candidate generation with transformation rules
+- Impact score calculation combining Phase 1 + Phase 2 insights
+- Human-readable recommendations with code examples
 
-    profiler = Phase1Profiler()
-    report = profiler.profile_model(model, sample_input)
+Usage:
+    from memopt.profiler import Phase1Profiler, Phase2Profiler
+
+    # Phase 1: Detect bottlenecks
+    phase1 = Phase1Profiler()
+    report = phase1.profile_model(model, sample_input)
     print(report)
 
-    # Get top optimization targets
-    targets = profiler.get_optimization_targets(top_n=5)
-    for t in targets:
-        print(f"{t.kernel_name}: {t.bottleneck_type.value}")
+    # Phase 2: Get actionable recommendations
+    phase2 = Phase2Profiler()
+    recommendations = phase2.analyze_and_recommend(
+        kernel_name="attention",
+        ncu_metrics=ncu_data,
+        phase1_metrics=counters,
+        tensor_info={'Q': q_size, 'K': k_size, 'V': v_size},
+        gpu_name='A100',
+        total_gpu_time_ms=report.total_gpu_time_ms
+    )
+    print(recommendations)
 """
 
 # Phase 1: Hardware Counter Collection
@@ -56,6 +70,32 @@ from .phase1_profiler import (
     ProfileReport,
     LiveDashboard,
     profile_model_bottlenecks,
+)
+
+# Phase 2: Access Pattern Analysis
+from .access_pattern_analyzer import (
+    AccessPatternAnalyzer,
+    AccessPatternReport,
+    AccessPattern,
+    CoalescingAnalyzer,
+    CoalescingReport,
+    RedundantFetchAnalyzer,
+    RedundantFetchReport,
+    CacheThrashingAnalyzer,
+    CacheThrashingReport,
+)
+
+# Phase 2: Optimization Synthesis
+from .optimization_synthesis import (
+    Phase2Profiler,
+    Phase2Report,
+    OptimizationCandidateGenerator,
+    OptimizationCandidate as Phase2OptimizationCandidate,
+    OptimizationType as Phase2OptimizationType,
+    ImpactScoreCalculator,
+    ImpactScore,
+    RecommendationFormatter,
+    FormattedRecommendation,
 )
 
 # Legacy imports for backward compatibility
@@ -123,6 +163,26 @@ __all__ = [
     "ProfileReport",
     "LiveDashboard",
     "profile_model_bottlenecks",
+    # Phase 2: Access Pattern Analysis
+    "AccessPatternAnalyzer",
+    "AccessPatternReport",
+    "AccessPattern",
+    "CoalescingAnalyzer",
+    "CoalescingReport",
+    "RedundantFetchAnalyzer",
+    "RedundantFetchReport",
+    "CacheThrashingAnalyzer",
+    "CacheThrashingReport",
+    # Phase 2: Optimization Synthesis
+    "Phase2Profiler",
+    "Phase2Report",
+    "OptimizationCandidateGenerator",
+    "Phase2OptimizationCandidate",
+    "Phase2OptimizationType",
+    "ImpactScoreCalculator",
+    "ImpactScore",
+    "RecommendationFormatter",
+    "FormattedRecommendation",
     # Aliases
     "EnhancedBottleneckClassifier",
     "EnhancedBottleneckType",
@@ -131,7 +191,7 @@ __all__ = [
     "BottleneckAnalysis",
     "KernelMetrics",
     "ProfilerSnapshot",
-    # Step 2: Traffic Attribution
+    # Step 2: Traffic Attribution (legacy)
     "TrafficAttributor",
     "Attribution",
     "AttributionType",
