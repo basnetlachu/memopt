@@ -1,0 +1,122 @@
+{
+  "test_info": {
+    "model": "openai-community/gpt2-xl",
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "gpu_memory_gb": 85.093777408,
+    "batch_size": 4,
+    "seq_length": 1024,
+    "timestamp": "2026-02-07T05:10:14.093467",
+    "num_parameters": 1557611200,
+    "model_size_gb": 3.1152224,
+    "load_time_sec": 31.523354530334473
+  },
+  "phase1": {
+    "baseline_time_ms": 33.72938720008278,
+    "baseline_std_ms": 0.11754248290974635,
+    "num_bottlenecks": 4,
+    "total_recoverable_pct": 52.1,
+    "bottlenecks": [
+      {
+        "name": "Attention Layers (240 layers)",
+        "type": "MEMORY_BOUND_DRAM",
+        "gpu_time_pct": 40.0,
+        "memory_stall_pct": 65.0,
+        "recoverable_pct": 26.0,
+        "optimization": "Flash Attention"
+      },
+      {
+        "name": "MLP/FFN Layers (240 layers)",
+        "type": "MIXED",
+        "gpu_time_pct": 50.0,
+        "memory_stall_pct": 40.0,
+        "recoverable_pct": 20.0,
+        "optimization": "Kernel Fusion"
+      },
+      {
+        "name": "LayerNorm (97 layers)",
+        "type": "MEMORY_BOUND_DRAM",
+        "gpu_time_pct": 5.0,
+        "memory_stall_pct": 80.0,
+        "recoverable_pct": 4.0,
+        "optimization": "Fused LayerNorm"
+      },
+      {
+        "name": "Activation Functions (GELU/SiLU)",
+        "type": "MEMORY_BOUND_DRAM",
+        "gpu_time_pct": 3.0,
+        "memory_stall_pct": 70.0,
+        "recoverable_pct": 2.1,
+        "optimization": "Fused Activations"
+      }
+    ]
+  },
+  "phase2": {
+    "num_recommendations": 4,
+    "recommendations": [
+      {
+        "title": "Replace Attention with Fused Implementation",
+        "target": "Attention Layers (240 layers)",
+        "expected_impact_pct": 20.8,
+        "priority": "HIGH",
+        "available": true,
+        "action": "flash_attention"
+      },
+      {
+        "title": "Apply Kernel Fusion via torch.compile",
+        "target": "MLP/FFN Layers (240 layers)",
+        "expected_impact_pct": 10.0,
+        "priority": "MEDIUM",
+        "available": true,
+        "action": "torch_compile"
+      },
+      {
+        "title": "Fuse LayerNorm with Adjacent Operations",
+        "target": "LayerNorm (97 layers)",
+        "expected_impact_pct": 2.4,
+        "priority": "MEDIUM",
+        "available": true,
+        "action": "fused_layernorm"
+      },
+      {
+        "title": "Fuse Activation Functions",
+        "target": "Activation Functions (GELU/SiLU)",
+        "expected_impact_pct": 1.05,
+        "priority": "LOW",
+        "available": true,
+        "action": "fused_activation"
+      }
+    ],
+    "backends": {
+      "flash_attn": true,
+      "sdpa": true,
+      "xformers": false,
+      "triton": true,
+      "torch_compile": true
+    }
+  },
+  "phase3": {
+    "original_baseline_ms": 33.72938720008278,
+    "final_time_ms": 31.022683299988785,
+    "speedup_factor": 1.0872491871164147,
+    "speedup_pct": 8.024764529630575,
+    "applied_optimizations": [
+      {
+        "name": "torch.compile (reduce-overhead)",
+        "speedup_pct": 8.024764529630575,
+        "time_ms": 31.022683299988785
+      }
+    ],
+    "failed_optimizations": []
+  },
+  "summary": {
+    "baseline_time_ms": 33.72938720008278,
+    "optimized_time_ms": 31.022683299988785,
+    "speedup_factor": 1.0872491871164147,
+    "speedup_pct": 8.024764529630575,
+    "bottlenecks_detected": 4,
+    "recoverable_gpu_time_pct": 52.1,
+    "optimizations_applied": 1,
+    "optimizations_failed": 0,
+    "achieved_vs_predicted": 15.402619058791892
+  }
+}

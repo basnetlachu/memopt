@@ -1,8 +1,12 @@
 """
-Memopt: Memory Bandwidth Profiling for AI
+Memopt: Memory Bandwidth Profiling and Auto-Optimization for AI
 
 Professional GPU memory bandwidth profiler for LLM workloads.
-Identifies optimization opportunities and provides hardware-validated proof.
+Identifies optimization opportunities and automatically applies fixes.
+
+Phase 1: Hardware Counter Collection + Bottleneck Detection
+Phase 2: Access Pattern Analysis + Optimization Recommendations
+Phase 3: Auto-Optimization Engine + Custom Kernel Library
 
 Usage:
     from memopt import MemoryCoalescer, BandwidthTracker
@@ -18,6 +22,13 @@ Usage:
     stats = coalescer.get_stats()
     print(f"Hit rate: {stats.hit_rate:.1f}%")
     print(f"Bandwidth reduction potential: {stats.bandwidth_reduction:.1f}%")
+
+Phase 3 Auto-Optimization:
+    from memopt.phase3 import AutoOptimizer
+
+    optimizer = AutoOptimizer()
+    result = optimizer.optimize(model, inputs)
+    print(f"Speedup: {result.speedup_pct:.1f}%")
 
 Training Optimization:
     from memopt import optimize_training, auto_optimize
