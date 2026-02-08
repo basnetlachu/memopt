@@ -1,36 +1,242 @@
-# memopt - Complete Guide
+# memopt - GPU Memory Optimization Platform
 
 ## What is memopt?
 
-**memopt** is a GPU memory optimization platform for PyTorch models. It automatically finds and fixes memory bottlenecks in your neural networks to make them run faster.
+**memopt** is a production-grade GPU memory optimization platform for PyTorch models. It automatically profiles, analyzes, and optimizes memory bottlenecks in neural networks using a 3-phase pipeline validated on real hardware.
 
 ### The Problem It Solves
 
-When you run a neural network on a GPU, there are two types of operations:
-1. **Compute operations** - Math like matrix multiplication
-2. **Memory operations** - Moving data between GPU memory and compute units
+Modern GPUs are compute monsters but often starve waiting for data. When a neural network runs:
+- **Compute operations** (matrix multiplication, convolutions) are blazing fast
+- **Memory operations** (loading weights, activations) become the bottleneck
 
-Modern GPUs are so fast at math that they often wait for data to arrive from memory. This is called being **"memory-bound"**. memopt identifies where your model is memory-bound and applies optimizations to reduce memory traffic.
+This is called being **"memory-bound"**. memopt identifies exactly where your model is memory-bound and applies targeted optimizations.
 
-### Simple Analogy
+### Real-World Results
 
-Think of a GPU like a super-fast chef (compute) with a slow delivery person (memory). The chef can cook instantly, but has to wait for ingredients to arrive. memopt is like hiring a better delivery service - it:
-- Pre-fetches ingredients before needed
-- Packs multiple deliveries together
-- Keeps frequently-used ingredients on the counter (cache)
+| Model | GPU | Baseline | Optimized | Speedup |
+|-------|-----|----------|-----------|---------|
+| GPT-2 XL (1.56B) | A100-80GB | 33.73ms | 31.02ms | **1.09× (8.0%)** |
 
 ---
 
-## Features Overview
+## Architecture: The 3-Phase Pipeline
 
-memopt provides four main components:
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           memopt 3-Phase Pipeline                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐          │
+│  │    PHASE 1      │   │    PHASE 2      │   │    PHASE 3      │          │
+│  │                 │   │                 │   │                 │          │
+│  │  Hardware       │──►│  Access Pattern │──►│  Auto-Optimize  │          │
+│  │  Profiling      │   │  Analysis       │   │  Engine         │          │
+│  │                 │   │                 │   │                 │          │
+│  │  • NCU/CUPTI    │   │  • Coalescing   │   │  • Test-Measure │          │
+│  │  • 7 counters   │   │  • Redundancy   │   │  • Commit/Roll  │          │
+│  │  • 5 bottleneck │   │  • Thrashing    │   │  • Custom Kernels│         │
+│  │    types        │   │  • 6 rules      │   │  • Flash Attn   │          │
+│  └─────────────────┘   └─────────────────┘   └─────────────────┘          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-| Component | Purpose |
-|-----------|---------|
-| **Profiler** | Core optimization pipeline (profile → attribute → optimize) |
-| **Daemon** | Background GPU monitoring service |
-| **Training Wrapper** | Automatic training optimization with zero code changes |
-| **Dashboard** | Real-time fleet monitoring web interface |
+---
+
+## Phase 1: Hardware Counter Collection + Bottleneck Detection
+
+Phase 1 uses **real hardware counters** via NVIDIA's NCU/CUPTI to measure actual GPU behavior.
+
+### Hardware Counters Collected
+
+| Counter | What It Measures |
+|---------|------------------|
+| `dram_bytes_read` | Bytes read from HBM/DRAM |
+| `dram_bytes_write` | Bytes written to HBM/DRAM |
+| `l2_hit_rate` | L2 cache efficiency |
+| `memory_stall_pct` | % cycles waiting for memory |
+| `compute_stall_pct` | % cycles waiting for compute |
+| `achieved_occupancy` | SM utilization |
+| `gpu_time_ms` | Kernel execution time |
+
+### 5-Way Bottleneck Classification
+
+```python
+class BottleneckType(Enum):
+    MEMORY_BOUND_DRAM = "memory_bound_dram"      # Bandwidth limited
+    MEMORY_BOUND_CACHE = "memory_bound_cache"    # Cache thrashing
+    COMPUTE_BOUND = "compute_bound"              # Math limited
+    PIPELINE_BOUND_OCCUPANCY = "pipeline_bound"  # Low occupancy
+    MIXED = "mixed"                              # Multiple issues
+```
+
+### Usage
+
+```python
+from memopt.profiler import Phase1Profiler
+
+profiler = Phase1Profiler()
+report = profiler.profile_model(model, sample_input)
+
+print(f"Total GPU Time: {report.total_gpu_time_ms:.2f}ms")
+for bottleneck in report.bottlenecks:
+    print(f"  {bottleneck.kernel_name}: {bottleneck.bottleneck_type}")
+```
+
+---
+
+## Phase 2: Access Pattern Analysis + Optimization Synthesis
+
+Phase 2 analyzes **why** memory bottlenecks occur and generates actionable recommendations.
+
+### Access Pattern Analyzers
+
+| Analyzer | What It Detects |
+|----------|-----------------|
+| `CoalescingAnalyzer` | Strided/scattered memory access |
+| `RedundantFetchAnalyzer` | Same data loaded multiple times |
+| `CacheThrashingAnalyzer` | Working set exceeds L2 cache |
+
+### 6 Optimization Rules
+
+| Rule | Trigger | Fix |
+|------|---------|-----|
+| `uncoalesced_strided` | Coalescing < 60% | Layout transpose |
+| `redundant_fetch` | Reuse ratio > 2.5× | Cache pinning / Flash Attention |
+| `cache_thrashing` | Working set > L2 | Tiling |
+| `scattered_access` | Coalescing < 40% | Shared memory staging |
+| `random_access` | Coalescing < 25% | Gather optimization |
+| `low_cache_hit` | L2 hit < 50% | Prefetching |
+
+### Impact Score Calculation
+
+```
+Impact = TimeWeight × Inefficiency × log(TrafficGB)
+
+Where:
+- TimeWeight = kernel_time / total_time (0-100%)
+- Inefficiency = memory_stall_pct / 100 (0-1)
+- TrafficGB = DRAM bytes / 1e9
+```
+
+### Usage
+
+```python
+from memopt.profiler import Phase2Profiler
+
+phase2 = Phase2Profiler()
+report = phase2.analyze_and_recommend(
+    kernel_name="attention",
+    ncu_metrics=metrics,
+    phase1_metrics=counters,
+    tensor_info={'Q': q_size, 'K': k_size, 'V': v_size},
+    gpu_name='A100',
+    total_gpu_time_ms=100.0
+)
+
+print(report)  # Formatted recommendations with code examples
+```
+
+---
+
+## Phase 3: Auto-Optimization Engine + Custom Kernel Library
+
+Phase 3 **automatically applies** optimizations with safety checks and rollback.
+
+### Test-Measure-Commit Loop
+
+```
+For each optimization candidate:
+    1. BASELINE: Measure current performance (10 iterations)
+    2. APPLY: Apply the optimization transformation
+    3. VALIDATE: Verify outputs match (rtol=1e-3, atol=1e-5)
+    4. MEASURE: Profile optimized version (10 iterations)
+    5. DECIDE:
+       - speedup > 5% → COMMIT
+       - regression > 5% → ROLLBACK
+       - otherwise → SKIP (within noise)
+```
+
+### Available Transformations
+
+| Transformation | What It Does |
+|----------------|--------------|
+| `flash_attention` | Replace attention with Flash Attention/SDPA |
+| `layout_transpose` | Optimize memory layout (channels_last) |
+| `kernel_fusion` | Fuse ops via torch.compile |
+| `cache_pinning` | Keep hot data in L2 cache |
+| `prefetch` | Overlap data loading with compute |
+
+### Custom Kernel Registry
+
+```python
+from memopt.phase3 import kernel_registry, fused_attention
+
+# Check available backends
+print(f"Flash Attention: {kernel_registry.has_flash_attn}")
+print(f"PyTorch SDPA: {kernel_registry.has_sdpa}")
+print(f"xFormers: {kernel_registry.has_xformers}")
+print(f"Triton: {kernel_registry.has_triton}")
+
+# Use fused attention (auto-selects best backend)
+output = fused_attention(query, key, value, is_causal=True)
+```
+
+### Usage
+
+```python
+from memopt.phase3 import AutoOptimizer
+
+optimizer = AutoOptimizer(tolerance_pct=5.0)
+result = optimizer.optimize(model, inputs)
+
+print(f"Speedup: {result.speedup_pct:.1f}%")
+print(f"Applied: {result.applied_optimizations}")
+```
+
+---
+
+## Production Test Results
+
+### Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Model | GPT-2 XL (openai-community/gpt2-xl) |
+| Parameters | 1.56B |
+| GPU | NVIDIA A100-SXM4-80GB |
+| GPU Memory | 85.1 GB |
+| Batch Size | 4 |
+| Sequence Length | 1024 |
+
+### Bottlenecks Detected
+
+| Component | Type | GPU Time | Recoverable |
+|-----------|------|----------|-------------|
+| Attention Layers (240) | MEMORY_BOUND_DRAM | 40.0% | 26.0% |
+| MLP/FFN Layers (240) | MIXED | 50.0% | 20.0% |
+| LayerNorm (97) | MEMORY_BOUND_DRAM | 5.0% | 4.0% |
+| Activations (GELU) | MEMORY_BOUND_DRAM | 3.0% | 2.1% |
+
+### Optimization Results
+
+| Metric | Value |
+|--------|-------|
+| Baseline Time | 33.73ms |
+| Optimized Time | 31.02ms |
+| **Speedup** | **1.09× (8.0%)** |
+| Optimizations Applied | 1 (torch.compile) |
+
+### Available Backends
+
+| Backend | Status |
+|---------|--------|
+| Flash Attention | ✓ |
+| PyTorch SDPA | ✓ |
+| Triton | ✓ |
+| torch.compile | ✓ |
+| xFormers | ✗ |
 
 ---
 
@@ -38,524 +244,159 @@ memopt provides four main components:
 
 ```
 memopt/
-├── memopt/                     # Main package
-│   ├── __init__.py            # Package entry point
-│   ├── cli.py                 # CLI commands
-│   ├── profiler/              # Core optimization logic
-│   │   ├── continuous_profiler.py   # GPU profiling
-│   │   ├── traffic_attribution.py   # Bottleneck analysis
-│   │   ├── adaptive_optimizer.py    # Apply optimizations
-│   │   ├── config.py                # Configuration
-│   │   ├── gpu_profiles.py          # GPU-specific settings
-│   │   ├── hardware_metrics.py      # Hardware counters
-│   │   ├── session_persistence.py   # Save/load sessions
-│   │   ├── multi_gpu.py             # Multi-GPU support
-│   │   └── api.py                   # Public API
-│   ├── daemon/                # Background monitoring
-│   │   ├── daemon_service.py        # Main daemon
-│   │   ├── process_monitor.py       # GPU process detection
-│   │   ├── scheduler.py             # Safe optimization scheduler
-│   │   └── reporter.py              # Dashboard integration
-│   ├── training/              # Training optimization
-│   │   ├── wrapper.py               # Decorator & context manager
-│   │   ├── hooks.py                 # Framework hooks
-│   │   ├── gradient_validator.py    # Gradient validation
-│   │   └── convergence_monitor.py   # Training monitoring
-│   ├── measurement/           # Bandwidth tracking
-│   └── validation/            # Validation tools
-├── dashboard/                 # Web monitoring dashboard
-│   ├── backend/               # FastAPI backend
-│   └── frontend/              # React frontend
-├── tests/                     # Test suite
-├── examples/                  # Usage examples
-├── config/                    # Configuration files
-└── docker/                    # Docker deployment
+├── memopt/
+│   ├── __init__.py
+│   ├── profiler/                    # Phase 1 + Phase 2
+│   │   ├── hardware_counters.py     # CUPTI counter collection
+│   │   ├── ncu_profiler.py          # NCU integration
+│   │   ├── bottleneck_classifier.py # 5-way classification
+│   │   ├── phase1_profiler.py       # Phase 1 main class
+│   │   ├── access_pattern_analyzer.py # Coalescing, redundancy, thrashing
+│   │   ├── optimization_synthesis.py  # Rules, impact, recommendations
+│   │   └── __init__.py
+│   ├── phase3/                      # Phase 3
+│   │   ├── optimization_executor.py # Test-measure-commit loop
+│   │   ├── optimization_sequencer.py # Multi-optimization application
+│   │   ├── transformations.py       # Flash Attention, Layout, Fusion
+│   │   ├── kernel_registry.py       # Custom kernel library
+│   │   ├── auto_optimizer.py        # Main entry point
+│   │   └── __init__.py
+│   ├── training/                    # Training optimization
+│   ├── daemon/                      # Background monitoring
+│   └── measurement/                 # Bandwidth tracking
+├── tests/
+│   ├── test_phase1_no_torch.py      # Phase 1 structure tests
+│   ├── test_phase2_comprehensive.py # Phase 2 validation
+│   ├── test_phase3_comprehensive.py # Phase 3 validation
+│   ├── test_real_counters.py        # Real GPU tests
+│   └── test_production_e2e.py       # Production E2E test
+└── gpt2xl_test/                     # Production test results
+    ├── production_test_report.json
+    └── production_test_report.md
 ```
 
 ---
 
-## 1. Core Profiler - The 3-Step Pipeline
+## Quick Start
 
+### Installation
+
+```bash
+pip install torch transformers
+pip install flash-attn --no-build-isolation  # Optional: for Flash Attention
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   1. PROFILE    │ ──► │  2. ATTRIBUTE   │ ──► │   3. OPTIMIZE   │
-│                 │     │                 │     │                 │
-│ Measure memory  │     │ Find which ops  │     │ Apply fixes and │
-│ traffic & time  │     │ cause problems  │     │ verify speedup  │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
-
-### Step 1: Profile
-- Runs your model and measures GPU time
-- Tracks memory allocations and access patterns
-- Identifies if model is memory-bound or compute-bound
-
-### Step 2: Attribute
-- Analyzes which layers/operations cause memory bottlenecks
-- Looks for patterns like:
-  - Cache thrashing (data too big for L2 cache)
-  - Redundant memory fetches (same data loaded multiple times)
-  - Poor memory layout (non-contiguous tensors)
-
-### Step 3: Optimize
-- Applies potential fixes one by one
-- Measures if each fix actually helps
-- Keeps good optimizations, rolls back bad ones
-- Uses statistical validation (not just one measurement)
 
 ### Basic Usage
 
 ```python
-import torch
-from memopt.profiler import api
+from memopt.phase3 import AutoOptimizer
 
-# Your model
-model = MyModel().cuda()
-sample = torch.randn(8, 512, 1024).cuda()
+# Load your model
+model = YourModel().cuda()
+inputs = {'input_ids': torch.randint(0, 50000, (4, 512)).cuda()}
 
-# Optimize it
-optimized_model, session = api.optimize(
-    model=model,
-    sample_input=sample,
-    verbose=True
+# Optimize
+optimizer = AutoOptimizer()
+result = optimizer.optimize(model, inputs)
+
+print(f"Speedup: {result.speedup_pct:.1f}%")
+```
+
+### Full Pipeline (Phase 1 → 2 → 3)
+
+```python
+from memopt.profiler import Phase1Profiler, Phase2Profiler
+from memopt.phase3 import AutoOptimizer
+
+# Phase 1: Profile
+phase1 = Phase1Profiler()
+bottlenecks = phase1.profile_model(model, inputs)
+
+# Phase 2: Analyze
+phase2 = Phase2Profiler()
+recommendations = phase2.analyze_and_recommend(...)
+
+# Phase 3: Optimize
+optimizer = AutoOptimizer()
+result = optimizer.optimize_from_report(model, inputs, recommendations)
+```
+
+---
+
+## GPU-Specific Profiles
+
+| GPU | L2 Cache | Memory BW | Recommended |
+|-----|----------|-----------|-------------|
+| A100-80GB | 40 MB | 2039 GB/s | max-autotune |
+| A100-40GB | 40 MB | 1555 GB/s | max-autotune |
+| H100-80GB | 50 MB | 3350 GB/s | max-autotune |
+| A6000 | 6 MB | 768 GB/s | reduce-overhead |
+| RTX 4090 | 72 MB | 1008 GB/s | reduce-overhead |
+
+---
+
+## Key Concepts
+
+### Arithmetic Intensity (Roofline Model)
+
+```
+Arithmetic Intensity = FLOPs / Bytes
+
+Ridge Point (A100 FP32) = 19.5 TFLOPS / 2039 GB/s ≈ 9.6 FLOPS/byte
+
+If AI < Ridge Point → Memory-bound
+If AI > Ridge Point → Compute-bound
+```
+
+### Cumulative Speedup
+
+When applying multiple optimizations:
+
+```
+Total = 1 - (1 - Speedup1/100) × (1 - Speedup2/100) × ...
+
+Example: 20% then 10% = 1 - (0.8 × 0.9) = 28% total (not 30%)
+```
+
+### Correctness Validation
+
+All optimizations are validated:
+
+```python
+# Must pass before optimization is committed
+assert torch.allclose(
+    original_output,
+    optimized_output,
+    rtol=1e-3,
+    atol=1e-5
 )
-
-print(f"Speedup: {session.total_speedup:.2f}x")
 ```
-
----
-
-## 2. Daemon Mode - Background GPU Monitoring
-
-The daemon runs as a background service that continuously monitors GPU workloads and applies safe optimizations.
-
-### Features
-- **Process Detection**: Monitors GPU processes using NVML
-- **Non-invasive Profiling**: Collects GPU stats without injecting into processes
-- **Safe Optimization Scheduling**: Only optimizes when GPU utilization allows
-- **Dashboard Integration**: Reports metrics to centralized dashboard
-
-### CLI Commands
-
-```bash
-# Start daemon
-memopt daemon start
-
-# Start in foreground (for debugging)
-memopt daemon start --foreground
-
-# Check status
-memopt daemon status
-
-# Stop daemon
-memopt daemon stop
-
-# View logs
-memopt daemon logs
-memopt daemon logs --follow  # Stream logs
-```
-
-### Configuration
-
-**~/.memopt/daemon_config.yaml:**
-```yaml
-poll_interval: 5.0          # Seconds between checks
-stability_threshold: 3      # Checks before profiling
-auto_optimize: false        # Auto-apply optimizations
-log_level: INFO
-dashboard_url: http://dashboard:8000  # Dashboard API
-dashboard_report_interval: 10.0
-```
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     MemoptDaemon                             │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │ProcessMonitor│  │  Scheduler   │  │DashboardReporter │  │
-│  │              │  │              │  │                  │  │
-│  │ - GPU states │  │ - Safe times │  │ - HTTP client    │  │
-│  │ - Processes  │  │ - Throttling │  │ - Heartbeats     │  │
-│  │ - Stability  │  │              │  │ - Alerts         │  │
-│  └──────────────┘  └──────────────┘  └──────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. Training Wrapper - Zero-Code Training Optimization
-
-Automatic training optimization with gradient validation and convergence monitoring.
-
-### Decorator Usage
-
-```python
-from memopt import optimize_training
-
-@optimize_training(
-    check_interval=100,      # Steps between checks
-    rollback_on_divergence=True,
-    min_improvement=0.05,    # 5% minimum speedup
-)
-def train(model, dataloader, optimizer):
-    for batch in dataloader:
-        loss = model(batch)
-        loss.backward()
-        optimizer.step()
-```
-
-### Context Manager Usage
-
-```python
-from memopt import auto_optimize
-
-model = MyModel().cuda()
-optimizer = torch.optim.Adam(model.parameters())
-
-with auto_optimize(model, check_interval=100) as ctx:
-    for epoch in range(10):
-        for batch in dataloader:
-            loss = model(batch)
-            loss.backward()
-            optimizer.step()
-
-            # Report loss for convergence monitoring
-            ctx.report_loss(loss.item())
-```
-
-### Framework Hooks
-
-Automatic integration with popular frameworks:
-
-```python
-from memopt.training.hooks import (
-    PyTorchHook,
-    LightningHook,
-    HuggingFaceHook,
-    AccelerateHook,
-)
-
-# PyTorch Lightning
-hook = LightningHook(check_interval=100)
-trainer = pl.Trainer(callbacks=[hook.as_callback()])
-
-# HuggingFace Trainer
-hook = HuggingFaceHook(check_interval=100)
-trainer = Trainer(callbacks=[hook.as_callback()])
-
-# Accelerate
-hook = AccelerateHook(accelerator, check_interval=100)
-```
-
-### Features
-
-| Feature | Description |
-|---------|-------------|
-| **Gradient Validation** | Ensures gradients flow correctly after optimization |
-| **Convergence Monitoring** | Detects divergence and automatically rolls back |
-| **Automatic Rollback** | Reverts bad optimizations to preserve training |
-| **Framework Support** | PyTorch, Lightning, HuggingFace, Accelerate |
-
----
-
-## 4. Dashboard - Fleet Monitoring
-
-Real-time GPU optimization monitoring across your entire fleet.
-
-### Quick Start
-
-```bash
-cd dashboard
-docker-compose up -d
-```
-
-Access at http://localhost:3000
-
-### Architecture
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   GPU Server 1  │     │   GPU Server 2  │     │   GPU Server N  │
-│  memopt daemon  │     │  memopt daemon  │     │  memopt daemon  │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │    Dashboard Backend    │
-                    │       (FastAPI)         │
-                    │    - REST API           │
-                    │    - WebSocket          │
-                    │    - SQLite DB          │
-                    └────────────┬────────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │   Dashboard Frontend    │
-                    │       (React)           │
-                    │    - Fleet Overview     │
-                    │    - Server Details     │
-                    │    - Training Runs      │
-                    │    - Session History    │
-                    │    - Alerts             │
-                    └─────────────────────────┘
-```
-
-### Connecting Daemons
-
-Configure each GPU server's daemon to report to the dashboard:
-
-```yaml
-# ~/.memopt/daemon_config.yaml
-dashboard_url: http://dashboard-server:8000
-dashboard_report_interval: 10.0
-```
-
-Or via environment variable:
-```bash
-export MEMOPT_DASHBOARD_URL=http://dashboard-server:8000
-memopt daemon start
-```
-
-### API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/fleet/overview` | GET | Aggregate fleet statistics |
-| `/api/servers` | GET/POST | List/register servers |
-| `/api/servers/{hostname}/heartbeat` | POST | Update server metrics |
-| `/api/sessions` | GET/POST | List/create sessions |
-| `/api/training` | GET/POST | Training runs |
-| `/api/alerts` | GET/POST | Alerts |
-| `/ws` | WebSocket | Real-time updates |
-
-### Frontend Pages
-
-1. **Fleet Overview** - Dashboard home with aggregate stats
-2. **Servers** - Detailed view of each GPU server
-3. **Training Runs** - Active and recent training progress
-4. **Session History** - Searchable optimization log
-5. **Alerts** - System alerts and notifications
-
-### Tech Stack
-
-- **Backend:** FastAPI, SQLAlchemy, WebSockets
-- **Frontend:** React, Recharts, TailwindCSS, Vite
-- **Database:** SQLite (can be swapped for PostgreSQL)
-- **Container:** Docker, Docker Compose
-
----
-
-## Core Files Explained
-
-### continuous_profiler.py - The Profiler
-
-**Purpose:** Measures what your model is doing on the GPU.
-
-```python
-profiler = ContinuousProfiler()
-profiler.start()
-
-with profiler.profile_region("forward"):
-    output = model(input)
-
-profiler.stop()
-snapshot = profiler.snapshot()
-
-# snapshot contains:
-# - total_gpu_time_ms: How long GPU spent working
-# - memory_bound_pct: % of time waiting for memory
-# - total_dram_bytes: How much memory was accessed
-```
-
-### traffic_attribution.py - The Analyzer
-
-**Purpose:** Figures out WHICH parts of your model cause memory problems.
-
-```python
-attributor = TrafficAttributor()
-attributor.analyze_model(model, sample_input)
-
-candidates = attributor.get_optimization_candidates()
-# Returns optimization suggestions
-```
-
-**Optimization Types:**
-
-| Type | What It Fixes |
-|------|---------------|
-| `CACHE_RESIDENCY` | Keep hot data in cache |
-| `KERNEL_FUSION` | Combine operations to reduce memory reads |
-| `LAYOUT_TRANSFORM` | Make memory layout more efficient |
-| `TILING` | Process data in cache-sized chunks |
-| `PREFETCH_INJECTION` | Load data before it's needed |
-
-### adaptive_optimizer.py - The Optimizer
-
-**Purpose:** Applies optimizations and verifies they work.
-
-```python
-optimizer = AdaptiveOptimizer()
-
-session = optimizer.optimize(
-    model=model,
-    candidates=candidates,
-    input_fn=lambda: torch.randn(8, 512).cuda(),
-    num_warmup=5,
-    num_measure=20,
-)
-
-# session contains:
-# - total_speedup: e.g., 1.73x faster
-# - committed_count: How many optimizations worked
-# - rollback_count: How many were reverted
-```
-
-**The Test-Measure-Commit Loop:**
-
-```
-For each optimization candidate:
-    1. SAVE current model state (checkpoint)
-    2. MEASURE baseline performance (20 runs)
-    3. APPLY the optimization
-    4. VERIFY semantics (output still matches)
-    5. MEASURE new performance (20 runs)
-    6. DECIDE:
-       - If faster AND significant → COMMIT
-       - If slower OR breaks output → ROLLBACK
-```
-
----
-
-## GPU-Specific Settings
-
-Different GPUs have different optimal settings:
-
-```python
-_GPU_PROFILES = {
-    "A100": GPUProfile(
-        l2_cache_mb=40,
-        memory_bandwidth_gbps=2039,
-        enable_tf32=True,
-        preferred_compile_mode="reduce-overhead",
-    ),
-    "H100": GPUProfile(
-        l2_cache_mb=50,
-        memory_bandwidth_gbps=3350,
-        ...
-    ),
-    "T4": GPUProfile(
-        l2_cache_mb=4,
-        enable_tf32=False,  # Turing doesn't have TF32
-        ...
-    ),
-}
-
-# Auto-detect and apply
-profile = get_gpu_profile()
-apply_gpu_profile(profile)
-```
-
----
-
-## What Optimizations Does It Apply?
-
-### 1. cuDNN Benchmark + TF32
-```python
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-```
-**Effect:** 10-30% speedup on Ampere+ GPUs
-
-### 2. torch.compile
-```python
-model = torch.compile(model, mode="reduce-overhead")
-```
-**Effect:** Fuses kernels, 20-100% speedup
-
-### 3. Memory Layout
-```python
-for param in model.parameters():
-    param.data = param.data.contiguous()
-model = model.to(memory_format=torch.channels_last)
-```
-**Effect:** Removes strided access overhead
-
-### 4. Gradient Checkpointing
-```python
-model.gradient_checkpointing_enable()
-```
-**Effect:** Trades compute for memory
-
----
-
-## Key Metrics
-
-### Coefficient of Variation (CV)
-```
-CV = (standard_deviation / mean) × 100%
-```
-- **< 5%:** Excellent measurement stability
-- **5-10%:** Good
-- **> 10%:** Noisy, results may be unreliable
-
-### Speedup
-```
-Speedup = baseline_time / optimized_time
-```
-- **1.0x:** No improvement
-- **1.5x:** 50% faster
-- **2.0x:** Twice as fast
-
----
-
-## Installation
-
-```bash
-pip install memopt
-```
-
-Or from source:
-```bash
-git clone https://github.com/your-org/memopt.git
-cd memopt
-pip install -e .
-```
-
-## Requirements
-
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.0+ (for GPU profiling)
-- pynvml (for NVML access)
-
-Optional:
-- httpx (for dashboard integration)
-- PyYAML (for config files)
 
 ---
 
 ## Summary
 
-**memopt** is a comprehensive GPU memory optimization platform:
+**memopt** is a 3-phase GPU memory optimization platform:
 
-1. **Profiler** → Measure, analyze, and optimize memory traffic
-2. **Daemon** → Background monitoring and safe optimization
-3. **Training Wrapper** → Zero-code training optimization
-4. **Dashboard** → Fleet-wide monitoring and visibility
+| Phase | Purpose | Key Components |
+|-------|---------|----------------|
+| **Phase 1** | Hardware profiling | NCU/CUPTI, 7 counters, 5 bottleneck types |
+| **Phase 2** | Access pattern analysis | Coalescing, redundancy, thrashing, 6 rules |
+| **Phase 3** | Auto-optimization | Test-measure-commit, Flash Attention, torch.compile |
 
-It uses:
-- Statistical validation (not single measurements)
-- Semantic verification (outputs must match)
-- Automatic rollback (bad optimizations are reverted)
-- GPU-specific tuning (A100 vs T4 vs H100)
-- Session persistence (results are saved)
+### Validated Results
 
-**Best for:** Large models (> 10M params) on memory-bound workloads.
+- **Model:** GPT-2 XL (1.56B parameters)
+- **GPU:** NVIDIA A100-SXM4-80GB
+- **Speedup:** **1.09× (8.0%)**
+- **Optimizations Applied:** torch.compile (reduce-overhead)
 
-**Typical speedup:** 1.1x - 3.8x depending on model and GPU.
+### Best For
+
+- Large transformer models (> 1B parameters)
+- Memory-bound workloads (attention, large activations)
+- Production inference and training
 
 ---
 
-*Document generated for memopt v0.4.0*
+*memopt v1.0.0 - Validated on A100-80GB with GPT-2 XL*
