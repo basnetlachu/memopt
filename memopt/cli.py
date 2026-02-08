@@ -5,6 +5,7 @@ memopt CLI - Command Line Interface
 Usage:
     memopt optimize --model path/to/model.pt --input-shape 8,512,1024
     memopt profile --model path/to/model.pt
+    memopt analyze --model path/to/model.pt --input-shape 8,512,1024 --format html
     memopt info
     memopt sessions
     memopt daemon start|stop|status|logs
@@ -111,6 +112,75 @@ def cmd_profile(args):
     print("=" * 50)
     print(f"Total GPU Time: {snapshot.total_gpu_time_ms:.2f} ms")
     print(f"Memory-Bound: {snapshot.memory_bound_pct:.1f}%")
+
+
+def cmd_analyze(args):
+    """Analyze a model and generate optimization report with ROI."""
+    import torch
+    from memopt.workflows import AnalyzeWorkflow
+
+    print(f"Loading model from: {args.model}")
+
+    # Parse input shape
+    shape = [int(x) for x in args.input_shape.split(",")]
+    print(f"Input shape: {shape}")
+
+    # Load model
+    try:
+        model = torch.load(args.model, weights_only=False)
+    except Exception as e:
+        # Try loading as JIT model
+        print(f"Trying to load as TorchScript: {e}")
+        model = torch.jit.load(args.model)
+
+    # Move to GPU if available
+    if torch.cuda.is_available():
+        model = model.cuda()
+        sample = torch.randn(*shape).cuda()
+    else:
+        sample = torch.randn(*shape)
+
+    # Get model name from file path
+    model_name = Path(args.model).stem
+
+    # Create workflow with fleet parameters
+    workflow = AnalyzeWorkflow(
+        gpu_count=args.gpu_count,
+        gpu_cost_per_hour=args.gpu_cost,
+        verbose=True
+    )
+
+    # Run analysis
+    result = workflow.analyze(
+        model=model,
+        sample_input=sample,
+        model_name=model_name,
+        output_format=args.format,
+        output_path=args.output,
+        num_iterations=args.iterations
+    )
+
+    if not result.success:
+        print(f"\nAnalysis failed: {result.error}")
+        sys.exit(1)
+
+    # Print output based on format
+    if args.format == 'text' and result.output_text:
+        print(result.output_text)
+    elif args.format == 'json' and result.output_json:
+        print(result.output_json)
+    elif args.format == 'html' and result.output_html:
+        if args.output:
+            print(f"\nHTML report saved to: {args.output}")
+        else:
+            # Save to default location
+            output_path = Path(f"./{model_name}_report.html")
+            output_path.write_text(result.output_html)
+            print(f"\nHTML report saved to: {output_path}")
+
+    # Print ROI summary
+    if result.roi_report:
+        print(result.roi_report)
 
 
 def cmd_daemon(args):
@@ -264,6 +334,21 @@ def main():
     prof_parser.add_argument("--input-shape", required=True, help="Input shape (e.g., 8,512,1024)")
     prof_parser.add_argument("--iterations", type=int, default=5, help="Profile iterations")
     prof_parser.set_defaults(func=cmd_profile)
+
+    # analyze command (full analysis with ROI)
+    analyze_parser = subparsers.add_parser("analyze", help="Full analysis with ROI calculation")
+    analyze_parser.add_argument("--model", required=True, help="Path to saved model (.pt)")
+    analyze_parser.add_argument("--input-shape", required=True, help="Input shape (e.g., 8,512,1024)")
+    analyze_parser.add_argument("--format", choices=["text", "json", "html", "all"],
+                                default="text", help="Output format (default: text)")
+    analyze_parser.add_argument("--output", "-o", help="Output file path")
+    analyze_parser.add_argument("--gpu-count", type=int, default=1,
+                                help="Number of GPUs in fleet for ROI calculation")
+    analyze_parser.add_argument("--gpu-cost", type=float, default=3.00,
+                                help="GPU cost per hour in dollars (default: $3.00)")
+    analyze_parser.add_argument("--iterations", type=int, default=5,
+                                help="Profile iterations (default: 5)")
+    analyze_parser.set_defaults(func=cmd_analyze)
 
     # daemon command
     daemon_parser = subparsers.add_parser("daemon", help="Daemon management")
