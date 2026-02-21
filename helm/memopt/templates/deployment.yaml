@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memopt-server
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: memopt-server
+    chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+spec:
+  replicas: 1         # single instance — GPU optimization jobs are stateful
+  selector:
+    matchLabels:
+      app: memopt-server
+  template:
+    metadata:
+      labels:
+        app: memopt-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: memopt-server
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+
+        env:
+        - name: MEMOPT_MODE
+          value: "server"
+        - name: MAX_CONCURRENT_JOBS
+          value: {{ .Values.server.maxConcurrentJobs | default 2 | quote }}
+
+        resources:
+          requests:
+            memory: {{ .Values.server.resources.requests.memory | quote }}
+            cpu: {{ .Values.server.resources.requests.cpu | quote }}
+          limits:
+            memory: {{ .Values.server.resources.limits.memory | quote }}
+            cpu: {{ .Values.server.resources.limits.cpu | quote }}
+            nvidia.com/gpu: {{ .Values.server.gpuLimit | default 1 }}
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        - name: results-storage
+          mountPath: /tmp/memopt_results
+
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: {{ .Values.storage.modelPVC }}
+      - name: results-storage
+        emptyDir:
+          sizeLimit: 10Gi

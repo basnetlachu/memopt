@@ -219,7 +219,7 @@ class AutoOptimizer:
         model: Any,
         inputs: Dict[str, Any],
         tensor_info: Optional[Dict[str, int]] = None,
-        gpu_name: str = "A100"
+        gpu_name: Optional[str] = None
     ) -> AutoOptimizationResult:
         """
         Full optimization pipeline: Profile -> Analyze -> Optimize.
@@ -230,7 +230,8 @@ class AutoOptimizer:
             model: The PyTorch model
             inputs: Input tensors
             tensor_info: Optional tensor size information
-            gpu_name: GPU model name for analysis
+            gpu_name: GPU model name for analysis. Defaults to the actual GPU
+                      detected via torch.cuda.get_device_name(0).
 
         Returns:
             AutoOptimizationResult with metrics and applied optimizations
@@ -248,6 +249,26 @@ class AutoOptimizer:
                 error_message="PyTorch not available"
             )
 
+        # Auto-detect GPU name from actual hardware
+        if gpu_name is None:
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+            else:
+                logger.warning(
+                    "No CUDA GPU detected — optimization requires a GPU. "
+                    "Returning model unchanged."
+                )
+                return AutoOptimizationResult(
+                    success=False,
+                    original_time_ms=0.0,
+                    optimized_time_ms=0.0,
+                    speedup_pct=0.0,
+                    applied_optimizations=[],
+                    failed_optimizations=[],
+                    prediction_accuracy_pct=0.0,
+                    error_message="No CUDA GPU available",
+                )
+
         # Build tensor_info if not provided
         if tensor_info is None:
             tensor_info = {}
@@ -257,7 +278,7 @@ class AutoOptimizer:
 
         # Try to import Phase 2 profiler
         try:
-            from ..profiler import Phase2Profiler, HardwareCounters
+            from ..profiler import Phase2Profiler
         except ImportError:
             return AutoOptimizationResult(
                 success=False,
@@ -270,18 +291,71 @@ class AutoOptimizer:
                 error_message="Phase 2 profiler not available"
             )
 
-        # Create mock metrics for testing (in production, would use NCU)
-        # This allows the optimizer to work without actual profiling
-        ncu_metrics = self._create_mock_metrics(model, inputs)
+        # Collect REAL hardware counters using the profiler.
+        # On GPU: CUDA event timing, PyTorch Kineto FLOPs/memory, NVML utilization.
+        # On CPU: wall-clock timing only (no CUDA events).
+        # Stall cycles are roofline-estimated (confidence=0.5) unless NCU is used.
+        try:
+            from ..profiler.hardware_counters import HardwareCounterCollector, HardwareCounters
+        except ImportError:
+            from memopt.profiler.hardware_counters import HardwareCounterCollector, HardwareCounters
 
-        # Create mock hardware counters with correct field names
-        hardware_counters = HardwareCounters(
-            kernel_name="model_forward",
-            dram_bytes_read=int(ncu_metrics.get('dram_read', 0)),
-            dram_bytes_write=int(ncu_metrics.get('dram_write', 0)),
-            duration_ms=ncu_metrics.get('duration_ms', 1.0),
-            gpu_time_ms=ncu_metrics.get('duration_ms', 1.0),
-            achieved_occupancy_raw=ncu_metrics.get('occupancy', 80.0) / 100.0,
+        import time as _time
+
+        _collector = HardwareCounterCollector()
+
+        def _run_forward():
+            with torch.no_grad():
+                model(**inputs)
+
+        _t0 = _time.perf_counter()
+        with _collector.collect("model_forward"):
+            _run_forward()
+        _t1 = _time.perf_counter()
+
+        counters_list = _collector.get_counters()
+        if counters_list:
+            hardware_counters = counters_list[-1]
+        else:
+            # CPU-only: collect() yields but returns before appending; use wall-clock.
+            hardware_counters = HardwareCounters(
+                kernel_name="model_forward",
+                duration_ms=(_t1 - _t0) * 1000,
+                gpu_time_ms=(_t1 - _t0) * 1000,
+                measurement_method="wall_clock",
+                measurement_confidence=0.3,
+            )
+
+        # Build ncu_metrics from real measurements.
+        # Keys consumed by AccessPatternAnalyzer / Phase2Profiler:
+        #   duration_ms      — REAL (CUDA event)
+        #   dram_read/write  — real allocator delta or profiler memory
+        #   memory_stall_pct — roofline-estimated (stall_cycles / elapsed)
+        #   l2_hit_rate      — 0 without NCU; Phase2 falls back to throughput estimate
+        #   coalescing_efficiency — derived from stall ratio
+        #   reuse_ratio      — FLOP/byte (arithmetic intensity proxy)
+        #   occupancy        — REAL from NVML if pynvml installed, else 0
+        mem_stall = hardware_counters.memory_stall_pct
+        coalescing_eff = max(20.0, 100.0 - mem_stall)  # higher stall → worse coalescing
+        arith_intensity = hardware_counters.arithmetic_intensity
+        reuse_ratio = max(1.0, arith_intensity / 4.0)   # normalised proxy; ≥1
+
+        ncu_metrics = {
+            'duration_ms': hardware_counters.duration_ms,
+            'dram_read': hardware_counters.dram_bytes_read,
+            'dram_write': hardware_counters.dram_bytes_write,
+            'memory_stall_pct': mem_stall,
+            'l2_hit_rate': hardware_counters.l2_hit_rate,
+            'coalescing_efficiency': coalescing_eff,
+            'reuse_ratio': reuse_ratio,
+            'occupancy': hardware_counters.achieved_occupancy,
+        }
+
+        logger.info(
+            f"Real profiling: duration={hardware_counters.duration_ms:.2f}ms "
+            f"stall={mem_stall:.1f}% "
+            f"intensity={arith_intensity:.2f} FLOPS/byte "
+            f"(confidence={hardware_counters.measurement_confidence:.1f})"
         )
 
         # Run Phase 2 analysis
@@ -310,37 +384,6 @@ class AutoOptimizer:
 
         # Apply optimizations
         return self.optimize_from_report(model, inputs, phase2_report)
-
-    def _create_mock_metrics(
-        self,
-        model: Any,
-        inputs: Dict[str, Any]
-    ) -> Dict[str, float]:
-        """Create mock NCU metrics for testing without actual profiling."""
-
-        # Estimate total tensor size
-        total_bytes = 0
-        for name, tensor in inputs.items():
-            if isinstance(tensor, torch.Tensor):
-                total_bytes += tensor.numel() * tensor.element_size()
-
-        # Estimate model parameter size
-        param_bytes = 0
-        if hasattr(model, 'parameters'):
-            for p in model.parameters():
-                param_bytes += p.numel() * p.element_size()
-
-        # Mock metrics based on typical patterns
-        return {
-            'dram_read': total_bytes + param_bytes,
-            'dram_write': total_bytes,
-            'l2_hit_rate': 70.0,
-            'memory_stall_pct': 30.0,
-            'occupancy': 80.0,
-            'duration_ms': 1.0,
-            'coalescing_efficiency': 60.0,
-            'reuse_ratio': 3.0,
-        }
 
     def apply_single_optimization(
         self,

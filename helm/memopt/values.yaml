@@ -1,0 +1,34 @@
+namespace: memopt
+
+image:
+  repository: your-registry/memopt
+  tag: "1.1.0"
+  pullPolicy: IfNotPresent
+
+server:
+  gpuLimit: 1
+  maxConcurrentJobs: 2
+  resources:
+    requests:
+      memory: "4Gi"
+      cpu: "1000m"
+    limits:
+      memory: "8Gi"
+      cpu: "2000m"
+
+agent:
+  pollIntervalSeconds: 15
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+storage:
+  modelPVC: model-storage-pvc
+
+service:
+  type: ClusterIP
+  port: 8080

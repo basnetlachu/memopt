@@ -66,6 +66,7 @@ class CustomKernelRegistry:
         logger.info(f"  Triton: {self.has_triton}")
         logger.info(f"  cuDNN: {self.has_cudnn}")
         logger.info(f"  PyTorch SDPA: {self.has_sdpa}")
+        logger.info(f"Attention backend: {self.active_attention_backend()}")
 
     def _check_flash_attention(self) -> bool:
         try:
@@ -97,6 +98,16 @@ class CustomKernelRegistry:
         if not HAS_TORCH:
             return False
         return hasattr(F, 'scaled_dot_product_attention')
+
+    def active_attention_backend(self) -> str:
+        """Return the highest-priority available attention backend name."""
+        if self.has_flash_attn:
+            return "flash_attn"
+        if self.has_xformers:
+            return "xformers"
+        if self.has_sdpa:
+            return "sdpa"
+        return "naive"
 
     def _register_builtin_kernels(self):
         """Register built-in optimized kernels."""
@@ -233,7 +244,19 @@ class CustomKernelRegistry:
             except Exception as e:
                 logger.debug(f"flash_attn failed, trying SDPA: {e}")
 
-        # Try PyTorch SDPA
+        # Tier 2: xFormers (avoids flash_attn ABI issues, ~10-15% behind flash_attn)
+        if self.has_xformers:
+            try:
+                import xformers.ops as xops
+                return xops.memory_efficient_attention(
+                    query, key, value,
+                    attn_bias=attn_mask,
+                    scale=query.size(-1) ** -0.5,
+                )
+            except Exception as e:
+                logger.debug(f"xFormers failed, falling back to SDPA: {e}")
+
+        # Tier 3: PyTorch SDPA (always available >= 2.0, uses flash-attn v2 kernel internally)
         if self.has_sdpa:
             return F.scaled_dot_product_attention(
                 query, key, value,
@@ -242,18 +265,7 @@ class CustomKernelRegistry:
                 is_causal=is_causal
             )
 
-        # Try xFormers
-        if self.has_xformers:
-            try:
-                import xformers.ops as xops
-                return xops.memory_efficient_attention(
-                    query, key, value,
-                    attn_bias=attn_mask
-                )
-            except Exception as e:
-                logger.debug(f"xFormers failed: {e}")
-
-        # Fallback to naive
+        # Tier 4: naive fallback
         return self._naive_attention_impl(
             query, key, value, attn_mask, dropout_p
         )
@@ -290,7 +302,9 @@ class CustomKernelRegistry:
 
         attn = F.softmax(scores, dim=-1)
 
-        if dropout_p > 0 and self.training if hasattr(self, 'training') else True:
+        if dropout_p > 0:
+            # CustomKernelRegistry is not nn.Module; apply dropout unconditionally
+            # when called (caller controls training vs eval via dropout_p=0.0)
             attn = F.dropout(attn, p=dropout_p)
 
         output = torch.matmul(attn, value)
@@ -390,6 +404,15 @@ def fused_attention(
 
     kernel = kernel_registry.get_kernel("fused_attention")
     return kernel(query, key, value, attn_mask, dropout_p, is_causal)
+
+
+def get_active_attention_backend() -> str:
+    """Return the highest-priority available attention backend.
+
+    Returns one of: "flash_attn", "xformers", "sdpa", "naive".
+    Priority order: flash_attn > xformers > sdpa > naive.
+    """
+    return kernel_registry.active_attention_backend()
 
 
 def fused_layernorm_linear(

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Callable, Any
 from enum import Enum
 
+from .gpu_specs import GPU_L2_CACHE_MB
+
 logger = logging.getLogger("memopt")
 
 
@@ -456,38 +458,8 @@ class CacheThrashingAnalyzer:
     - lts__t_requests_miss.sum: L2 misses
     """
 
-    # L2 cache sizes per GPU architecture (from Phase 1 GPU specs)
-    L2_CACHE_SIZES_MB = {
-        # Hopper
-        'H100': 50.0,
-        'H100-SXM5': 50.0,
-        'H100-PCIe': 50.0,
-        'H200': 50.0,
-        # Ampere
-        'A100': 40.0,
-        'A100-SXM4': 40.0,
-        'A100-PCIe': 40.0,
-        'A30': 24.0,
-        'A40': 6.0,
-        'A10': 6.0,
-        'A6000': 6.0,
-        'A5000': 6.0,
-        # Ada Lovelace
-        'L40': 96.0,
-        'L40S': 96.0,
-        'RTX 4090': 72.0,
-        'RTX 4080': 64.0,
-        # Volta
-        'V100': 6.0,
-        'V100-SXM2': 6.0,
-        # Turing
-        'T4': 4.0,
-        # Pascal
-        'P100': 4.0,
-        # Consumer Ampere
-        'RTX 3090': 6.0,
-        'RTX 3080': 5.0,
-    }
+    # Single source of truth — derived from hardware_counters.GPU_SPECS via gpu_specs.py
+    L2_CACHE_SIZES_MB = GPU_L2_CACHE_MB
 
     # Thresholds
     MILD_OVERFLOW_THRESHOLD = 0.8       # Working set > 80% of cache

@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: memopt-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: memopt-agent
+    chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+spec:
+  selector:
+    matchLabels:
+      app: memopt-agent
+  template:
+    metadata:
+      labels:
+        app: memopt-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Only schedule on GPU nodes
+      nodeSelector:
+        nvidia.com/gpu: "true"
+
+      containers:
+      - name: memopt-agent
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+
+        env:
+        - name: MEMOPT_MODE
+          value: "agent"          # passive NVML monitoring only — no GPU compute
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+
+        resources:
+          requests:
+            memory: {{ .Values.agent.resources.requests.memory | quote }}
+            cpu: {{ .Values.agent.resources.requests.cpu | quote }}
+          limits:
+            memory: {{ .Values.agent.resources.limits.memory | quote }}
+            cpu: {{ .Values.agent.resources.limits.cpu | quote }}
+            nvidia.com/gpu: 0     # agent uses NO GPU compute
+
+        # Security — no privilege escalation
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      - name: tmp
+        emptyDir: {}
+
+      # Never evict agent pods — NVML monitoring must stay up
+      priorityClassName: system-node-critical

@@ -32,15 +32,32 @@ from .optimization_sequencer import (
 from .transformations import (
     TransformationEngine,
     TransformationType,
+    selective_compile,
+    apply_int8_quantization,
+    apply_gpu_int8,
+    validate_int8_accuracy,
+    should_apply_int8,
+    _get_torchao,
+    apply_torchao_int8,
+    apply_int8_with_fallback,
+    get_atol_for_tier,
 )
 from .kernel_registry import (
     CustomKernelRegistry,
     kernel_registry,
     fused_attention,
+    get_active_attention_backend,
 )
 from .auto_optimizer import (
     AutoOptimizer,
     AutoOptimizationResult,
+)
+from .universal_optimizer import (
+    get_ridge_point_flops_per_byte,
+    select_optimizations,
+    safe_compile,
+    apply_universal_plan,
+    UniversalPlan,
 )
 
 __all__ = [
@@ -54,11 +71,27 @@ __all__ = [
     # Transformations
     "TransformationEngine",
     "TransformationType",
+    "selective_compile",
+    "apply_int8_quantization",
+    "apply_gpu_int8",
+    "validate_int8_accuracy",
+    "should_apply_int8",
+    "_get_torchao",
+    "apply_torchao_int8",
+    "apply_int8_with_fallback",
+    "get_atol_for_tier",
     # Kernels
     "CustomKernelRegistry",
     "kernel_registry",
     "fused_attention",
+    "get_active_attention_backend",
     # Auto-optimizer
     "AutoOptimizer",
     "AutoOptimizationResult",
+    # Universal optimizer
+    "get_ridge_point_flops_per_byte",
+    "select_optimizations",
+    "safe_compile",
+    "apply_universal_plan",
+    "UniversalPlan",
 ]

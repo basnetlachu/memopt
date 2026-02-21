@@ -25,6 +25,7 @@ from .wrapper import (
 from .gradient_validator import GradientValidator, validate_backward_pass
 from .convergence_monitor import ConvergenceMonitor, TrainingState, EarlyStopper
 from .hooks import PyTorchHook, LightningHook, HuggingFaceHook, AccelerateHook
+from .prefetch_loader import PrefetchLoader
 
 __all__ = [
     # Main API
@@ -45,4 +46,6 @@ __all__ = [
     "LightningHook",
     "HuggingFaceHook",
     "AccelerateHook",
+    # Data loading
+    "PrefetchLoader",
 ]

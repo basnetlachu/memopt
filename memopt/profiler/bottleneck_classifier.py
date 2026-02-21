@@ -23,9 +23,48 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
+import torch
+
 from .hardware_counters import HardwareCounters, get_gpu_spec
 
 logger = logging.getLogger("memopt")
+
+
+def get_ridge_point_flops_per_byte(device_index: int = 0) -> float:
+    """
+    Compute the roofline ridge point for the given CUDA device.
+
+    The ridge point is the arithmetic intensity (FLOPS/byte) at which the
+    workload transitions from memory-bound to compute-bound.
+
+        ridge = peak_compute (FLOPS/s) / peak_bandwidth (bytes/s)
+
+    Uses GPU device properties — no hardcoded values.
+
+    Args:
+        device_index: CUDA device index (default 0).
+
+    Returns:
+        Ridge point in FLOPS/byte (e.g. ~156 for A100-SXM4, ~248 for RTX 4090).
+
+    Raises:
+        RuntimeError: If no CUDA device is available.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA device available; cannot compute ridge point.")
+
+    props = torch.cuda.get_device_properties(device_index)
+
+    # Peak FP32 throughput: SM_count × 64 FP32 CUDA cores/SM × 2 ops/cycle × clock (Hz)
+    # clock_rate is in kHz → multiply by 1e3 to get Hz
+    peak_flops = props.multi_processor_count * 64 * 2 * props.clock_rate * 1e3  # FLOPS/s
+
+    # Peak HBM bandwidth:
+    #   memory_clock_rate (kHz) → Hz × (memory_bus_width / 8) bytes/transfer × 2 (DDR)
+    peak_bw_bytes = props.memory_clock_rate * 1e3 * (props.memory_bus_width / 8) * 2  # bytes/s
+
+    ridge = peak_flops / peak_bw_bytes  # FLOPS/byte
+    return ridge
 
 
 # =============================================================================
@@ -162,14 +201,18 @@ class BottleneckClassifier:
         print(f"Confidence: {result.confidence:.0%}")
     """
 
-    # Classification thresholds - adjusted for heuristic-based estimation
-    MEMORY_STALL_DRAM_THRESHOLD = 60.0      # >60% stalls for DRAM-bound
-    MEMORY_STALL_CACHE_THRESHOLD = 50.0     # >50% stalls for cache issues
-    DRAM_BW_UTIL_THRESHOLD = 40.0           # >40% bandwidth for DRAM-bound
+    # Classification thresholds
+    # MEMORY_BOUND_DRAM: stall_ratio > 0.70 AND l2_miss_rate > 0.60
+    # MEMORY_BOUND_CACHE: stall_ratio > 0.60 AND l2_hit_rate < 0.50
+    # COMPUTE_BOUND: stall_ratio < 0.25 AND arith_intensity >= ridge_point
+    # PIPELINE_BOUND_OCCUPANCY: occupancy < 30%
+    MEMORY_STALL_DRAM_THRESHOLD = 70.0      # >70% stalls for DRAM-bound
+    MEMORY_STALL_CACHE_THRESHOLD = 60.0     # >60% stalls for cache thrashing
+    L2_HIT_DRAM_THRESHOLD = 40.0            # <40% L2 hit rate for DRAM-bound (miss > 60%)
     L2_HIT_RATE_THRESHOLD = 50.0            # <50% L2 hit rate for cache thrashing
     COMPUTE_STALL_THRESHOLD = 25.0          # <25% stalls for compute-bound
-    ARITHMETIC_INTENSITY_THRESHOLD = None   # Use ridge point instead (dynamic)
-    OCCUPANCY_THRESHOLD = 35.0              # <35% occupancy for pipeline-bound
+    ARITHMETIC_INTENSITY_THRESHOLD = None   # Use ridge point (dynamic, from GPU spec)
+    OCCUPANCY_THRESHOLD = 30.0              # <30% occupancy for pipeline-bound
 
     def __init__(self, gpu_spec=None):
         """Initialize classifier with GPU specifications."""
@@ -194,25 +237,64 @@ class BottleneckClassifier:
         arith_intensity = counters.arithmetic_intensity
         compute_util = counters.compute_utilization
 
+        # If CUPTI stall counters are absent (stall=0 on a >1ms kernel),
+        # hardware counter collection failed.  Classifying as COMPUTE_BOUND
+        # would silently skip all optimizations — return MIXED with low
+        # confidence so the caller knows to treat results as unreliable.
+        counters_reliable = not (
+            memory_stall_pct == 0.0
+            and l2_hit_rate == 0.0
+            and counters.duration_ms > 1.0
+            and counters.measurement_confidence < 0.5
+        )
+        if not counters_reliable:
+            logger.warning(
+                "Hardware counters unreliable (stall=0, l2=0, dur=%.1fms, conf=%.1f). "
+                "Returning MIXED — run with NCU for accurate classification.",
+                counters.duration_ms, counters.measurement_confidence,
+            )
+            return BottleneckClassification(
+                kernel_name=counters.kernel_name,
+                bottleneck_type=BottleneckType.MIXED,
+                severity=Severity.MEDIUM,
+                confidence=0.3,
+                root_cause=(
+                    f"Hardware counter collection failed (CUPTI stall counters unavailable). "
+                    f"Kernel took {counters.duration_ms:.1f}ms but reported 0 stall cycles. "
+                    "Re-run with `ncu --metrics` for accurate bottleneck classification."
+                ),
+                memory_stall_pct=0.0,
+                l2_hit_rate=l2_hit_rate,
+                dram_bw_utilization=dram_bw_util,
+                achieved_occupancy=occupancy,
+                arithmetic_intensity=arith_intensity,
+                impact_score=0.0,
+            )
+
         # Track which conditions are met
+        # DRAM-bound: high stalls AND low L2 hit rate (data NOT in cache, coming from DRAM)
         is_dram_bound = (
             memory_stall_pct > self.MEMORY_STALL_DRAM_THRESHOLD and
-            dram_bw_util > self.DRAM_BW_UTIL_THRESHOLD
+            l2_hit_rate <= self.L2_HIT_DRAM_THRESHOLD  # <=, not <, to capture boundary
         )
 
+        # Cache-bound: elevated stalls AND high L2 hit rate (data IS in L2 → L2 BW bottleneck)
+        # Requires real L2 data — not valid in estimation mode (stall_cycles from roofline only).
+        _estimation_mode = (
+            getattr(counters, "measurement_method", "") == "estimated_roofline"
+        )
         is_cache_bound = (
+            not _estimation_mode and
             memory_stall_pct > self.MEMORY_STALL_CACHE_THRESHOLD and
-            l2_hit_rate < self.L2_HIT_RATE_THRESHOLD
+            l2_hit_rate > self.L2_HIT_RATE_THRESHOLD  # high hit rate = L2 bandwidth bound
         )
 
         # Use GPU's ridge point for arithmetic intensity threshold
-        # Kernels above ridge point are compute-bound
         ridge_point = self.gpu_spec.ridge_point_fp32
-        intensity_threshold = ridge_point * 1.5  # 1.5x above ridge = clearly compute-bound
 
         is_compute_bound = (
             memory_stall_pct < self.COMPUTE_STALL_THRESHOLD and
-            arith_intensity > intensity_threshold
+            arith_intensity >= ridge_point
         )
 
         is_occupancy_bound = occupancy < self.OCCUPANCY_THRESHOLD
@@ -243,12 +325,14 @@ class BottleneckClassifier:
 
         elif is_cache_bound:
             bottleneck_type = BottleneckType.MEMORY_BOUND_CACHE
-            severity = Severity.HIGH if l2_hit_rate < 30 else Severity.MEDIUM
-            confidence = min(0.95, (100 - l2_hit_rate) / 100.0)
+            # High l2_hit_rate means data IS in L2 but L2 bandwidth is saturated.
+            # Severity scales with stall_pct; confidence scales with hit_rate (the signal).
+            severity = Severity.HIGH if memory_stall_pct > 70 else Severity.MEDIUM
+            confidence = min(0.95, l2_hit_rate / 100.0)
             root_cause = (
-                f"Memory-bound with cache thrashing. L2 hit rate only {l2_hit_rate:.1f}%, "
-                f"memory stalls at {memory_stall_pct:.1f}%. "
-                "Working set exceeds cache capacity."
+                f"L2 bandwidth-bound. High L2 hit rate ({l2_hit_rate:.1f}%) means data "
+                f"fits in cache but L2 bandwidth is saturated ({memory_stall_pct:.1f}% "
+                "stall cycles). Fix: reduce working-set reuse pressure or tile for L2."
             )
 
         elif is_occupancy_bound:

@@ -827,9 +827,15 @@ class HardwareCounterCollector:
 
     def _extract_real_counters(self, prof, name: str, duration_ms: float) -> HardwareCounters:
         """
-        Extract REAL hardware counters from PyTorch profiler.
+        Extract hardware counters from PyTorch Profiler (Kineto/CUPTI).
 
-        This parses the actual CUPTI/Kineto data, not estimates.
+        What is REAL here: cuda_time_total, flops, memory_usage (allocator).
+        What is ESTIMATED: stall_cycles (derived from arithmetic intensity vs
+        ridge point — a roofline approximation, not a silicon measurement).
+
+        For true stall cycle counts, use NCUProfiler.profile_script() which
+        runs ncu and parses smsp__warp_issue_stalled_long_scoreboard.avg.
+        measurement_confidence reflects this: 0.9 for timing, 0.5 for stalls.
         """
         counters = HardwareCounters(
             kernel_name=name,
@@ -837,7 +843,7 @@ class HardwareCounterCollector:
             duration_ms=duration_ms,
             gpu_time_ms=duration_ms,
             measurement_method="kineto",
-            measurement_confidence=0.9,
+            measurement_confidence=0.5,  # stall cycles are estimated, not measured
         )
 
         # Get events from profiler
@@ -978,15 +984,103 @@ class HardwareCounterCollector:
         counters.gpu_utilization_pct = avg_gpu_util
         counters.memory_utilization_pct = avg_mem_util
 
-        # If profiler didn't capture memory, use CUDA stats
+        # If profiler didn't capture memory, use CUDA allocator stats as a
+        # lower bound on DRAM traffic.  memory_stats() tracks bytes retired
+        # to/from DRAM by the allocator; intermediate activations that are
+        # allocated AND freed within the region show up in peak but not delta.
         if counters.dram_total_bytes == 0:
-            # Peak memory delta is a lower bound on DRAM traffic
-            mem_delta = max(0, peak_mem - start_mem)
-            counters.dram_bytes_read = mem_delta
-            counters.dram_bytes_write = mem_delta // 2
+            mem_stats = torch.cuda.memory_stats()
+            # bytes_retired_to_freed_pool ≈ write traffic; bytes_allocated ≈ read+write
+            retired = mem_stats.get("retired_bytes.all.current", 0)
+            if retired > 0:
+                # Use allocator retired bytes as DRAM write lower bound
+                counters.dram_bytes_write = retired
+                counters.dram_bytes_read  = max(retired, max(0, peak_mem - start_mem))
+            else:
+                # Fallback: peak allocation delta (coarser lower bound)
+                mem_delta = max(0, peak_mem - start_mem)
+                counters.dram_bytes_read  = mem_delta
+                counters.dram_bytes_write = mem_delta // 2
+
+        # Validate: stall_cycles==0 on a kernel that took >1 ms is physically
+        # impossible.  It means CUPTI stall counters are not available (kineto
+        # only provides them with NCU or a CUPTI subscriber).  Downgrade
+        # confidence so the classifier can fall back to MIXED.
+        if counters.stall_cycles == 0 and total_duration_ms > 1.0:
+            logger.warning(
+                "PROFILER ESTIMATION MODE: stall_cycles=0 on a %.1fms kernel is "
+                "physically impossible — CUPTI stall counters are not available "
+                "(kineto alone cannot collect them). Bottleneck classification will "
+                "use arithmetic intensity vs roofline only; MEMORY_BOUND_CACHE "
+                "will not be reported. Confidence capped at 0.50. "
+                "To get real stall counts re-run under NCU:\n"
+                "  ncu --metrics smsp__warp_issue_stalled_long_scoreboard.avg "
+                "python your_script.py",
+                total_duration_ms,
+            )
+            counters.measurement_confidence = min(counters.measurement_confidence, 0.50)
+            counters.measurement_method = "estimated_roofline"
+
+        logger.debug(
+            f"[{name}] duration={total_duration_ms:.2f}ms "
+            f"stall={counters.memory_stall_pct:.1f}% "
+            f"(confidence={counters.measurement_confidence:.1f}, "
+            f"method={counters.measurement_method})"
+        )
 
         # Store the counters
         self._counters.append(counters)
+
+    def collect_with_ncu(
+        self,
+        script_content: str,
+        name: str = "region",
+    ) -> HardwareCounters:
+        """
+        Collect REAL hardware counters by running *script_content* under ncu.
+
+        This is the only path that gives true stall cycle measurements
+        (smsp__warp_issue_stalled_long_scoreboard.avg, sm__cycles_active/elapsed).
+        measurement_confidence is set to 1.0 for NCU results.
+
+        Args:
+            script_content: Python code to profile (must be self-contained).
+            name: Label for the returned HardwareCounters.
+
+        Returns:
+            HardwareCounters with real stall cycles; falls back to a zero-filled
+            HardwareCounters with confidence=0.0 if ncu is unavailable.
+        """
+        try:
+            from .ncu_profiler import NCUProfiler
+        except ImportError:
+            logger.warning("NCUProfiler not importable; returning empty counters")
+            return HardwareCounters(kernel_name=name, measurement_confidence=0.0)
+
+        ncu = NCUProfiler()
+        if not ncu.is_available():
+            logger.warning(
+                "ncu not found; real stall cycle measurement unavailable. "
+                "Install CUDA toolkit or grant profiling permissions."
+            )
+            return HardwareCounters(kernel_name=name, measurement_confidence=0.0)
+
+        ncu_results = ncu.profile_script(script_content, kernel_name=name)
+        if not ncu_results:
+            logger.warning(f"ncu returned no results for '{name}'")
+            return HardwareCounters(kernel_name=name, measurement_confidence=0.0)
+
+        # Use the first (usually only) kernel result
+        ncu_c = ncu_results[0]
+        hw = counters_from_ncu(ncu_c)
+
+        logger.info(
+            f"[NCU/{name}] duration={hw.duration_ms:.2f}ms "
+            f"stall={hw.memory_stall_pct:.1f}% (REAL) "
+            f"l2_hit={hw.l2_hit_rate:.1f}% "
+            f"arith_intensity={hw.arithmetic_intensity:.2f} FLOPS/byte"
+        )
+        return hw
 
     def get_counters(self) -> List[HardwareCounters]:
         """Get all collected counters."""

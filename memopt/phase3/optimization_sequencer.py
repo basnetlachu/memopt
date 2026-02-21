@@ -185,8 +185,13 @@ class OptimizationSequencer:
                 cumulative_speedup_pct = new_cumulative
                 current_time_ms = result.optimized_time_ms
 
-                # Note: In a full implementation, would update current_model
-                # and current_operation to use the optimized version
+                # Chain: subsequent optimizations build on the already-optimized model.
+                # Without this, each optimization would start from the original model
+                # and speedups would not compound.
+                if result.optimized_model is not None:
+                    current_model = result.optimized_model
+                if result.optimized_op is not None:
+                    current_operation = result.optimized_op
 
             else:
                 reason = result.error_message or "Unknown failure"

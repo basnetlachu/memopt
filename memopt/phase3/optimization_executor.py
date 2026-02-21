@@ -19,6 +19,24 @@ import time
 
 logger = logging.getLogger("memopt.phase3")
 
+# Minimum speedup required to commit INT8 — higher bar than the default
+# tolerance_pct (5%) because INT8 adds quantization complexity and should
+# only be kept when it delivers meaningful bandwidth savings.
+INT8_COMMIT_THRESHOLD_PCT = 15.0
+
+# Reference ordering for the optimization pipeline.
+# Callers that build OptimizationCandidate lists should respect this order:
+#   channels_last  → layout (must precede compile)
+#   sdpa           → attention kernel selection
+#   int8_quantization → halves weight bandwidth (memory-bound only)
+#   torch_compile  → fuses all previous transformations
+TRANSFORMATION_ORDER = [
+    "channels_last",
+    "sdpa",
+    "int8_quantization",
+    "torch_compile",
+]
+
 # Try to import torch, but don't fail if not available
 try:
     import torch
@@ -50,6 +68,10 @@ class OptimizationResult:
     metrics_after: Dict[str, float] = field(default_factory=dict)
     correctness_validated: bool = True
     optimization_type: str = ""
+    # Optimized model/operation returned when success=True so sequencer
+    # can chain them (avoids applying every optimization to the original).
+    optimized_model: Any = None
+    optimized_op: Optional[Callable] = None
 
     def __str__(self) -> str:
         status = "SUCCESS" if self.success else "FAILED"
@@ -247,15 +269,25 @@ class OptimizationExecutor:
 
         regression_detected = speedup_pct < -self.tolerance_pct
 
+        # INT8 carries quantization complexity — require a higher minimum gain.
+        commit_threshold = (
+            INT8_COMMIT_THRESHOLD_PCT
+            if opt_type in ('int8_quantization', 'INT8_QUANTIZATION')
+            else self.tolerance_pct
+        )
+
         # Decision logic
         if regression_detected:
             decision = "ROLLBACK"
             success = False
             logger.warning(f"{decision}: {speedup_pct:.1f}% regression detected")
-        elif speedup_pct < self.tolerance_pct:
+        elif speedup_pct < commit_threshold:
             decision = "NO_IMPROVEMENT"
             success = False
-            logger.info(f"{decision}: {speedup_pct:.1f}% change (within noise)")
+            logger.info(
+                f"{decision}: {speedup_pct:.1f}% change "
+                f"(below {commit_threshold:.0f}% commit threshold)"
+            )
         else:
             decision = "COMMIT"
             success = True
@@ -271,7 +303,10 @@ class OptimizationExecutor:
             metrics_before=baseline_metrics,
             metrics_after=optimized_metrics,
             correctness_validated=True,
-            optimization_type=opt_type
+            optimization_type=opt_type,
+            # Carry the optimized versions so the sequencer can chain them
+            optimized_model=optimized_model if success else None,
+            optimized_op=optimized_op if success else None,
         )
 
     def _profile_operation(

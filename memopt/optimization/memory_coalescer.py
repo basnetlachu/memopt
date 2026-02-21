@@ -7,8 +7,14 @@ This module provides transparent memory optimization for:
 - Fine-tuning: Combined training + inference optimizations
 
 Key insight: During autoregressive generation, each new token reads overlapping
-KV cache regions. By caching recently accessed memory blocks in fast GPU memory
-(L2 cache / shared memory), we reduce redundant HBM/DRAM traffic.
+KV cache regions. This module tracks those accesses with a Python-level LRU
+cache (an OrderedDict in CPU memory) and reports hit_rate for Python-level
+cache accesses only.
+
+Note: this does NOT modify GPU L2 cache or shared memory behavior. hit_rate
+describes the Python-level cache, not actual GPU L1/L2 hardware. bandwidth_reduction
+is NOT provided — it requires NCU hardware counters. For real HBM traffic
+measurements use HardwareCounterCollector.
 
 Usage:
     from memopt.optimization import MemoryCoalescer
@@ -103,11 +109,19 @@ class CoalescingStats:
 
     @property
     def bandwidth_reduction(self) -> float:
-        """Bandwidth reduction as percentage."""
-        total_bytes = self.bytes_saved + self.bytes_fetched
-        if total_bytes == 0:
-            return 0.0
-        return (self.bytes_saved / total_bytes) * 100
+        """Not available without NCU hardware counters.
+
+        Raises:
+            NotImplementedError: Always. Use HardwareCounterCollector for real
+                HBM traffic measurements. The Python-level cache tracked here
+                cannot observe actual GPU memory transactions.
+        """
+        raise NotImplementedError(
+            "bandwidth_reduction requires NCU hardware counters to measure real "
+            "HBM traffic. This class tracks a Python-level cache only.\n"
+            "Use HardwareCounterCollector for actual bandwidth measurements:\n"
+            "  from memopt.profiler.hardware_counters import HardwareCounterCollector"
+        )
 
     @property
     def bytes_saved_gb(self) -> float:
@@ -314,13 +328,7 @@ class MLPCoalescer:
         if total_weight_bytes > 0:
             self.stats.total_accesses += 1
             self.stats.bytes_fetched += total_weight_bytes
-
-            # After first forward, subsequent forwards could benefit from L2 cache
-            if self.forward_count > 1:
-                # Assume ~50% of weights stay in L2 cache between calls
-                cached_bytes = total_weight_bytes // 2
-                self.stats.cache_hits += 1
-                self.stats.bytes_saved += cached_bytes
+            # bytes_saved is not tracked here — would require NCU to measure real HBM hits.
 
         # Track input tensor
         if len(args) > 0 and torch.is_tensor(args[0]):
@@ -350,7 +358,8 @@ class MemoryCoalescer:
 
         # Check results
         stats = coalescer.get_stats()
-        print(f"Bandwidth reduction: {stats.bandwidth_reduction:.1f}%")
+        print(f"Hit rate: {stats.hit_rate:.1f}%")
+        # bandwidth_reduction not available — requires NCU counters
     """
 
     def __init__(
@@ -506,6 +515,20 @@ class MemoryCoalescer:
         """Get current coalescing statistics."""
         return self.stats
 
+    def get_cache_stats(self) -> dict:
+        """Return only the Python-level cache metrics that are actually measured.
+
+        Does NOT include bandwidth_reduction (requires NCU hardware counters).
+        """
+        return {
+            "python_cache_hit_rate_pct": self.stats.hit_rate,
+            "python_cache_hits": self.stats.cache_hits,
+            "python_cache_misses": self.stats.cache_misses,
+            "total_accesses": self.stats.total_accesses,
+            "layers_optimized": self.stats.layers_optimized,
+            # bandwidth_reduction: not available without NCU
+        }
+
     def reset_stats(self):
         """Reset statistics without disabling coalescing."""
         self.stats.reset()
@@ -561,7 +584,7 @@ class MemoryCoalescer:
             "Memory Traffic:",
             f"  Bytes saved: {stats.bytes_saved_gb:.3f} GB",
             f"  Bytes fetched: {stats.bytes_fetched / (1024**3):.3f} GB",
-            f"  Bandwidth reduction: {stats.bandwidth_reduction:.1f}%",
+            "  Bandwidth reduction: N/A (requires NCU — use HardwareCounterCollector)",
             "=" * 60,
         ]
         return "\n".join(lines)

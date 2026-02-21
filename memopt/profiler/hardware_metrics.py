@@ -22,32 +22,8 @@ import torch.nn as nn
 
 logger = logging.getLogger("memopt")
 
-# L2 cache size lookup table (fallback if query fails)
-_L2_CACHE_SIZES_MB = {
-    # Ampere
-    "A100": 40,
-    "A30": 24,
-    "A10": 24,
-    "A6000": 48,
-    "A5000": 48,
-    "A4000": 16,
-    "RTX 3090": 6,
-    "RTX 3080": 5,
-    "RTX 3070": 4,
-    # Hopper
-    "H100": 50,
-    "H200": 50,
-    # Ada Lovelace
-    "RTX 4090": 72,
-    "RTX 4080": 64,
-    "RTX 4070": 36,
-    "L40": 48,
-    # Volta
-    "V100": 6,
-    # Turing
-    "T4": 4,
-    "RTX 2080": 6,
-}
+# Single source of truth — do not maintain a local copy
+from .gpu_specs import GPU_L2_CACHE_MB as _L2_CACHE_SIZES_MB
 
 
 def get_l2_cache_size_bytes() -> int:
