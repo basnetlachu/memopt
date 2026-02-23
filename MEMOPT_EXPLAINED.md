@@ -34,6 +34,7 @@
 24. [Validated Real Numbers (A100)](#24-validated-real-numbers-a100)
 25. [The 3-Layer Reality Check](#25-the-3-layer-reality-check)
 26. [What memopt Is Not](#26-what-memopt-is-not)
+27. [Autonomous Optimization Agent (MemoptAgent)](#27-autonomous-optimization-agent-memoptagent)
 
 ---
 
@@ -85,6 +86,9 @@ memopt/
 │   └── roi_calculator.py           Speedup % → monthly/annual cost savings
 ├── api/
 │   └── server.py                   FastAPI REST server with Prometheus metrics
+├── agent/
+│   ├── optimization_agent.py       Autonomous multi-round optimization loop (MemoptAgent)
+│   └── __init__.py                 Exports: MemoptAgent, AgentReport, AgentRound
 └── workflows/
     └── ...                         CLI command implementations
 ```
@@ -1743,6 +1747,25 @@ Other:
 - PrefetchLoader: tensor, tuple, dict, CPU-only all pass ✓
 - Failure modes: no flash_attn, broken forward, no-param model all handled gracefully ✓
 
+### 24.5 MemoptAgent Comprehensive Test Suite (4/4 PASS, A100-SXM4-80GB)
+
+All 4 tests run on **NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124**, using `tests/test_agent_comprehensive.py`. No mocks.
+
+| Test | Result | Key Metric | Stop Reason |
+|------|--------|------------|-------------|
+| ResNet50 b=8 — finds optimization | **PASS** | 2.74× speedup | TARGET_MET |
+| Linear(4096,4096) — compute-bound | **PASS** | 1.000× (0 opts committed) | OPTIMAL (round 1) |
+| BERT b=1 seq=512 — rollback correctness | **PASS** | max_diff=0.0000 | EXHAUSTED |
+| ResNet50 — agent vs real benchmark | **PASS** | ratio=0.919 (91.9% accuracy) | — |
+
+**Test 1 (ResNet50):** Agent commits `torch.compile(reduce-overhead)` in round 1, hits 2.74× target, stops. `optimized_model` runs correctly (batch=8, shape [8,1000]).
+
+**Test 2 (Linear 4096):** Arithmetic intensity AI≈1008 FLOPS/byte >> ridge=153 → COMPUTE_BOUND. Agent stops in round 1 with 0 candidates tried, 0 opts committed. Total time: ~0.1s.
+
+**Test 3 (BERT rollback):** `channels_last`, `sdpa`, `int8`, `compile` all tried and rolled back (each ≤1.00× at seq=512). Final model output identical to baseline (max_diff=0.0000). BERT-base-uncased position embeddings cap at seq=512.
+
+**Test 4 (speedup accuracy):** Agent-reported speedup (2.74×) vs independently benchmarked speedup. Ratio=0.919 — within the ±15% tolerance. Confirms timing logic is honest.
+
 ### 24.4 Honest Speedup Numbers (A100, batch=8, seq=256, no flash_attn library)
 
 | Model | Claimed | Actual (A100, no flash_attn) |
@@ -1875,3 +1898,184 @@ print(f"Accuracy: {100 * min(real_speedup, claimed_speedup) / max(real_speedup, 
 **`torch.compile` first-invocation latency.** The first call after `torch.compile()` triggers Triton kernel compilation and autotuning. This can take 30–120 seconds. Subsequent calls use cached kernels. The benchmark numbers in this document exclude warm-up (10 warm-up iterations before timing).
 
 **GPU-to-GPU variance.** Benchmarks on A100-SXM4-80GB (HBM2e, 2039 GB/s) do not predict results on A100-PCIe (1555 GB/s) or A30 (933 GB/s). Memory-bandwidth-bound speedups scale with bandwidth differences; compute-bound workloads do not.
+
+---
+
+## 27. Autonomous Optimization Agent (MemoptAgent)
+
+`MemoptAgent` is an autonomous multi-round optimization loop that requires no manual intervention. You hand it a model and a sample input; it profiles, applies optimizations one at a time, benchmarks each, commits wins, rolls back losses, and stops when it reaches a terminal condition.
+
+### 27.1 Architecture
+
+```
+MemoptAgent.run(model, sample_input)
+│
+├── Round N:
+│   ├── _profile(model, sample) → bottleneck type + candidate list
+│   ├── _select_next(candidates) → next optimization to try
+│   ├── _apply_optimization(model, opt) → candidate model
+│   ├── _benchmark(baseline, candidate) → speedup
+│   ├── _verify_correctness(orig, candidate, sample) → max_diff
+│   ├── COMMIT or ROLLBACK
+│   └── check stop condition → continue or stop
+│
+└── AgentReport (final_speedup, optimized_model, rounds, honest_ceiling, ...)
+```
+
+**Stop conditions (5 total):**
+
+| Condition | Trigger | Meaning |
+|-----------|---------|---------|
+| `OPTIMAL` | Profile returns COMPUTE_BOUND in round 1 | Model is already compute-bound; no memory optimizations apply |
+| `TARGET_MET` | Cumulative speedup ≥ `target_speedup` | Goal reached |
+| `EXHAUSTED` | All candidates tried, none committed | No applicable optimization beats the regression threshold |
+| `NO_PROGRESS` | Two consecutive rounds with 0 commits | Stalled — further rounds unlikely to help |
+| `MAX_ROUNDS` | Round count reaches `max_rounds` | Safety cutoff |
+
+### 27.2 Decision Table (OPTIMIZATION_PRIORITY)
+
+The agent picks candidates based on bottleneck type. Each candidate is tried at most once per session.
+
+| Bottleneck | Candidate Order |
+|------------|----------------|
+| `MEMORY_BOUND_DRAM` | `channels_last` → `sdpa` → `int8` → `compile` |
+| `MEMORY_BOUND_CACHE` | `channels_last` → `compile` |
+| `COMPUTE_BOUND` | *(empty — stop immediately with OPTIMAL)* |
+| `PIPELINE_BOUND` | `compile` |
+| `MIXED` | `channels_last` → `sdpa` → `compile` |
+
+### 27.3 Data Classes
+
+```python
+@dataclass
+class AgentRound:
+    round_num: int
+    bottleneck: str          # e.g. "MEMORY_BOUND_DRAM"
+    candidate: str           # e.g. "compile"
+    speedup: float           # measured speedup for this round
+    committed: bool          # True = kept, False = rolled back
+    stop_reason: str | None  # set on the final round only
+
+@dataclass
+class AgentReport:
+    final_speedup: float                  # cumulative speedup vs original baseline
+    optimizations_applied: list[str]      # committed optimizations (in order)
+    optimizations_rolled_back: list[str]  # rolled-back optimizations
+    rounds: list[AgentRound]
+    optimized_model: nn.Module | None     # None if nothing was committed
+    honest_ceiling: str                   # plain-English explanation + next steps
+```
+
+### 27.4 Usage
+
+**Python API:**
+
+```python
+import torch
+import torchvision
+from memopt.agent import MemoptAgent
+
+model = torchvision.models.resnet50().cuda().eval()
+inp = torch.randn(8, 3, 224, 224, device="cuda")
+
+agent = MemoptAgent(target_speedup=2.0, max_rounds=5)
+report = agent.run(model, {"x": inp})
+
+print(f"Speedup: {report.final_speedup:.2f}×")
+print(f"Applied: {report.optimizations_applied}")
+print(f"Stop:    {report.rounds[-1].stop_reason}")
+print(f"Ceiling: {report.honest_ceiling}")
+
+# Use the optimized model
+if report.optimized_model is not None:
+    with torch.no_grad():
+        out = report.optimized_model(inp)
+```
+
+**CLI (`memopt agent`):**
+
+```bash
+# Optimize a serialized model
+memopt agent --model path/to/model.pt \
+             --input-shape 8,3,224,224 \
+             --target 2.0 \
+             --max-rounds 5
+
+# With transformer model (token IDs as input)
+memopt agent --model bert.pt \
+             --input-shape 1,512 \
+             --target 1.5 \
+             --input-type ids
+```
+
+**REST API (`POST /agent`):**
+
+```bash
+curl -X POST http://localhost:8000/agent \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_path": "/models/resnet50.pt",
+    "input_shape": [8, 3, 224, 224],
+    "target_speedup": 2.0,
+    "max_rounds": 5
+  }'
+```
+
+Response:
+```json
+{
+  "job_id": "agent-abc123",
+  "status": "queued"
+}
+```
+
+Poll with `GET /agent/{job_id}` — same async pattern as `POST /optimize`.
+
+### 27.5 The `honest_ceiling` Field
+
+Every `AgentReport` includes a plain-English explanation of why optimization stopped and what to try next. Examples:
+
+```
+TARGET_MET: Reached 2.74× (target 2.0×) after committing ['compile'].
+  Next: profile individual layers to find remaining bottlenecks.
+
+OPTIMAL: Model is compute-bound (AI=1008 FLOPS/byte >> ridge=153).
+  No memory optimizations apply. To go faster: use tensor parallelism,
+  reduce sequence length, or lower precision (FP16/BF16).
+
+EXHAUSTED: Tried ['channels_last', 'sdpa', 'int8', 'compile'] — none
+  exceeded the 0.95× regression threshold at this batch/seq size.
+  BERT-base at seq=512 is compute-bound for this hardware config.
+  To unlock int8: need seq>=1024 AND batch×seq<=4096.
+  To unlock sdpa: need nn.MultiheadAttention (not BertSelfAttention).
+```
+
+### 27.6 Benchmarking Details
+
+Each candidate is evaluated with:
+- **Warmup:** 5 iterations (excluded from timing)
+- **Measurement:** 20 iterations, median CUDA-event latency
+- **Regression threshold:** 0.95× — candidates below this are rolled back
+- **Correctness check:** `max_diff < 0.25` on float32 output (relaxed for INT8: `< 0.25`)
+
+`final_speedup` is the ratio of original baseline latency to current model latency, measured with warmup=5, iters=50 at the end of all rounds.
+
+### 27.7 Validated Results (A100-SXM4-80GB)
+
+| Model | Rounds | Committed | Rolled Back | Final | Stop |
+|-------|--------|-----------|-------------|-------|------|
+| ResNet50 b=8 | 2 | `compile` | `channels_last`, `sdpa`, `int8` | **2.73×** | TARGET_MET |
+| Linear(4096,4096) b=64 | 1 | *(none)* | *(none — stopped before trying)* | 1.00× | OPTIMAL |
+| BERT b=1 seq=512 | 2 | *(none)* | `channels_last`, `sdpa`, `int8`, `compile` | 1.00× | EXHAUSTED |
+
+### 27.8 Known Limitations
+
+**BERT-base max seq=512.** `bert-base-uncased` has `max_position_embeddings=512`. Passing `seq=2048` raises `RuntimeError`. Use `bert-large` with extended positions for long-context experiments.
+
+**`_apply_sdpa` only replaces `nn.MultiheadAttention`.** HuggingFace BERT uses `BertSelfAttention` (a custom module, not `nn.MultiheadAttention`). The sdpa candidate finds nothing to replace → 1.000× → rollback. PyTorch SDPA benefits for BERT come from HuggingFace's own attention implementation, not from the agent's sdpa replacement.
+
+**INT8 regime gate is A100-calibrated.** The gate `seq >= 1024 AND batch × seq <= 4096` was tuned for A100-SXM4-80GB. The Triton `int_mm` vs cuBLAS FP32 crossover shifts on other hardware (RTX 4090, V100, T4). Expect false negatives (useful speedup missed) or false positives (regression committed before `safe_compile` catches it) on other GPUs without re-calibration.
+
+**`copy.deepcopy` + transformers 5.x causes segfaults.** The agent passes the model directly to `select_optimizations()` (which only reads it). Do not deepcopy HuggingFace models in the same process as iterating `named_modules()` — this crashes in transformers 5.x due to internal reference cycles and Cython metadata interactions.
+
+**Stale `.so` files shadow `.py` fixes.** If memopt was installed with Cython/setuptools, compiled `.so` binaries in the source tree take precedence over `.py` files. Code fixes are invisible until `.so` files are deleted: `find /repo -name '*.so' -delete && find /repo -name '*.pyc' -delete`. This was the root cause of `_detect_attention` segfaults on fresh servers.

@@ -6,6 +6,7 @@ Usage:
     memopt optimize --model path/to/model.pt --input-shape 8,512,1024
     memopt profile --model path/to/model.pt
     memopt analyze --model path/to/model.pt --input-shape 8,512,1024 --format html
+    memopt agent  --model path/to/model.pt --input-shape 1,2048 --target 2.0
     memopt info
     memopt sessions
     memopt daemon start|stop|status|logs
@@ -183,6 +184,101 @@ def cmd_analyze(args):
         print(result.roi_report)
 
 
+def cmd_agent(args):
+    """Run autonomous multi-round optimization agent."""
+    import torch
+    from memopt.agent import MemoptAgent
+
+    print(f"Loading model from: {args.model}")
+    shape = [int(x) for x in args.input_shape.split(",")]
+
+    try:
+        model = torch.load(args.model, weights_only=False)
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
+    # Build sample input — reuse same strategy as server._build_sample_input()
+    sample_input = _agent_build_sample(model, shape, device)
+
+    agent = MemoptAgent(
+        target_speedup=args.target,
+        max_rounds=args.max_rounds,
+    )
+
+    print(f"\nStarting agent | target={args.target:.2f}x | max_rounds={args.max_rounds}")
+    report = agent.run(model, sample_input)
+
+    # Pretty output matching the spec
+    print("\n" + "=" * 64)
+    for r in report.rounds:
+        committed_str = ", ".join(r.candidates_committed)  or "-"
+        rolled_str    = ", ".join(r.candidates_rolled_back) or "-"
+        stop_str      = f"\n  STOP: {r.stop_reason}" if r.stop_reason else ""
+        print(
+            f"Round {r.round_number}: {r.bottleneck_type} (conf={r.confidence:.2f}) "
+            f"→ committed=[{committed_str}]  rolled=[{rolled_str}]  "
+            f"cumulative={r.cumulative_speedup:.2f}x{stop_str}"
+        )
+    print("=" * 64)
+    gap = abs(report.target_speedup - report.final_speedup)
+    print(
+        f"\nFinal:  {report.final_speedup:.2f}x  |  "
+        f"Target: {report.target_speedup:.2f}x  |  "
+        f"Gap: {gap:.2f}x"
+    )
+    print(f"Ceiling: {report.honest_ceiling}")
+
+    if report.optimized_model is not None:
+        out_path = args.output or (Path(args.model).stem + "_optimized.pt")
+        torch.save(report.optimized_model, out_path)
+        print(f"Optimized model saved to: {out_path}")
+    else:
+        print("No optimization committed — original model unchanged.")
+
+
+def _agent_build_sample(model, shape, device):
+    """
+    Build sample input dict for the agent CLI.
+    Mirrors server._build_sample_input() strategy without importing FastAPI.
+    """
+    import torch
+
+    # Strategy 1: transformer input_ids (2D shape)
+    if len(shape) == 2:
+        for vocab in (30522, 50257, 32000):
+            try:
+                ids  = torch.randint(0, vocab, shape, device=device)
+                mask = torch.ones(shape, dtype=torch.long, device=device)
+                sample = {"input_ids": ids, "attention_mask": mask}
+                with torch.no_grad():
+                    model(**sample)
+                return sample
+            except Exception:
+                pass
+
+    # Strategy 2: float tensor with common kwarg names
+    t = torch.randn(*shape, device=device)
+    for kw in ("x", "input", "inputs", "hidden_states"):
+        try:
+            sample = {kw: t}
+            with torch.no_grad():
+                model(**sample)
+            return sample
+        except Exception:
+            pass
+
+    # Strategy 3: last-resort — try "input" as kwarg name and warn
+    print(
+        f"Warning: could not probe model with standard kwarg names for shape {shape}. "
+        "Falling back to {'input': tensor}. If this fails, pass inputs manually."
+    )
+    return {"input": t}
+
+
 def cmd_daemon(args):
     """Daemon management commands."""
     from memopt.daemon import MemoptDaemon, DaemonConfig
@@ -349,6 +445,25 @@ def main():
     analyze_parser.add_argument("--iterations", type=int, default=5,
                                 help="Profile iterations (default: 5)")
     analyze_parser.set_defaults(func=cmd_analyze)
+
+    # agent command
+    agent_parser = subparsers.add_parser(
+        "agent", help="Autonomous multi-round optimization agent"
+    )
+    agent_parser.add_argument("--model", required=True, help="Path to saved model (.pt)")
+    agent_parser.add_argument(
+        "--input-shape", required=True, help="Input shape (e.g., 1,2048 or 8,3,224,224)"
+    )
+    agent_parser.add_argument(
+        "--target", type=float, default=2.0, help="Target speedup multiplier (default: 2.0)"
+    )
+    agent_parser.add_argument(
+        "--max-rounds", type=int, default=10, help="Maximum optimization rounds (default: 10)"
+    )
+    agent_parser.add_argument(
+        "--output", "-o", help="Output path for optimized model (default: <model>_optimized.pt)"
+    )
+    agent_parser.set_defaults(func=cmd_agent)
 
     # daemon command
     daemon_parser = subparsers.add_parser("daemon", help="Daemon management")
