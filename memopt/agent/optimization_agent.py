@@ -26,7 +26,7 @@ import copy
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,7 @@ from memopt.phase3.universal_optimizer import (
     UniversalPlan,
     _bench_ms,
 )
+from memopt.profiler.power_sampler import PowerSampler, PowerReport
 
 log = logging.getLogger("memopt.agent")
 
@@ -133,6 +134,17 @@ class AgentReport:
     optimizations_rolled_back: List[str]
     honest_ceiling:            str             # plain English reason for stopping
     optimized_model:           Optional[nn.Module]
+    # Power fields — default to unavailable so existing callers aren't broken
+    baseline_power:            "PowerReport" = None   # type: ignore[assignment]
+    optimized_power:           "PowerReport" = None   # type: ignore[assignment]
+    power_reduction_pct:       Optional[float] = None
+
+    def __post_init__(self):
+        # Ensure power fields are always valid PowerReport objects
+        if self.baseline_power is None:
+            self.baseline_power = PowerReport.unavailable()
+        if self.optimized_power is None:
+            self.optimized_power = PowerReport.unavailable()
 
     def summary(self) -> str:
         lines = [
@@ -146,7 +158,22 @@ class AgentReport:
             f"  Time:    {self.total_time_seconds:.1f}s",
             f"  Ceiling: {self.honest_ceiling}",
         ]
+        if self.baseline_power.available:
+            lines.append(f"  Power:   {self.power_summary()}")
         return "\n".join(lines)
+
+    def power_summary(self) -> str:
+        if not self.baseline_power.available:
+            return "Power data unavailable"
+        if self.power_reduction_pct is None:
+            return "Power comparison unavailable"
+        return (
+            f"Power: {self.baseline_power.avg_watts:.1f}W → "
+            f"{self.optimized_power.avg_watts:.1f}W "
+            f"({self.power_reduction_pct:+.1f}%)\n"
+            f"  Baseline:  {self.baseline_power.summary()}\n"
+            f"  Optimized: {self.optimized_power.summary()}"
+        )
 
 
 # =============================================================================
@@ -190,9 +217,12 @@ class MemoptAgent:
             self.target_speedup, gpu_name,
         )
 
-        # Measure true baseline ONCE — all cumulative speedups relative to this
-        baseline_ms = self._benchmark(model, sample_input)
-        log.info("Baseline: %.2f ms", baseline_ms)
+        # Measure true baseline ONCE — latency + power simultaneously
+        baseline_ms, baseline_power = self._benchmark_with_power(model, sample_input)
+        log.info(
+            "Baseline: %.2f ms | power: %s",
+            baseline_ms, baseline_power.summary(),
+        )
 
         current_model = copy.deepcopy(model)
         state = AgentState(
@@ -300,6 +330,19 @@ class MemoptAgent:
         all_committed   = [c for r in rounds for c in r.candidates_committed]
         all_rolled_back = [c for r in rounds for c in r.candidates_rolled_back]
 
+        # Measure final power on the optimized model
+        final_model = current_model if all_committed else model
+        _, optimized_power = self._benchmark_with_power(final_model, sample_input)
+
+        # Power reduction: positive = less watts = good
+        if baseline_power.available and optimized_power.available and baseline_power.avg_watts > 0:
+            power_reduction_pct = (
+                (baseline_power.avg_watts - optimized_power.avg_watts)
+                / baseline_power.avg_watts * 100.0
+            )
+        else:
+            power_reduction_pct = None
+
         return AgentReport(
             model_name=type(model).__name__,
             gpu_name=gpu_name,
@@ -312,6 +355,9 @@ class MemoptAgent:
             optimizations_rolled_back=all_rolled_back,
             honest_ceiling=self._explain_ceiling(state, rounds),
             optimized_model=current_model if all_committed else None,
+            baseline_power=baseline_power,
+            optimized_power=optimized_power,
+            power_reduction_pct=power_reduction_pct,
         )
 
     # ── Stop conditions (checked in priority order) ────────────────────────────
@@ -573,6 +619,45 @@ class MemoptAgent:
             return model(**sample_input)
 
         return _bench_ms(_run, warmup=warmup, iters=iters)
+
+    def _benchmark_with_power(
+        self,
+        model: nn.Module,
+        sample_input: Dict[str, Any],
+        iters: int = 50,
+        token_count: int = 0,
+    ) -> "Tuple[float, PowerReport]":
+        """
+        Measure latency AND power simultaneously.
+
+        Warmup runs first (no power measurement — GPU stabilises).
+        Then iters forward passes under PowerSampler context.
+        Returns (median_ms_per_iter, PowerReport).
+        """
+        # Warmup — GPU frequency ramps up, caches warm, no power measurement
+        with torch.no_grad():
+            for _ in range(5):
+                model(**sample_input)
+        torch.cuda.synchronize()
+
+        # Timed + power-sampled batch
+        with PowerSampler() as sampler:
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            with torch.no_grad():
+                for _ in range(iters):
+                    model(**sample_input)
+            e.record()
+            torch.cuda.synchronize()
+            duration_ms = s.elapsed_time(e)
+
+        median_ms = duration_ms / iters
+        power = sampler.report(
+            duration_ms=duration_ms,
+            token_count=token_count * iters,
+        )
+        return median_ms, power
 
     # ── Honest ceiling explanation ─────────────────────────────────────────────
 

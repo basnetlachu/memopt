@@ -132,6 +132,36 @@ gpu_memory_used = Gauge(
     ["gpu_id"],
 )
 
+gpu_power_watts = Gauge(
+    "memopt_gpu_power_watts",
+    "Current GPU power draw in watts",
+    ["gpu_id"],
+)
+
+baseline_power_watts = Histogram(
+    "memopt_baseline_power_watts",
+    "GPU power during baseline measurement",
+    buckets=[50, 100, 150, 200, 250, 300, 350, 400, 450, 500],
+)
+
+optimized_power_watts = Histogram(
+    "memopt_optimized_power_watts",
+    "GPU power during optimized model measurement",
+    buckets=[50, 100, 150, 200, 250, 300, 350, 400, 450, 500],
+)
+
+power_reduction_pct = Histogram(
+    "memopt_power_reduction_percent",
+    "Power reduction achieved by optimization",
+    buckets=[-10, 0, 5, 10, 15, 20, 25, 30, 35, 40],
+)
+
+joules_per_token = Histogram(
+    "memopt_joules_per_token",
+    "Energy efficiency: joules consumed per token",
+    buckets=[0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+)
+
 
 # ── GPU metrics background collector ─────────────────────────────────────────
 
@@ -153,6 +183,11 @@ def _collect_gpu_metrics() -> None:
                 mem    = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 gpu_utilization.labels(gpu_id=str(i)).set(util.gpu)
                 gpu_memory_used.labels(gpu_id=str(i)).set(mem.used)
+                try:
+                    power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+                    gpu_power_watts.labels(gpu_id=str(i)).set(power_mw / 1000.0)
+                except pynvml.NVMLError:
+                    pass  # power reading not supported on all GPUs
         except Exception as exc:
             log.warning("GPU metrics collection failed: %s", exc)
         time.sleep(15)
@@ -360,6 +395,7 @@ def run_optimization(job_id: str) -> None:
     """
     import torch
     from memopt.phase3 import select_optimizations, apply_universal_plan
+    from memopt.profiler.power_sampler import PowerSampler
 
     job = job_store[job_id]
     job.status     = JobStatus.RUNNING
@@ -390,9 +426,13 @@ def run_optimization(job_id: str) -> None:
             def _call(m: torch.nn.Module) -> Any:
                 return m(**sample_input)
 
-        # ── Baseline measurement ─────────────────────────────────────────────
-        baseline_ms = _bench_ms(lambda: _call(model))
-        log.info("Job %s baseline: %.2f ms", job_id, baseline_ms)
+        # ── Baseline measurement (with power) ────────────────────────────────
+        with PowerSampler() as _bps:
+            baseline_ms = _bench_ms(lambda: _call(model))
+        _bp = _bps.report(duration_ms=baseline_ms * 50)
+        if _bp.available:
+            baseline_power_watts.observe(_bp.avg_watts)
+        log.info("Job %s baseline: %.2f ms | power: %s", job_id, baseline_ms, _bp.summary())
 
         # ── Optimization pipeline ────────────────────────────────────────────
         # select_optimizations profiles the model and returns a UniversalPlan.
@@ -405,12 +445,21 @@ def run_optimization(job_id: str) -> None:
         tier = _plan_tier(plan)
         log.info("Job %s plan: %s | tier=%s", job_id, plan, tier)
 
-        # ── Optimized measurement ────────────────────────────────────────────
-        optimized_ms = _bench_ms(lambda: _call(optimized))
-        speedup      = baseline_ms / optimized_ms
+        # ── Optimized measurement (with power) ───────────────────────────────
+        with PowerSampler() as _ops:
+            optimized_ms = _bench_ms(lambda: _call(optimized))
+        _op = _ops.report(duration_ms=optimized_ms * 50)
+        if _op.available:
+            optimized_power_watts.observe(_op.avg_watts)
+            if _bp.available and _bp.avg_watts > 0:
+                _pct = (_bp.avg_watts - _op.avg_watts) / _bp.avg_watts * 100.0
+                power_reduction_pct.observe(_pct)
+            if _op.joules_per_token is not None:
+                joules_per_token.observe(_op.joules_per_token)
+        speedup = baseline_ms / optimized_ms
         log.info(
-            "Job %s speedup: %.3fx baseline=%.2f ms optimized=%.2f ms",
-            job_id, speedup, baseline_ms, optimized_ms,
+            "Job %s speedup: %.3fx baseline=%.2f ms optimized=%.2f ms | power: %s",
+            job_id, speedup, baseline_ms, optimized_ms, _op.summary(),
         )
 
         # ── Save result ──────────────────────────────────────────────────────
@@ -576,6 +625,14 @@ def run_agent_job(job_id: str) -> None:
         # Prometheus per-type counters
         for opt in report.optimizations_applied:
             optimizations_applied.labels(type=opt).inc()
+
+        # Power metrics from AgentReport
+        if report.baseline_power.available:
+            baseline_power_watts.observe(report.baseline_power.avg_watts)
+        if report.optimized_power.available:
+            optimized_power_watts.observe(report.optimized_power.avg_watts)
+        if report.power_reduction_pct is not None:
+            power_reduction_pct.observe(report.power_reduction_pct)
 
     except Exception as exc:
         log.error("AgentJob %s FAILED: %s", job_id, exc, exc_info=True)

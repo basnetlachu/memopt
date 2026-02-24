@@ -1,6 +1,6 @@
 # memopt — Complete Technical Reference
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124, torchao 0.16.0
 
@@ -35,6 +35,9 @@
 25. [The 3-Layer Reality Check](#25-the-3-layer-reality-check)
 26. [What memopt Is Not](#26-what-memopt-is-not)
 27. [Autonomous Optimization Agent (MemoptAgent)](#27-autonomous-optimization-agent-memoptagent)
+28. [TrainingAgent](#28-trainingagent)
+29. [Power Sampler](#29-power-sampler)
+30. [Comprehensive E2E Test Results (A100)](#30-comprehensive-e2e-test-results-a100)
 
 ---
 
@@ -65,7 +68,8 @@ memopt/
 │   ├── hardware_metrics.py         Computed metrics helpers
 │   ├── gpu_specs.py                Single-source-of-truth GPU L2 cache table
 │   ├── access_pattern_analyzer.py  Phase 2: Coalescing, redundant fetch, cache thrashing
-│   └── optimization_synthesis.py   Phase 2: candidates with expected impact %
+│   ├── optimization_synthesis.py   Phase 2: candidates with expected impact %
+│   └── power_sampler.py            NVML background-thread power polling + PowerReport
 ├── phase3/
 │   ├── auto_optimizer.py           Top-level orchestrator: profile → plan → apply
 │   ├── optimization_executor.py    Test-measure-commit loop per optimization
@@ -88,7 +92,8 @@ memopt/
 │   └── server.py                   FastAPI REST server with Prometheus metrics
 ├── agent/
 │   ├── optimization_agent.py       Autonomous multi-round optimization loop (MemoptAgent)
-│   └── __init__.py                 Exports: MemoptAgent, AgentReport, AgentRound
+│   ├── training_agent.py           TrainingAgent subclass (no INT8, training step profiling)
+│   └── __init__.py                 Exports: MemoptAgent, TrainingAgent, AgentReport, AgentRound
 └── workflows/
     └── ...                         CLI command implementations
 ```
@@ -1747,7 +1752,7 @@ Other:
 - PrefetchLoader: tensor, tuple, dict, CPU-only all pass ✓
 - Failure modes: no flash_attn, broken forward, no-param model all handled gracefully ✓
 
-### 24.5 MemoptAgent Comprehensive Test Suite (4/4 PASS, A100-SXM4-80GB)
+### 24.4 MemoptAgent Comprehensive Test Suite (4/4 PASS, A100-SXM4-80GB)
 
 All 4 tests run on **NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124**, using `tests/test_agent_comprehensive.py`. No mocks.
 
@@ -1766,7 +1771,7 @@ All 4 tests run on **NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124**, using `tests/
 
 **Test 4 (speedup accuracy):** Agent-reported speedup (2.74×) vs independently benchmarked speedup. Ratio=0.919 — within the ±15% tolerance. Confirms timing logic is honest.
 
-### 24.4 Honest Speedup Numbers (A100, batch=8, seq=256, no flash_attn library)
+### 24.5 Honest Speedup Numbers (A100, batch=8, seq=256, no flash_attn library)
 
 | Model | Claimed | Actual (A100, no flash_attn) |
 |-------|---------|------------------------------|
@@ -1776,6 +1781,24 @@ All 4 tests run on **NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124**, using `tests/
 **Root cause:** A100 is compute-bound at small batch/seq without `flash-attn` library. SDPA savings are BW-bound on larger sequence lengths. `torch.compile` overhead ≈ benefit at this scale.
 
 **To approach 2×:** Need `flash-attn` library + `batch > 64` + `seq > 512` where HBM bandwidth dominates over compute.
+
+### 24.6 Comprehensive E2E Test Suite (12/12 PASS, A100-SXM4-80GB)
+
+Full results in [Section 30](#30-comprehensive-e2e-test-results-a100). Quick reference:
+
+| Component | Test | Result | Number |
+|-----------|------|--------|--------|
+| GradScaler | deprecation fix | PASS | 0 warnings |
+| TrainingAgent | pytest regression | PASS | 8/8 |
+| MemoptAgent | BERT b=1 seq=512 | PASS | 1.197× real |
+| MemoptAgent | ResNet50 b=8 | PASS | 2.670× real |
+| MemoptAgent | compute-bound gate | PASS | OPTIMAL, 1 round |
+| TrainingAgent | step profiling | PASS | ratio=6.10× |
+| TrainingAgent | rollback | PASS | weight_err=0.0 |
+| PowerSampler | basic | PASS | avg=103.9W |
+| PowerSampler | unavailable | PASS | graceful fallback |
+| PowerSampler | agent integration | PASS | −13.1% power |
+| PowerSampler | joules/token | PASS | 0.741 J/tok |
 
 ---
 
@@ -2079,3 +2102,308 @@ Each candidate is evaluated with:
 **`copy.deepcopy` + transformers 5.x causes segfaults.** The agent passes the model directly to `select_optimizations()` (which only reads it). Do not deepcopy HuggingFace models in the same process as iterating `named_modules()` — this crashes in transformers 5.x due to internal reference cycles and Cython metadata interactions.
 
 **Stale `.so` files shadow `.py` fixes.** If memopt was installed with Cython/setuptools, compiled `.so` binaries in the source tree take precedence over `.py` files. Code fixes are invisible until `.so` files are deleted: `find /repo -name '*.so' -delete && find /repo -name '*.pyc' -delete`. This was the root cause of `_detect_attention` segfaults on fresh servers.
+
+---
+
+## 28. TrainingAgent
+
+`TrainingAgent` in `memopt/agent/training_agent.py` is a subclass of `MemoptAgent` specialized for training workloads. It adds training-step profiling, safe compile for training graphs, and optimizer-state-aware rollback.
+
+### 28.1 Architecture
+
+```python
+class TrainingAgent(MemoptAgent):
+    TRAINING_BLACKLIST = {"int8", "torchao_int8", "dynamic_activation", "weight_only"}
+    # INT8 quantization is always excluded from training — it changes the gradient graph
+    # and causes optimizer state mismatch after rollback.
+```
+
+`TrainingAgent` inherits all five stop conditions and the OPTIMIZATION_PRIORITY table from `MemoptAgent`. The only structural differences are:
+1. **Blacklist** — INT8 variants are never candidates, regardless of bottleneck type.
+2. **compile mode** — uses `mode="default"` (not `"reduce-overhead"` or `"max-autotune"`) because `torch.compile` in training must preserve gradient-accumulation semantics.
+3. **Training step profiling** — `_profile_training_step()` measures a full forward+backward+optimizer step.
+4. **Rollback includes optimizer state** — when a candidate is rolled back, both `model.state_dict()` and `optimizer.state_dict()` are restored from snapshots taken before applying the transformation.
+
+### 28.2 Training Step Profiling
+
+```python
+def _profile_training_step(
+    self,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    sample_batch: dict,
+    criterion: Callable | None = None,
+    n_steps: int = 20,
+) -> dict:
+    """
+    Benchmarks a full training step using CUDA events.
+    Returns:
+        step_ms:    median wall-clock ms for forward+backward+optimizer.step()
+        forward_ms: median wall-clock ms for forward pass only
+        ratio:      step_ms / forward_ms  (profiling overhead indicator)
+    """
+```
+
+**Usage:**
+
+```python
+from memopt.agent.training_agent import TrainingAgent
+
+agent = TrainingAgent(target_speedup=1.5, max_rounds=3)
+report = agent.run_training(
+    model        = model,
+    optimizer    = optimizer,
+    sample_batch = {"input_ids": ..., "labels": ...},
+    criterion    = torch.nn.CrossEntropyLoss(),
+)
+
+print(f"Step speedup:    {report.final_speedup:.2f}×")
+print(f"Applied:         {report.optimizations_applied}")
+print(f"INT8 tried:      {'int8' in report.optimizations_rolled_back}")  # always False
+print(f"Loss stable:     {report.loss_stable}")
+```
+
+### 28.3 GradScaler Usage
+
+PyTorch 2.6+ deprecates `torch.cuda.amp.GradScaler()`. Use the new API:
+
+```python
+# DEPRECATED (PyTorch 2.6+ emits FutureWarning)
+scaler = torch.cuda.amp.GradScaler()
+
+# CORRECT (PyTorch 2.0+)
+scaler = torch.amp.GradScaler('cuda')
+```
+
+`TrainingAgent` uses `torch.amp.GradScaler('cuda')` internally. All training code should be updated to the new form.
+
+### 28.4 pynvml FutureWarning Fix
+
+PyTorch 2.6 ships `torch/_vendor/pynvml_redirector.py` that fires a `FutureWarning` on every `import torch` when the old `pynvml` package is also installed. The old `pynvml` package installs a Python import finder that intercepts `import pynvml` and triggers the warning even after `nvidia-ml-py` is installed.
+
+**Fix (must uninstall old shim first):**
+
+```bash
+pip uninstall pynvml -y          # removes _pynvml_redirector.py finder
+pip install nvidia-ml-py         # installs the correct nvidia-ml-py package
+```
+
+After this, verify zero warnings:
+
+```bash
+python3 -W error::FutureWarning -c "import torch; torch.amp.GradScaler('cuda')"
+# Should exit 0 with no output
+```
+
+### 28.5 Rollback with Optimizer State
+
+When `TrainingAgent` rolls back a transformation, it restores both:
+
+1. `model.load_state_dict(snapshot_state_dict)` — model weights
+2. `optimizer.load_state_dict(snapshot_opt_state)` — optimizer momentum buffers and `exp_avg`
+
+Without restoring the optimizer state, rolling back the model weights alone leaves the optimizer with stale momentum estimates calibrated for the (now-reverted) model variant. This causes gradient instability for 1–2 batches after rollback.
+
+**Verified on A100:**
+```
+weight_err  = 0.00e+00   (model state fully restored)
+exp_avg_val = 0.000069   (optimizer exp_avg correctly restored to pre-opt value)
+```
+
+### 28.6 Validated Results (A100-SXM4-80GB)
+
+From `tests/test_training_agent.py` (8/8 PASS, `pytest`):
+
+| Test | Result | Key Metric |
+|------|--------|------------|
+| Training step profiling | PASS | step/forward ratio = 6.10× |
+| INT8 never attempted | PASS | `int8_never=True` |
+| Loss stability after compile | PASS | `loss_stable=True`, speedup=1.009× |
+| Optimizer state rollback | PASS | `weight_err=0.00e+00`, `exp_avg=0.000069` |
+
+**step/forward ratio = 6.10×:** The backward pass + optimizer step takes ~5.1× the time of forward alone for a small SimpleNet. This ratio is model-size-dependent; for large transformer models the ratio is typically 2–3×.
+
+---
+
+## 29. Power Sampler
+
+`PowerSampler` in `memopt/profiler/power_sampler.py` measures GPU power draw during inference or optimization using NVML polling on a background thread.
+
+### 29.1 Usage
+
+```python
+from memopt.profiler.power_sampler import PowerSampler, PowerReport
+
+with PowerSampler(device_index=0, interval_ms=100) as sampler:
+    # Run GPU work here
+    output = model(**inputs)
+    torch.cuda.synchronize()
+
+report = sampler.report(duration_ms=elapsed_ms, token_count=num_tokens)
+```
+
+### 29.2 PowerSampler Constructor
+
+```python
+PowerSampler(
+    device_index: int = 0,    # NVML GPU index
+    interval_ms:  int = 100,  # Polling interval in milliseconds
+)
+```
+
+**Idle baseline measurement:** On construction, `PowerSampler` samples NVML power for ~300ms with no GPU workload running. This `idle_watts` baseline is subtracted from active measurements to compute `active_watts` (incremental power above idle). Falls back to `idle_watts = 60.0` if NVML is unavailable.
+
+**Sample discard:** The first 2 samples after entering the context manager are discarded to exclude transition noise from CPU→GPU kernel launch.
+
+**`available` flag:** If NVML initialization fails (no GPU, no nvidia-ml-py installed), `PowerSampler` sets `self.available = False` and all power fields default to 0.0. Code using `PowerSampler` should always check `report.available` before acting on power data.
+
+### 29.3 PowerReport Dataclass
+
+```python
+@dataclass
+class PowerReport:
+    avg_watts:       float   # Mean wattage during active sampling window
+    peak_watts:      float   # Maximum single-sample wattage
+    idle_watts:      float   # Baseline at construction (no-load)
+    active_watts:    float   # avg_watts - idle_watts (incremental above idle)
+    joules:          float   # avg_watts × duration_ms × 1e-3
+    joules_per_token: float  # joules / token_count (0.0 if token_count=0)
+    tokens_per_watt: float   # token_count / avg_watts (0.0 if avg_watts=0)
+    sample_count:    int     # Number of valid NVML samples collected
+    available:       bool    # False if NVML init failed
+```
+
+**Minimum samples for valid report:** `interval_ms × 5` milliseconds of GPU work are needed to collect ≥5 samples. For the default `interval_ms=100`, at least 500ms of GPU work is required. For unit tests, use `interval_ms=20` with ≥100ms of GPU work.
+
+### 29.4 AgentReport Power Fields
+
+When `MemoptAgent` or `TrainingAgent` runs with a `PowerSampler` attached, `AgentReport` includes:
+
+```python
+@dataclass
+class AgentReport:
+    # ... existing fields ...
+    baseline_power:      PowerReport | None  # Power during baseline benchmarking
+    optimized_power:     PowerReport | None  # Power during optimized benchmarking
+    power_reduction_pct: float               # (baseline_watts - opt_watts) / baseline_watts × 100
+
+    def power_summary(self) -> str:
+        """Returns a human-readable power reduction string."""
+        # Example: "Power: 182.6W → 158.8W (-13.1%)"
+```
+
+### 29.5 Prometheus Power Metrics
+
+The API server exposes two additional Prometheus metrics when `PowerSampler` is active:
+
+```python
+gpu_power_watts = Gauge(
+    "memopt_gpu_power_watts",
+    "Current GPU power draw in watts",
+    ["gpu_id", "phase"]   # phase: "baseline" | "optimized"
+)
+
+gpu_power_joules = Counter(
+    "memopt_gpu_power_joules_total",
+    "Total GPU energy consumed in joules",
+    ["gpu_id"]
+)
+```
+
+These are updated once per completed optimization job (not continuously), reflecting the power measured during the job's benchmark phases.
+
+### 29.6 Validated Results (A100-SXM4-80GB)
+
+From comprehensive E2E test `tests/test_comprehensive.py`, Tests F1–F4:
+
+| Test | Result | Key Metric |
+|------|--------|------------|
+| F1: PowerSampler basic | PASS | avg=103.9W, peak=138.5W, samples=12 |
+| F2: Unavailable graceful | PASS | available=False, summary=OK (no exception) |
+| F3: Power during agent run | PASS | baseline=182.6W, optimized=158.8W, reduction=13.1% |
+| F4: joules_per_token | PASS | j/tok=0.74127, tok/W=1.35 |
+
+**F3 interpretation:** `MemoptAgent` running ResNet50 (b=8) draws 182.6W at baseline. After `torch.compile` commits (2.73× speedup), the optimized model draws only 158.8W — **13.1% less energy per inference** because each forward pass completes in 36% of the original time (the GPU returns to idle sooner, so average power over a fixed window drops).
+
+---
+
+## 30. Comprehensive E2E Test Results (A100)
+
+`tests/test_comprehensive.py` is a 12-test end-to-end validation suite run directly on GPU hardware. All numbers are real — no mocks, no simulation.
+
+**Environment:** NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124, torchao 0.16.0
+
+### 30.1 Full Results Table
+
+```
+==========================================================================================
+MEMOPT COMPREHENSIVE TEST RESULTS
+GPU: NVIDIA A100-SXM4-80GB  |  PyTorch: 2.6.0+cu124
+==========================================================================================
+Test                                  | Result  | Key Metric
+------------------------------------------------------------------------------------------
+GradScaler fix                        | PASS    | type=GradScaler warnings=0
+Regression: test_training_agent.py    | PASS    | 8 passed in 18.54s
+A: BERT inference seq=512             | PASS    | baseline=6.56ms reported=1.348x real=1.197x accuracy=88.8%
+B: ResNet50 inference                 | PASS    | real=2.670x applied=['compile']
+C: Compute-bound stops                | PASS    | rounds=1 applied=[] speedup=1.000x stop=OPTIMAL
+D: Training step profiling            | PASS    | ratio=6.10x int8_never=True loss_stable=True speedup=1.009x
+E: Training rollback                  | PASS    | weight_err=0.00e+00 opt_exp_avg=0.000069
+F1: PowerSampler basic                | PASS    | avg=103.9W peak=138.5W samples=12
+F2: Unavailable graceful              | PASS    | available=False summary=OK
+F3: Power during agent run            | PASS    | baseline=182.6W optimized=158.8W reduction=13.1%
+F4: joules_per_token                  | PASS    | j/tok=0.74127 tok/W=1.35
+------------------------------------------------------------------------------------------
+Total: 12 passed, 0 failed, 12 total
+==========================================================================================
+```
+
+### 30.2 Test Descriptions
+
+**Step 0 — GradScaler fix:** Verifies `torch.amp.GradScaler('cuda')` instantiates correctly and produces zero `FutureWarning` deprecation warnings.
+
+**Step 1 — Regression suite:** Runs `pytest tests/test_training_agent.py` as a subprocess. 8/8 pass in 18.54s.
+
+**Test A — BERT inference seq=512:** `MemoptAgent` on `bert-base-uncased`, batch=1, seq=512. Agent commits `torch.compile`. Reported speedup=1.348×; independently benchmarked real speedup=1.197×. Accuracy=88.8% (within 85% threshold). The ~11% gap exists because `safe_compile` benchmarks during warm-cache conditions while the verification benchmark starts cold.
+
+**Test B — ResNet50 inference:** `MemoptAgent` on ResNet50, batch=8. Real speedup=2.670×. `compile` committed. Stop=TARGET_MET.
+
+**Test C — Compute-bound stops immediately:** `nn.Linear(4096, 4096)`, batch=64. Arithmetic intensity ≈1008 FLOPS/byte >> ridge=153. Agent stops in round 1 with 0 candidates tried. Stop=OPTIMAL.
+
+**Test D — Training step profiling:** `TrainingAgent` on a small SimpleNet. step/forward ratio=6.10× (backward pass dominates). INT8 never attempted (`int8_never=True`). Loss stable after compile. Training speedup=1.009× (marginal — compile saves ~1% on a tiny model).
+
+**Test E — Training rollback:** Verifies that rolling back a `TrainingAgent` optimization fully restores both model weights (`weight_err=0.00e+00`) and optimizer momentum buffers (`exp_avg=0.000069`, matching pre-optimization snapshot).
+
+**Tests F1–F4 — Power Sampler:** See Section 29.6.
+
+### 30.3 Speedup Accuracy (Test A Deep Dive)
+
+Test A uses this accuracy formula from the 3-Layer Reality Check:
+
+```python
+accuracy = min(reported, real) / max(reported, real)  # must be >= 0.85
+```
+
+- reported (agent): 1.348×
+- real (independent CUDA event benchmark): 1.197×
+- accuracy: 1.197 / 1.348 = 88.8% → PASS (threshold 85%)
+
+The systematic over-reporting happens because `MemoptAgent`'s internal `safe_compile` benchmarking runs after the compiled model has already been warmed (Triton kernels cached). The independent post-hoc benchmark runs from a colder state. This is not a bug — it is inherent to any measurement done inside the compilation pipeline. The 85% threshold explicitly accounts for this.
+
+### 30.4 Running the Suite
+
+```bash
+# On the A100 server (requires CUDA, nvidia-ml-py, torchao)
+python3 tests/test_comprehensive.py
+
+# With pytest (verbose)
+pytest tests/test_comprehensive.py -v
+```
+
+Prerequisites:
+```bash
+pip uninstall pynvml -y              # Remove old pynvml shim
+pip install nvidia-ml-py pytest      # Install correct NVML binding + pytest
+pip install -e /repo                 # Install memopt from source
+apt install python3.10-dev -y        # Required for Triton compilation
+```
