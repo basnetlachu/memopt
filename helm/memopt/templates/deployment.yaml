@@ -42,7 +42,9 @@ spec:
           limits:
             memory: {{ .Values.server.resources.limits.memory | quote }}
             cpu: {{ .Values.server.resources.limits.cpu | quote }}
-            nvidia.com/gpu: {{ .Values.server.gpuLimit | default 1 }}
+            {{- if gt (int .Values.gpu.limit) 0 }}
+            nvidia.com/gpu: {{ .Values.gpu.limit }}
+            {{- end }}
 
         securityContext:
           allowPrivilegeEscalation: false

@@ -7,7 +7,7 @@ Never crashes — all errors return safe defaults.
 import time
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,19 @@ _MODEL_FAMILY_AI = {
     "clip":    7.0,
 }
 
+# Expected speedup range per optimization key: (min, max)
+_OPT_SPEEDUP: Dict[str, Tuple[float, float]] = {
+    "flash_attention":   (1.5, 2.5),
+    "int8":              (1.5, 2.0),
+    "bf16":              (1.2, 1.8),
+    "torch_compile":     (1.1, 1.5),
+    "kv_cache":          (1.3, 2.0),
+    "continuous_batch":  (2.0, 5.0),
+    "channels_last":     (1.1, 1.3),
+    "fp8":               (1.3, 2.0),
+    "tensor_parallel":   (1.5, 3.0),
+}
+
 # Optimization labels
 OPT_LABELS = {
     "flash_attention":   "Flash Attention 2",
@@ -52,19 +65,27 @@ class ProcessProfile:
     """Full bottleneck profile for one running GPU process."""
     pid: int
     gpu_ids: List[int]
-    model_family: str
-    mode: str
     gpu_memory_mb: int
     avg_utilization_pct: float
-    bottleneck: str          # "memory_bandwidth" | "compute" | "unknown"
-    arithmetic_intensity: float  # estimated FLOPS/byte
-    ridge_point: float       # hardware ridge point FLOPS/byte
-    recommendations: List[str]   # list of opt keys from OPT_LABELS
-    hw_arch: str             # e.g. "ampere" / "hopper" / "other"
-    hw_name: str             # GPU name
-    supports_flash_attn2: bool
-    supports_fp8: bool
-    supports_bf16: bool
+    bottleneck: str                      # "memory_bandwidth" | "compute" | "unknown"
+    arithmetic_intensity: float          # estimated FLOPS/byte
+    ridge_point: float                   # hardware ridge point FLOPS/byte
+    # Legacy field — used by report.py / ScanReporter
+    recommendations: List[str] = field(default_factory=list)
+    # Fields used by zero_touch.py
+    recommended_optimizations: List[str] = field(default_factory=list)
+    expected_speedup_min: float = 1.0
+    expected_speedup_max: float = 1.0
+    utilization_efficiency: float = 0.0  # avg_util / 100
+    reasoning: str = ""
+    # Hardware info
+    model_family: str = ""
+    mode: str = ""
+    hw_arch: str = ""
+    hw_name: str = ""
+    supports_flash_attn2: bool = False
+    supports_fp8: bool = False
+    supports_bf16: bool = False
 
 
 class ProcessInspector:
@@ -103,12 +124,12 @@ class ProcessInspector:
             log.warning(f"hardware_detector failed for pid {pid}: {e}")
             hw = None
 
-        ridge_point = hw.ridge_point if hw else 153.0  # A100 default
-        hw_arch     = hw.arch         if hw else "unknown"
-        hw_name     = hw.device_name  if hw else "unknown"
-        supports_fa2 = hw.supports_flash_attn2 if hw else False
-        supports_fp8 = hw.supports_fp8         if hw else False
-        supports_bf16 = hw.supports_bf16       if hw else False
+        ridge_point   = hw.ridge_point         if hw else 153.0  # A100 default
+        hw_arch       = hw.arch                if hw else "unknown"
+        hw_name       = hw.device_name         if hw else "unknown"
+        supports_fa2  = hw.supports_flash_attn2 if hw else False
+        supports_fp8  = hw.supports_fp8         if hw else False
+        supports_bf16 = hw.supports_bf16        if hw else False
 
         # Sample utilization
         avg_util = self._sample_utilization(gpu_ids, sample_seconds)
@@ -122,7 +143,7 @@ class ProcessInspector:
         )
 
         # Build recommendations
-        recommendations = self._build_recommendations(
+        recs = self._build_recommendations(
             bottleneck=bottleneck,
             model_family=model_family,
             mode=mode,
@@ -131,6 +152,17 @@ class ProcessInspector:
             supports_fa2=supports_fa2,
             supports_fp8=supports_fp8,
             supports_bf16=supports_bf16,
+        )
+
+        # Estimate speedup from top recommendation
+        top_key = recs[0] if recs else None
+        sp_min, sp_max = _OPT_SPEEDUP.get(top_key, (1.0, 1.0)) if top_key else (1.0, 1.0)
+
+        # Build reasoning string
+        reasoning = (
+            f"{bottleneck.replace('_', '-')} bottleneck | "
+            f"AI={ai:.1f} ridge={ridge_point:.0f} FLOPS/byte | "
+            f"util={avg_util:.0f}%"
         )
 
         return ProcessProfile(
@@ -143,7 +175,12 @@ class ProcessInspector:
             bottleneck=bottleneck,
             arithmetic_intensity=ai,
             ridge_point=ridge_point,
-            recommendations=recommendations,
+            recommendations=recs,
+            recommended_optimizations=recs,   # mirror for zero_touch.py
+            expected_speedup_min=sp_min,
+            expected_speedup_max=sp_max,
+            utilization_efficiency=avg_util / 100.0,
+            reasoning=reasoning,
             hw_arch=hw_arch,
             hw_name=hw_name,
             supports_flash_attn2=supports_fa2,
@@ -188,16 +225,7 @@ class ProcessInspector:
         model_family: str,
         mode: str,
     ) -> str:
-        """
-        Diagnose bottleneck from utilization + roofline position.
-
-        Rules:
-        - Util > 85% AND ai > ridge_point → compute-bound
-        - Util < 40% OR ai < ridge_point  → memory-bandwidth-bound
-        - Otherwise → unknown (ambiguous)
-        """
         if ridge_point <= 0:
-            # No roofline info — fall back to utilization only
             if avg_util > 85:
                 return "compute"
             if avg_util < 40:
@@ -225,18 +253,14 @@ class ProcessInspector:
         supports_fp8: bool,
         supports_bf16: bool,
     ) -> List[str]:
-        """Return ordered list of optimization keys for this process."""
         recs = []
-
         is_transformer = model_family not in ("resnet", "vit", "diffusion", "clip", "unknown")
 
         if bottleneck == "memory_bandwidth":
-            # Memory-bound — quantization + attention efficiency win most
             if is_transformer and supports_fa2:
                 recs.append("flash_attention")
             if supports_bf16:
                 recs.append("bf16")
-            # INT8 is broadly applicable
             recs.append("int8")
             if supports_fp8:
                 recs.append("fp8")
@@ -247,7 +271,6 @@ class ProcessInspector:
             recs.append("torch_compile")
 
         elif bottleneck == "compute":
-            # Compute-bound — precision reduction + compile
             recs.append("torch_compile")
             if supports_fp8:
                 recs.append("fp8")
@@ -260,7 +283,6 @@ class ProcessInspector:
                 recs.append("channels_last")
 
         else:
-            # Unknown — give broad set
             if is_transformer and supports_fa2:
                 recs.append("flash_attention")
             if supports_bf16:
@@ -269,7 +291,7 @@ class ProcessInspector:
             recs.append("int8")
 
         # Deduplicate preserving order
-        seen = set()
+        seen: set = set()
         result = []
         for r in recs:
             if r not in seen:

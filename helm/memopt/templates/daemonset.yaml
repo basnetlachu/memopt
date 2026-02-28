@@ -34,11 +34,19 @@ spec:
 
         env:
         - name: MEMOPT_MODE
-          value: "agent"          # passive NVML monitoring only — no GPU compute
+          value: "agent"          # passive NVML monitoring + zero-touch scan/apply
         - name: NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: MEMOPT_SCAN_INTERVAL
+          value: "{{ .Values.daemon.scanIntervalSeconds }}"
+        - name: MEMOPT_SAMPLE_SECONDS
+          value: "{{ .Values.daemon.sampleSeconds }}"
+        - name: MEMOPT_AUTO_APPLY
+          value: "{{ .Values.daemon.autoApply }}"
+        - name: MEMOPT_GPU_COST_PER_HOUR
+          value: "{{ .Values.daemon.gpuCostPerHour }}"
 
         resources:
           requests:
@@ -47,7 +55,12 @@ spec:
           limits:
             memory: {{ .Values.agent.resources.limits.memory | quote }}
             cpu: {{ .Values.agent.resources.limits.cpu | quote }}
-            nvidia.com/gpu: 0     # agent uses NO GPU compute
+            {{- if gt (int .Values.gpu.limit) 0 }}
+            nvidia.com/gpu: {{ .Values.gpu.limit }}
+            {{- end }}
+            {{- if eq (int .Values.gpu.limit) 0 }}
+            # gpu.limit: 0 — no GPU resource limit; Kubernetes allocates all available GPUs
+            {{- end }}
 
         # Security — no privilege escalation
         securityContext:

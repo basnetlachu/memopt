@@ -52,6 +52,7 @@ Documentation = "https://docs.memopt.ai"
 
 [project.scripts]
 memopt = "memopt.cli:main"
+memopt-wrap = "memopt.wrap.cli:main"
 
 [tool.setuptools]
-packages = ["memopt", "memopt.profiler", "memopt.measurement", "memopt.optimization", "memopt.validation", "memopt.daemon", "memopt.training", "memopt.phase3", "memopt.business", "memopt.formatters", "memopt.workflows", "memopt.utils", "memopt.api", "memopt.agent", "memopt.serving"]
+packages = ["memopt", "memopt.profiler", "memopt.measurement", "memopt.optimization", "memopt.validation", "memopt.daemon", "memopt.training", "memopt.phase3", "memopt.business", "memopt.formatters", "memopt.workflows", "memopt.utils", "memopt.api", "memopt.agent", "memopt.serving", "memopt.wrap"]

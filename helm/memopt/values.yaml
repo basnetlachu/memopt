@@ -5,8 +5,33 @@ image:
   tag: "1.1.0"
   pullPolicy: IfNotPresent
 
+# GPU configuration
+gpu:
+  # Number of GPUs per node to allocate to memopt agent.
+  # Set to 0 to use all available GPUs on each node (no limit set in K8s).
+  limit: 0
+  # Memory fraction per GPU (0.0 - 1.0)
+  memoryFraction: 0.9
+
+# Daemon (zero-touch scan/apply) configuration
+daemon:
+  # How often to scan for GPU processes (seconds)
+  scanIntervalSeconds: 60
+  # Sample GPU utilization for N seconds per process
+  sampleSeconds: 5
+  # Auto-apply optimizations without operator approval.
+  # Set false (recommended) for first deployment — report-only mode.
+  autoApply: false
+  # Dollar cost per GPU hour (for ROI calculation)
+  gpuCostPerHour: 2.50
+
+# Dashboard
+dashboard:
+  enabled: true
+  port: 8080
+
 server:
-  gpuLimit: 1
+  # Kept for backward compatibility
   maxConcurrentJobs: 2
   resources:
     requests:

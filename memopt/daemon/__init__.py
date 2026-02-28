@@ -34,4 +34,15 @@ __all__ = [
     "ScanReporter",
     "ApplyEngine",
     "ApplyResult",
+    # Zero-touch daemon + ROI
+    "ZeroTouchDaemon",
+    "ZeroDaemonConfig",
+    "OptimizationEvent",
+    "ROICalculator",
+    "ROIEstimate",
 ]
+
+# Zero-touch daemon + ROI
+from .zero_touch import ZeroTouchDaemon, OptimizationEvent
+from .zero_touch import DaemonConfig as ZeroDaemonConfig
+from .roi_calculator import ROICalculator, ROIEstimate
