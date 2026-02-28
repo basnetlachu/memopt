@@ -28,6 +28,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import signal
+import threading
+
 import torch
 import torch.nn as nn
 
@@ -36,9 +39,20 @@ from memopt.phase3.universal_optimizer import (
     apply_universal_plan,
     safe_compile,
     UniversalPlan,
+    UniversalOptimizer,
     _bench_ms,
 )
 from memopt.profiler.power_sampler import PowerSampler, PowerReport
+from memopt.utils.input_handler import (
+    detect_input_format,
+    forward,
+    extract_tensor,
+    get_sequence_length,
+    get_batch_size,
+    InputFormat,
+)
+from memopt.utils.hardware_detector import detect_hardware, HardwareProfile
+from memopt.utils.model_type_detector import detect_model_type, get_applicable_optimizations
 
 log = logging.getLogger("memopt.agent")
 
@@ -102,6 +116,8 @@ class AgentState:
     target_speedup:           float
     current_bottleneck:       str = "MIXED"
     last_arithmetic_intensity: Optional[float] = None
+    fmt:                      Optional[InputFormat] = None
+    model_family:             str = "unknown"
 
 
 # =============================================================================
@@ -199,15 +215,36 @@ class MemoptAgent:
         max_rounds:        int   = 10,
         min_improvement:   float = 0.05,   # minimum improvement per round to count as progress
         no_progress_limit: int   = 3,      # stop after N rounds with no committed optimization
+        multi_gpu:         bool  = False,  # explicit opt-in: shard across GPUs via FSDP
     ):
         self.target_speedup    = target_speedup
         self.max_rounds        = max_rounds
         self.min_improvement   = min_improvement
         self.no_progress_limit = no_progress_limit
+        self.multi_gpu         = multi_gpu
+
+        # Detect hardware once at construction — shared across all run() calls
+        self.hw: HardwareProfile = detect_hardware()
+        log.info("Hardware: %s", self.hw.summary())
+
+        if self.multi_gpu:
+            from memopt.utils.multi_gpu import detect_available_gpus
+            self.num_gpus = detect_available_gpus()
+            log.info("Multi-GPU mode: %d GPU(s) detected", self.num_gpus)
+        else:
+            self.num_gpus = 1
 
     # ── Top-level entry point ──────────────────────────────────────────────────
 
-    def run(self, model: nn.Module, sample_input: Dict[str, Any]) -> AgentReport:
+    def run(self, model: nn.Module, sample: Any) -> AgentReport:
+        """
+        Run autonomous optimization on any PyTorch model.
+
+        Args:
+            model:  Any nn.Module on CUDA.
+            sample: One real batch from your dataloader.
+                    Can be dict, tensor, tuple, HuggingFace BatchEncoding — anything.
+        """
         start_time = time.time()
         gpu_name = (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
@@ -217,20 +254,52 @@ class MemoptAgent:
             self.target_speedup, gpu_name,
         )
 
+        # Detect input format ONCE — all downstream calls use fmt
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        log.info("Detecting input format for %s...", type(model).__name__)
+        fmt = detect_input_format(model, sample, device=device)
+        log.info(
+            "Detected: style=%s | family=%s | keys=%s",
+            fmt.style, fmt.model_family, fmt.input_keys,
+        )
+
+        # Detect model family for hardware-aware candidate selection
+        model_family = detect_model_type(model)
+        log.info("Model family: %s", model_family)
+
+        # Multi-GPU: apply FSDP if explicitly enabled and needed
+        if self.multi_gpu and self.num_gpus > 1:
+            from memopt.utils.multi_gpu import apply_fsdp, is_multi_gpu_needed
+            if is_multi_gpu_needed(model, self.hw):
+                model, fsdp_applied = apply_fsdp(model, self.num_gpus)
+                if fsdp_applied:
+                    log.info("FSDP: model sharded across %d GPUs", self.num_gpus)
+
         # Measure true baseline ONCE — latency + power simultaneously
-        baseline_ms, baseline_power = self._benchmark_with_power(model, sample_input)
+        baseline_ms, baseline_power = self._benchmark_with_power(model, fmt)
         log.info(
             "Baseline: %.2f ms | power: %s",
             baseline_ms, baseline_power.summary(),
         )
 
-        current_model = copy.deepcopy(model)
+        _param_count = sum(p.numel() for p in model.parameters())
+        if _param_count > 1e9:
+            log.info(
+                "Large model (%.1fB params): using in-place optimization "
+                "with state_dict snapshots for rollback",
+                _param_count / 1e9,
+            )
+            current_model = model  # work in-place; per-optimization snapshots handle rollback
+        else:
+            current_model = copy.deepcopy(model)
         state = AgentState(
             round_number=0,
             cumulative_speedup=1.0,
             rounds_without_commit=0,
             tried_candidates=set(),
             target_speedup=self.target_speedup,
+            fmt=fmt,
+            model_family=model_family,
         )
         rounds: List[AgentRound] = []
 
@@ -239,7 +308,7 @@ class MemoptAgent:
             log.info("\n--- Round %d ---", state.round_number)
 
             # Profile current model (uses select_optimizations for real GPU data)
-            profile = self._profile(current_model, sample_input)
+            profile = self._profile(current_model, fmt)
             state.current_bottleneck = profile.bottleneck_type
             state.last_arithmetic_intensity = profile.ai
 
@@ -267,7 +336,7 @@ class MemoptAgent:
                 break
 
             # Candidates for this bottleneck (excluding already-tried)
-            candidates = self._get_candidates(state)
+            candidates = self._get_candidates(state, current_model)
             round_committed:    List[str] = []
             round_rolled_back:  List[str] = []
             round_start_speedup = state.cumulative_speedup
@@ -281,14 +350,14 @@ class MemoptAgent:
                 log.info("  Trying: %s", candidate_name)
 
                 result = self._apply_optimization(
-                    current_model, sample_input, candidate_name
+                    current_model, fmt, candidate_name
                 )
 
                 if result.status == "COMMITTED":
                     current_model = result.optimized_model
 
                     # Re-measure against the ORIGINAL baseline (not current round start)
-                    new_ms = self._benchmark(current_model, sample_input)
+                    new_ms = self._benchmark(current_model, fmt)
                     state.cumulative_speedup = baseline_ms / new_ms if new_ms > 0 else 1.0
 
                     round_committed.append(candidate_name)
@@ -332,7 +401,7 @@ class MemoptAgent:
 
         # Measure final power on the optimized model
         final_model = current_model if all_committed else model
-        _, optimized_power = self._benchmark_with_power(final_model, sample_input)
+        _, optimized_power = self._benchmark_with_power(final_model, fmt)
 
         # Power reduction: positive = less watts = good
         if baseline_power.available and optimized_power.available and baseline_power.avg_watts > 0:
@@ -398,10 +467,53 @@ class MemoptAgent:
 
     # ── Candidate management ───────────────────────────────────────────────────
 
-    def _get_candidates(self, state: AgentState) -> List[str]:
-        """Return untried candidates for current bottleneck in priority order."""
-        all_candidates = OPTIMIZATION_PRIORITY.get(state.current_bottleneck, [])
-        return [c for c in all_candidates if c not in state.tried_candidates]
+    def _get_candidates(
+        self,
+        state: AgentState,
+        model: Optional[nn.Module] = None,
+    ) -> List[str]:
+        """
+        Return untried candidates for (model_family, hardware) in priority order.
+
+        Uses model_type_detector.get_applicable_optimizations() which is
+        hardware-aware (gates flash_attn3/fp8 on Hopper, flash_attn2 on Ampere+).
+
+        Falls back to static OPTIMIZATION_PRIORITY table if model_family lookup
+        yields nothing (ensures backward compat).
+        """
+        # Dynamic path: hardware + model-family aware
+        candidates = get_applicable_optimizations(
+            state.model_family,
+            self.hw,
+            tried=state.tried_candidates,
+        )
+
+        # Intersect with bottleneck-appropriate set from static table
+        # (COMPUTE_BOUND must still yield no candidates to trigger the OPTIMAL stop)
+        if state.current_bottleneck == "COMPUTE_BOUND":
+            return []
+
+        # Skip compile for >7B models
+        if model is not None:
+            param_count = sum(p.numel() for p in model.parameters())
+            if param_count > 7e9 and "compile" in candidates:
+                candidates = [c for c in candidates if c != "compile"]
+                log.info(
+                    "Skipping compile: model has %.1fB params "
+                    "(compile warmup overhead exceeds benefit at this scale)",
+                    param_count / 1e9,
+                )
+
+        # If dynamic path returned nothing, fall back to static table
+        if not candidates:
+            all_static = OPTIMIZATION_PRIORITY.get(state.current_bottleneck, [])
+            candidates = [c for c in all_static if c not in state.tried_candidates]
+            if model is not None:
+                param_count = sum(p.numel() for p in model.parameters())
+                if param_count > 7e9 and "compile" in candidates:
+                    candidates = [c for c in candidates if c != "compile"]
+
+        return candidates
 
     def _remaining_candidates(self, state: AgentState) -> List[str]:
         """Alias for _get_candidates (used by stop condition 3)."""
@@ -412,7 +524,7 @@ class MemoptAgent:
     def _profile(
         self,
         model: nn.Module,
-        sample_input: Dict[str, Any],
+        fmt: InputFormat,
     ) -> _ProfileResult:
         """
         Determine compute regime using select_optimizations().
@@ -426,7 +538,7 @@ class MemoptAgent:
             # Pass model directly — select_optimizations only reads it (no modification).
             # Avoid copy.deepcopy here: transformers 5.x models crash in named_modules()
             # after deepcopy due to stale Cython .so metadata interactions.
-            plan = select_optimizations(model, sample_input)
+            plan = select_optimizations(model, fmt)
         except Exception as exc:
             log.warning(
                 "_profile: select_optimizations failed (%s) — defaulting to MIXED", exc
@@ -472,7 +584,7 @@ class MemoptAgent:
     def _apply_optimization(
         self,
         model: nn.Module,
-        sample_input: Dict[str, Any],
+        fmt: InputFormat,
         candidate_name: str,
     ) -> _ApplyResult:
         """
@@ -486,42 +598,97 @@ class MemoptAgent:
         Commit thresholds:
           int8:         15%  (INT8_COMMIT_THRESHOLD_PCT in optimization_executor.py)
           all others:   5%   (default tolerance_pct)
+
+        For models >1B params, channels_last and sdpa use in-place application
+        with state_dict snapshot for rollback (avoids GPU deepcopy overhead).
+        compile and int8 always use deepcopy (compile wraps module; int8 changes arch).
         """
         commit_threshold = 0.15 if candidate_name == "int8" else 0.05
+        snapshot = None
 
         try:
-            candidate_model = copy.deepcopy(model)
+            # Fix D: memory headroom check before each attempt
+            if not self._check_memory_headroom(model):
+                return _ApplyResult(status="ROLLED_BACK", speedup=1.0, optimized_model=None)
 
-            if candidate_name == "channels_last":
-                plan = UniversalPlan(use_channels_last=True)
-                optimized = apply_universal_plan(candidate_model, sample_input, plan)
+            param_count = sum(p.numel() for p in model.parameters())
+            # Fix A: in-place + state_dict snapshot for large models
+            # (channels_last and sdpa don't change architecture → state_dict works)
+            # compile and int8 still use deepcopy (compile wraps; int8 changes layer types)
+            use_snapshot = (param_count > 1e9 and candidate_name in ("channels_last", "sdpa"))
 
-            elif candidate_name == "sdpa":
-                plan = UniversalPlan(use_sdpa=True)
-                optimized = apply_universal_plan(candidate_model, sample_input, plan)
+            if use_snapshot:
+                snapshot = self._snapshot_model(model, optimization_name=candidate_name)
+                # Measure baseline BEFORE applying in-place transformation
+                baseline_ms = self._benchmark(model, fmt)
 
-            elif candidate_name == "compile":
-                # safe_compile already has an internal regression guard (0.95 threshold).
-                # If it decides NOT to compile, it returns the original module unchanged.
-                # Then our own benchmark below will see speedup ≈ 1.0 → ROLLED_BACK.
-                optimized = safe_compile(
-                    candidate_model,
-                    sample_input,
-                    mode="reduce-overhead",
-                )
-
-            elif candidate_name == "int8":
-                optimized = self._apply_int8(candidate_model, sample_input)
+                if candidate_name == "channels_last":
+                    plan = UniversalPlan(use_channels_last=True)
+                    apply_universal_plan(model, fmt.inputs, plan)
+                    optimized = model
+                elif candidate_name == "sdpa":
+                    plan = UniversalPlan(use_sdpa=True)
+                    apply_universal_plan(model, fmt.inputs, plan)
+                    optimized = model
+                else:
+                    log.warning("Unknown snapshot candidate '%s' — skipping", candidate_name)
+                    self._restore_snapshot(model, snapshot)
+                    return _ApplyResult(status="ROLLED_BACK", speedup=1.0, optimized_model=None)
 
             else:
-                log.warning("Unknown candidate '%s' — skipping", candidate_name)
-                return _ApplyResult(
-                    status="ROLLED_BACK", speedup=1.0, optimized_model=None
-                )
+                candidate_model = copy.deepcopy(model)
 
-            # Measure speedup of this transformation vs the CURRENT model
-            baseline_ms  = self._benchmark(model, sample_input)
-            optimized_ms = self._benchmark(optimized, sample_input)
+                if candidate_name == "channels_last":
+                    plan = UniversalPlan(use_channels_last=True)
+                    optimized = apply_universal_plan(candidate_model, fmt.inputs, plan)
+
+                elif candidate_name == "sdpa":
+                    plan = UniversalPlan(use_sdpa=True)
+                    optimized = apply_universal_plan(candidate_model, fmt.inputs, plan)
+
+                elif candidate_name == "compile":
+                    # safe_compile already has an internal regression guard (0.95 threshold).
+                    # If it decides NOT to compile, it returns the original module unchanged.
+                    # Then our own benchmark below will see speedup ≈ 1.0 → ROLLED_BACK.
+                    optimized = safe_compile(
+                        candidate_model,
+                        fmt,
+                        mode="reduce-overhead",
+                    )
+
+                elif candidate_name == "int8":
+                    optimized = self._apply_int8(candidate_model, fmt)
+
+                elif candidate_name in ("flash_attn2", "flash_attn3"):
+                    version = 3 if candidate_name == "flash_attn3" else 2
+                    optimized = self._apply_flash_attention(candidate_model, version)
+
+                elif candidate_name == "fp8":
+                    optimized = self._apply_fp8(candidate_model)
+
+                elif candidate_name == "qkv_fusion":
+                    optimized = self._apply_qkv_fusion(candidate_model)
+
+                elif candidate_name == "awq_4bit":
+                    optimized = self._apply_awq(candidate_model, fmt)
+
+                elif candidate_name == "gptq_4bit":
+                    optimized = self._apply_gptq(candidate_model, fmt)
+
+                elif candidate_name == "moe_optimize":
+                    optimized = self._apply_moe(candidate_model, fmt)
+
+                else:
+                    log.warning("Unknown candidate '%s' — skipping", candidate_name)
+                    return _ApplyResult(
+                        status="ROLLED_BACK", speedup=1.0, optimized_model=None
+                    )
+
+                # Measure baseline from the original (unmodified) model
+                baseline_ms = self._benchmark(model, fmt)
+
+            # Measure optimized performance
+            optimized_ms = self._benchmark(optimized, fmt)
             speedup      = baseline_ms / optimized_ms if optimized_ms > 0 else 1.0
             improvement  = speedup - 1.0
 
@@ -540,18 +707,27 @@ class MemoptAgent:
                     "    %s: %.3fx (%.1f%% improvement < %.0f%% threshold) → ROLLBACK",
                     candidate_name, speedup, improvement * 100, commit_threshold * 100,
                 )
+                # Restore snapshot if we modified in-place
+                if use_snapshot and snapshot is not None:
+                    self._restore_snapshot(model, snapshot)
                 return _ApplyResult(
                     status="ROLLED_BACK", speedup=speedup, optimized_model=None
                 )
 
         except Exception as exc:
             log.warning("  %s raised exception: %s", candidate_name, exc)
+            # Restore snapshot if we modified in-place before the exception
+            if use_snapshot and snapshot is not None:
+                try:
+                    self._restore_snapshot(model, snapshot)
+                except Exception as restore_exc:
+                    log.warning("  snapshot restore also failed: %s", restore_exc)
             return _ApplyResult(status="ROLLED_BACK", speedup=1.0, optimized_model=None)
 
     def _apply_int8(
         self,
         model: nn.Module,
-        sample_input: Dict[str, Any],
+        fmt: InputFormat,
     ) -> nn.Module:
         """
         Apply torchao INT8 quantization with regime gate.
@@ -563,20 +739,21 @@ class MemoptAgent:
         Tier 2: Int8WeightOnlyConfig (weight_only fallback)
         Returns original if torchao unavailable or both tiers fail.
         """
-        # Extract batch and sequence length from sample_input
-        seq_len = 1
-        batch   = 1
-        for v in sample_input.values():
-            if isinstance(v, torch.Tensor) and v.ndim >= 2:
-                batch   = v.shape[0]
-                seq_len = v.shape[1]
-                break
+        seq_len = get_sequence_length(fmt) or 1
+        batch   = get_batch_size(fmt) or 1
 
-        in_regime = (seq_len >= 1024) and (batch * seq_len <= 4096)
+        # Delegate to 3-tier UniversalOptimizer gate
+        # (<7B: seq>=1024 AND batch*seq<=4096; 7B-20B: seq>=512; >20B: seq>=128)
+        from memopt.profiler.bottleneck_classifier import BottleneckType
+        in_regime = UniversalOptimizer()._should_apply_int8(
+            fmt,
+            BottleneckType.MEMORY_BOUND_DRAM,
+            model,
+        )
+
         if not in_regime:
             log.info(
-                "    int8: regime gate REJECTED (seq=%d, batch×seq=%d) — "
-                "need seq>=1024 and batch×seq<=4096",
+                "    int8: regime gate REJECTED (seq=%d, batch×seq=%d)",
                 seq_len, batch * seq_len,
             )
             return model  # unchanged → speedup ~1.0 → ROLLBACK
@@ -605,25 +782,159 @@ class MemoptAgent:
 
         return model  # both tiers failed → speedup ~1.0 → ROLLBACK
 
+    def _apply_flash_attention(
+        self,
+        model: nn.Module,
+        version: int = 2,
+    ) -> nn.Module:
+        """
+        Apply Flash Attention via the three-strategy cascade in flash_attention.py.
+        Returns the (possibly wrapped) model; strategy is logged internally.
+        The caller benchmarks and rolls back if speedup < threshold.
+        """
+        from memopt.phase3.flash_attention import apply_flash_attention
+        optimized, strategy = apply_flash_attention(model, version=version)
+        log.info("    flash_attn%d: strategy=%s", version, strategy)
+        return optimized
+
+    def _apply_fp8(
+        self,
+        model: nn.Module,
+    ) -> nn.Module:
+        """
+        Apply FP8 quantization via Transformer Engine (Hopper only).
+        Returns the (possibly wrapped) model; mode is logged internally.
+        The caller benchmarks and rolls back if speedup < threshold.
+        """
+        from memopt.phase3.fp8_optimizer import apply_fp8
+        optimized, mode = apply_fp8(model)
+        log.info("    fp8: mode=%s", mode)
+        return optimized
+
+    def _apply_qkv_fusion(
+        self,
+        model: nn.Module,
+    ) -> nn.Module:
+        """
+        Fuse Q/K/V projection triplets in transformer attention blocks.
+        Modifies model in-place; caller deepcopied before calling here.
+        Returns model (possibly with FusedQKVLinear modules substituted).
+        """
+        from memopt.phase3.qkv_fusion import apply_qkv_fusion
+        optimized, n_fused = apply_qkv_fusion(model)
+        log.info("    qkv_fusion: %d triplets fused", n_fused)
+        return optimized
+
+    def _apply_awq(
+        self,
+        model: nn.Module,
+        fmt,
+    ) -> nn.Module:
+        """
+        Apply AWQ 4-bit quantization.
+        Requires: autoawq installed, HuggingFace model with .config.
+        Returns original model if prerequisites not met or accuracy fails.
+        """
+        from memopt.phase3.quantization import apply_awq, is_quantization_candidate
+        if not is_quantization_candidate(model):
+            log.info("    awq_4bit: not a quantization candidate — skipping")
+            return model
+
+        # Try to get tokenizer from model config
+        tokenizer = self._get_tokenizer(model)
+        if tokenizer is None:
+            log.info("    awq_4bit: no tokenizer available — skipping")
+            return model
+
+        quantized, applied, reason = apply_awq(model, tokenizer, fmt=fmt)
+        log.info("    awq_4bit: applied=%s reason=%s", applied, reason)
+        return quantized if applied else model
+
+    def _apply_gptq(
+        self,
+        model: nn.Module,
+        fmt,
+    ) -> nn.Module:
+        """
+        Apply GPTQ 4-bit quantization (fallback after AWQ).
+        Returns original model if prerequisites not met or accuracy fails.
+        """
+        from memopt.phase3.quantization import apply_gptq, is_quantization_candidate
+        if not is_quantization_candidate(model):
+            log.info("    gptq_4bit: not a quantization candidate — skipping")
+            return model
+
+        tokenizer = self._get_tokenizer(model)
+        if tokenizer is None:
+            log.info("    gptq_4bit: no tokenizer available — skipping")
+            return model
+
+        quantized, applied, reason = apply_gptq(model, tokenizer, fmt=fmt)
+        log.info("    gptq_4bit: applied=%s reason=%s", applied, reason)
+        return quantized if applied else model
+
+    def _apply_moe(
+        self,
+        model: nn.Module,
+        fmt,
+    ) -> nn.Module:
+        """
+        Apply MoE optimization (router compile + expert prefetch).
+        Returns original model if no MoE structure found.
+        """
+        from memopt.phase3.moe_optimizer import apply_moe_optimization
+        optimized, applied = apply_moe_optimization(model, hardware=self.hw, fmt=fmt)
+        log.info("    moe_optimize: applied=%s", applied)
+        return optimized if applied else model
+
+    @staticmethod
+    def _get_tokenizer(model: nn.Module):
+        """
+        Try to retrieve a tokenizer for the model.
+
+        Checks:
+          1. model.tokenizer attribute (some wrapped models expose it)
+          2. model.config.name_or_path → AutoTokenizer.from_pretrained()
+
+        Returns tokenizer or None if unavailable.
+        """
+        # Check direct attribute
+        if hasattr(model, "tokenizer"):
+            return model.tokenizer
+
+        # Try loading from config
+        try:
+            config = getattr(model, "config", None)
+            if config is None:
+                return None
+            name = getattr(config, "name_or_path", None) or getattr(config, "_name_or_path", None)
+            if not name:
+                return None
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+            return tok
+        except Exception:
+            return None
+
     # ── Benchmarking ───────────────────────────────────────────────────────────
 
     def _benchmark(
         self,
         model: nn.Module,
-        sample_input: Dict[str, Any],
+        fmt: InputFormat,
         warmup: int = 5,
         iters: int = 20,
     ) -> float:
         """Median latency in ms using CUDA events (perf_counter fallback on CPU)."""
         def _run() -> Any:
-            return model(**sample_input)
+            return forward(model, fmt)
 
         return _bench_ms(_run, warmup=warmup, iters=iters)
 
     def _benchmark_with_power(
         self,
         model: nn.Module,
-        sample_input: Dict[str, Any],
+        fmt: InputFormat,
         iters: int = 50,
         token_count: int = 0,
     ) -> "Tuple[float, PowerReport]":
@@ -637,7 +948,7 @@ class MemoptAgent:
         # Warmup — GPU frequency ramps up, caches warm, no power measurement
         with torch.no_grad():
             for _ in range(5):
-                model(**sample_input)
+                forward(model, fmt)
         torch.cuda.synchronize()
 
         # Timed + power-sampled batch
@@ -647,7 +958,7 @@ class MemoptAgent:
             s.record()
             with torch.no_grad():
                 for _ in range(iters):
-                    model(**sample_input)
+                    forward(model, fmt)
             e.record()
             torch.cuda.synchronize()
             duration_ms = s.elapsed_time(e)
@@ -658,6 +969,133 @@ class MemoptAgent:
             token_count=token_count * iters,
         )
         return median_ms, power
+
+    # ── Change 1: 3-tier snapshot / restore for large models ───────────────────
+
+    @staticmethod
+    def _snapshot_model(model: nn.Module, optimization_name: str = None) -> Dict:
+        """
+        Snapshot strategy by model size:
+        - <1B params:  deepcopy (preserves compiled state, fast)
+        - 1B-7B params: full state_dict to CPU (safe, acceptable speed)
+        - >7B params:  layer-selective snapshot (only layers touched by optimization)
+        """
+        param_count = sum(p.numel() for p in model.parameters())
+
+        if param_count < 1e9:
+            return {
+                "type": "deepcopy",
+                "model": copy.deepcopy(model),
+                "param_count": param_count,
+            }
+
+        elif param_count < 7e9:
+            return {
+                "type": "state_dict",
+                "state": {k: v.cpu().clone() for k, v in model.state_dict().items()},
+                "param_count": param_count,
+            }
+
+        else:
+            # >7B: only snapshot layers relevant to this optimization
+            # SDPA touches attention layers only
+            # INT8 touches linear layers only
+            # channels_last touches conv layers only
+            layer_patterns = {
+                "sdpa":          ["attn", "attention", "self_attn"],
+                "int8":          ["q_proj", "k_proj", "v_proj", "o_proj",
+                                 "gate_proj", "up_proj", "down_proj",
+                                 "fc1", "fc2", "dense"],
+                "channels_last": ["conv"],
+                "compile":       [],  # skipped >7B — should never reach here
+            }
+
+            patterns = layer_patterns.get(optimization_name, [])
+
+            if not patterns:
+                # Unknown optimization or compile — snapshot nothing
+                # Rollback will re-profile and skip if needed
+                return {
+                    "type": "none",
+                    "param_count": param_count,
+                }
+
+            selective_state = {
+                k: v.cpu().clone()
+                for k, v in model.named_parameters()
+                if any(p in k for p in patterns)
+            }
+
+            log.info(
+                "Selective snapshot: %d tensors (%.0fM params) for optimization='%s'",
+                len(selective_state),
+                sum(v.numel() for v in selective_state.values()) / 1e6,
+                optimization_name,
+            )
+
+            return {
+                "type": "selective",
+                "state": selective_state,
+                "param_count": param_count,
+            }
+
+    @staticmethod
+    def _restore_snapshot(model: nn.Module, snapshot: Dict) -> nn.Module:
+        """Restore from any snapshot type."""
+        snap_type = snapshot["type"]
+
+        if snap_type == "deepcopy":
+            return snapshot["model"]
+
+        elif snap_type == "state_dict":
+            model.load_state_dict(snapshot["state"])
+            if next(model.parameters(), None) is not None:
+                device = next(model.parameters()).device
+                if device.type == "cpu":
+                    model.cuda()
+            return model
+
+        elif snap_type == "selective":
+            # Restore only the snapshotted layers in-place
+            current_state = model.state_dict()
+            for k, v in snapshot["state"].items():
+                current_state[k] = v.cuda()
+            model.load_state_dict(current_state)
+            return model
+
+        elif snap_type == "none":
+            # Nothing to restore — model unchanged (optimization was no-op)
+            return model
+
+        else:
+            raise ValueError(f"Unknown snapshot type: {snap_type}")
+
+    # ── Fix D: GPU memory headroom check ───────────────────────────────────────
+
+    @staticmethod
+    def _check_memory_headroom(model: nn.Module) -> bool:
+        """
+        Check if enough GPU memory exists to attempt optimization.
+        Needs ~1.5x model memory free for snapshot + candidate tensors.
+        Returns False if memory is too tight — skip optimization safely.
+        """
+        if not torch.cuda.is_available():
+            return True  # CPU path — no memory constraint
+        total     = torch.cuda.get_device_properties(0).total_memory
+        reserved  = torch.cuda.memory_reserved(0)
+        free      = total - reserved
+        model_bytes = sum(
+            p.numel() * p.element_size() for p in model.parameters()
+        )
+        headroom_needed = model_bytes * 1.5
+        has_headroom = free >= headroom_needed
+        if not has_headroom:
+            log.warning(
+                "Low GPU memory: free=%.1fGB needed=%.1fGB model=%.1fGB "
+                "— skipping optimization to avoid OOM",
+                free / 1e9, headroom_needed / 1e9, model_bytes / 1e9,
+            )
+        return has_headroom
 
     # ── Honest ceiling explanation ─────────────────────────────────────────────
 

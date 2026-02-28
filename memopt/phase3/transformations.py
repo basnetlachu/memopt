@@ -84,23 +84,25 @@ def _extract_tensor(output: Any) -> Any:
     """Return the primary tensor from model output (tensor / tuple / dict / ModelOutput)."""
     if not HAS_TORCH:
         raise RuntimeError("PyTorch not available")
+    # Delegate to the shared universal implementation in input_handler
+    try:
+        from memopt.utils.input_handler import extract_tensor as _ih_extract
+        result = _ih_extract(output)
+        if result is not None:
+            return result
+    except ImportError:
+        pass
+    # Fallback (should never reach here in normal operation)
     if isinstance(output, torch.Tensor):
         return output
     if isinstance(output, (tuple, list)):
         for item in output:
             if isinstance(item, torch.Tensor):
                 return item
-        raise ValueError("No tensor in tuple/list output")
     if isinstance(output, dict):
         for v in output.values():
             if isinstance(v, torch.Tensor):
                 return v
-        raise ValueError("No tensor in dict output")
-    # HuggingFace ModelOutput (dataclass with __dataclass_fields__ / __dict__)
-    if hasattr(output, '__iter__'):
-        for item in output:
-            if isinstance(item, torch.Tensor):
-                return item
     if hasattr(output, '__dict__'):
         for v in vars(output).values():
             if isinstance(v, torch.Tensor):

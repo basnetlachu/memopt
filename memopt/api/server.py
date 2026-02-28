@@ -262,49 +262,47 @@ def _build_sample_input(
     """
     Construct a sample input dict from input_shape.
 
-    Tries three strategies in order:
-      1. 2-D [batch, seq]  → transformer token IDs + attention_mask
-         Tries BERT (30522), GPT-2 (50257), and LLaMA (32000) vocab sizes.
-      2. Any shape → single float randn tensor as keyword arg.
-         Tries common kwarg names: x, input, inputs, hidden_states.
-      3. Positional fallback: returns {"_positional": tensor}.
-         run_optimization() unwraps this and calls model(tensor) directly.
+    Uses detect_input_format() for auto-detection first.
+    Falls back to shape-based heuristics if the model cannot run a probe.
 
-    The probe forward passes are intentionally swallowed so that
-    type/shape errors fall through to the next strategy quietly.
+    Returns a plain dict that can be used with model(**sample) or
+    {"_positional": tensor} as a last resort.
     """
     import torch
+    from memopt.utils.input_handler import detect_input_format
 
     shape = tuple(input_shape)
 
-    # ── Strategy 1: transformer input_ids ──────────────────────────────────
-    if len(shape) == 2:
-        for vocab in (30522, 50257, 32000):
-            try:
-                ids  = torch.randint(0, vocab, shape, device=device)
-                mask = torch.ones(shape, dtype=torch.long, device=device)
-                sample: Dict[str, Any] = {"input_ids": ids, "attention_mask": mask}
-                with torch.no_grad():
-                    model(**sample)
-                return sample
-            except Exception:
-                pass
-
-    # ── Strategy 2: float tensor with common kwarg names ───────────────────
-    t = torch.randn(*shape, device=device)
-    for kw in ("x", "input", "inputs", "hidden_states"):
+    # ── Auto-detection via detect_input_format ──────────────────────────────
+    # Build a probe tensor from shape and let detect_input_format try everything
+    if len(shape) == 2 and model is not None:
+        # Transformer probe: try integer tensor (token IDs)
         try:
-            sample = {kw: t}
-            with torch.no_grad():
-                model(**sample)
-            return sample
+            ids = torch.randint(0, 32000, shape, device=device)
+            fmt = detect_input_format(model, ids, device=str(device))
+            log.info("_build_sample_input: auto-detected style=%s keys=%s", fmt.style, fmt.input_keys)
+            return fmt.inputs
         except Exception:
             pass
 
-    # ── Strategy 3: positional fallback ────────────────────────────────────
+    if model is not None:
+        # General probe: float tensor
+        try:
+            t = torch.randn(*shape, device=device)
+            fmt = detect_input_format(model, t, device=str(device))
+            log.info("_build_sample_input: auto-detected style=%s keys=%s", fmt.style, fmt.input_keys)
+            # For positional style, wrap in a key the caller understands
+            if fmt.style == "positional":
+                return {"_positional": fmt.inputs["__tensor__"]}
+            return fmt.inputs
+        except Exception:
+            pass
+
+    # ── Fallback: shape-based heuristics (no model probe available) ─────────
+    t = torch.randn(*shape, device=device)
     log.warning(
-        "_build_sample_input: no keyword matched shape=%s; "
-        "using positional fallback — model(tensor)",
+        "_build_sample_input: auto-detection failed for shape=%s; "
+        "returning positional fallback",
         shape,
     )
     return {"_positional": t}
@@ -555,31 +553,18 @@ def run_agent_job(job_id: str) -> None:
         model = load_model_safe(job.model_path, device)
         model.eval()
 
+        # Build probe tensor from shape; agent.run() calls detect_input_format() internally
         raw_sample        = _build_sample_input(model, job.input_shape, device)
         positional_tensor = raw_sample.pop("_positional", None)
-        sample_input      = raw_sample
-
-        # Wrap positional models so agent's model(**sample_input) works correctly
-        if positional_tensor is not None:
-            _pt = positional_tensor
-
-            class _PosWrap(torch.nn.Module):
-                def __init__(self, m: torch.nn.Module) -> None:
-                    super().__init__()
-                    self._m = m
-
-                def forward(self, **_: Any) -> Any:
-                    return self._m(_pt)
-
-            model        = _PosWrap(model)
-            sample_input = {}
+        # Use raw positional tensor when available so detect_input_format can probe properly
+        sample_for_agent  = positional_tensor if positional_tensor is not None else raw_sample
 
         agent = MemoptAgent(
             target_speedup=job.target_speedup or 2.0,
             max_rounds=job.max_rounds or 10,
         )
 
-        report = agent.run(model, sample_input)
+        report = agent.run(model, sample_for_agent)
 
         speedup = report.final_speedup
         job.speedup = round(speedup, 4)

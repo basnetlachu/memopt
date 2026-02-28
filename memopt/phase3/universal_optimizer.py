@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import copy
 import logging
+import signal
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -22,6 +24,13 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger("memopt")
+
+# Lazy import to avoid circular dependency (input_handler imports torch, not universal_optimizer)
+def _get_input_handler():
+    from memopt.utils.input_handler import (
+        detect_input_format, forward, get_sequence_length, get_batch_size, InputFormat,
+    )
+    return detect_input_format, forward, get_sequence_length, get_batch_size, InputFormat
 
 # ---------------------------------------------------------------------------
 # 1. Runtime ridge-point detection
@@ -142,17 +151,29 @@ def _detect_conv(model: nn.Module) -> bool:
     return any(isinstance(m, nn.Conv2d) for _, m in model.named_modules())
 
 
-def _estimate_ai(model: nn.Module, sample_input: Dict[str, Any]) -> float:
+def _estimate_ai(model: nn.Module, sample_input) -> float:
     """
     Estimate arithmetic intensity = theoretical_flops / measured_dram_bytes.
 
     FLOPs:  sum over Linear/Conv2d/MultiheadAttention layers (theoretical).
     DRAM:   allocator peak-delta × 2 (each byte is read once + written once).
 
+    sample_input may be a Dict[str, Any] or an InputFormat.
     Returns inf if DRAM traffic cannot be measured (CPU-only or no allocation).
     """
+    detect_input_format, fwd, get_sequence_length, get_batch_size, InputFormat = _get_input_handler()
+
     if not torch.cuda.is_available():
         return float("inf")
+
+    # Normalise to InputFormat so we can call forward() universally
+    if isinstance(sample_input, InputFormat):
+        fmt = sample_input
+    else:
+        try:
+            fmt = detect_input_format(model, sample_input)
+        except Exception:
+            return float("inf")
 
     # ── DRAM via allocator ──────────────────────────────────────────────────
     torch.cuda.synchronize()
@@ -160,7 +181,7 @@ def _estimate_ai(model: nn.Module, sample_input: Dict[str, Any]) -> float:
     mem_before = torch.cuda.memory_allocated()
     try:
         with torch.no_grad():
-            model(**sample_input)
+            fwd(model, fmt)
         torch.cuda.synchronize()
     except Exception:
         return float("inf")
@@ -169,13 +190,8 @@ def _estimate_ai(model: nn.Module, sample_input: Dict[str, Any]) -> float:
 
     # ── FLOPs via module walk ───────────────────────────────────────────────
     total_flops = 0
-    # Infer batch × seq from the first tensor input
-    B, S = 1, 1
-    for v in sample_input.values():
-        if isinstance(v, torch.Tensor) and v.ndim >= 2:
-            B = v.shape[0]
-            S = v.shape[1] if v.ndim >= 3 else 1
-            break
+    B = get_batch_size(fmt) or 1
+    S = get_sequence_length(fmt) or 1
 
     for mod in model.modules():
         if isinstance(mod, nn.Linear):
@@ -197,11 +213,13 @@ def _estimate_ai(model: nn.Module, sample_input: Dict[str, Any]) -> float:
 
 def select_optimizations(
     model: nn.Module,
-    sample_input: Dict[str, Any],
+    sample_input,           # Dict[str, Any] | InputFormat | Any batch
     ridge: Optional[float] = None,
 ) -> UniversalPlan:
     """
     Profile model with sample_input, classify compute regime, return plan.
+
+    sample_input may be a dict, raw tensor, tuple, or InputFormat.
 
     Rules (from benchmark evidence on A100):
     - CNN  → channels_last + compile(reduce-overhead)       always safe
@@ -214,7 +232,7 @@ def select_optimizations(
 
     has_attn = _detect_attention(model)
     is_cnn   = _detect_conv(model)
-    ai       = _estimate_ai(model, sample_input)
+    ai       = _estimate_ai(model, sample_input)  # accepts dict or InputFormat
     is_mem   = (ai < ridge)
 
     plan = UniversalPlan(
@@ -278,13 +296,43 @@ def _bench_ms(
         return (time.perf_counter() - t0) * 1000 / iters
 
 
+def _compile_with_timeout(
+    module: nn.Module,
+    mode: str,
+    timeout_seconds: int = 300,
+) -> nn.Module:
+    """
+    Fix E: torch.compile with SIGALRM timeout (Linux main-thread only).
+    Falls back to no-timeout compile in worker threads or on non-Linux.
+    Returns original module on timeout.
+    """
+    can_alarm = (
+        hasattr(signal, "SIGALRM")
+        and threading.current_thread() is threading.main_thread()
+    )
+    if not can_alarm:
+        return torch.compile(module, mode=mode, fullgraph=False, backend="inductor")
+
+    def _handler(signum, frame):
+        raise TimeoutError(f"torch.compile timed out after {timeout_seconds}s")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout_seconds)
+    try:
+        return torch.compile(module, mode=mode, fullgraph=False, backend="inductor")
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 def safe_compile(
     module: nn.Module,
-    sample_input: Dict[str, Any],
+    sample_input,           # Dict[str, Any] | InputFormat | Any batch
     mode: str = "reduce-overhead",
     regression_threshold: float = 0.95,
     warmup_iters: int = 10,
     bench_iters: int = 50,
+    compile_timeout: int = 300,
 ) -> nn.Module:
     """
     Apply torch.compile only if it does not regress performance.
@@ -294,35 +342,60 @@ def safe_compile(
 
     Args:
         module:               The nn.Module to (potentially) compile.
-        sample_input:         Dict of kwargs for module(**sample_input).
+        sample_input:         Dict, tensor, tuple, or InputFormat.
         mode:                 torch.compile mode string.
         regression_threshold: Roll back if speedup < this value (0.95 = 5% margin).
         warmup_iters:         Warmup iterations before benchmarking.
         bench_iters:          Benchmark iterations.
+        compile_timeout:      Max seconds for torch.compile call (Fix E). 0 = no limit.
 
     Returns:
-        Compiled module (or original if compile regressed / failed).
+        Compiled module (or original if compile regressed / failed / timed out).
     """
+    detect_input_format, fwd, _, __, InputFormat = _get_input_handler()
     use_cuda = torch.cuda.is_available()
+    device = "cuda" if use_cuda else "cpu"
+
+    # Normalise sample_input to InputFormat once
+    if isinstance(sample_input, InputFormat):
+        fmt = sample_input
+    else:
+        try:
+            fmt = detect_input_format(module, sample_input, device=device)
+        except Exception as exc:
+            logger.warning("safe_compile: input detection failed (%s) — using original", exc)
+            return module
 
     def run_original():
-        return module(**sample_input)
+        return fwd(module, fmt)
 
     baseline_ms = _bench_ms(run_original, warmup=warmup_iters, iters=bench_iters, use_cuda=use_cuda)
 
+    # Fix A: skip inner deepcopy for large models — torch.compile wraps without
+    # modifying the module, so the original is safe to pass directly.
+    # For small models, deepcopy preserves compiled state if safe_compile is re-called.
+    param_count = sum(p.numel() for p in module.parameters())
+    module_to_compile = module if param_count > 1e9 else copy.deepcopy(module)
+
     try:
-        compiled = torch.compile(
-            copy.deepcopy(module),
-            mode=mode,
-            fullgraph=False,
-            backend="inductor",
-        )
+        if compile_timeout > 0:
+            compiled = _compile_with_timeout(module_to_compile, mode, compile_timeout)
+        else:
+            compiled = torch.compile(
+                module_to_compile,
+                mode=mode,
+                fullgraph=False,
+                backend="inductor",
+            )
+    except TimeoutError as exc:
+        logger.warning("safe_compile: %s — using original", exc)
+        return module
     except Exception as exc:
         logger.warning("safe_compile: torch.compile failed (%s) — using original", exc)
         return module
 
     def run_compiled():
-        return compiled(**sample_input)
+        return fwd(compiled, fmt)
 
     # Warmup the compiled version (first call triggers JIT — always slow)
     try:
@@ -460,3 +533,101 @@ def apply_universal_plan(
         result = safe_compile(result, compile_input, mode=plan.compile_mode)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 5. UniversalOptimizer — stateless helper with testable gate methods
+# ---------------------------------------------------------------------------
+
+class UniversalOptimizer:
+    """
+    Stateless helper class that wraps the module-level optimizer functions.
+    Provides individually testable gate methods (e.g., _should_apply_int8).
+    Instantiate with UniversalOptimizer() — no state, safe to share.
+    """
+
+    def _should_apply_int8(
+        self,
+        inputs,                         # Dict[str, Any] | InputFormat
+        bottleneck_type: Any,
+        model: Optional[nn.Module] = None,
+    ) -> bool:
+        """
+        INT8 regime gate — three tiers based on model size.
+
+        inputs may be a plain dict or an InputFormat (from detect_input_format).
+
+        Physics:
+        - Small models (<7B): need seq>=1024 to be memory-bound
+          (GEMM matrices too small at short seq for INT8 to win)
+        - Large models (7B-20B): memory-bound at seq>=512
+          (larger weight matrices = more memory traffic per token)
+        - Very large models (>20B): memory-bound at seq>=128
+          (30B weight matrices dominate bandwidth at any seq length)
+
+        Thresholds are physics-based estimates. The test-measure-commit loop
+        catches any cases where INT8 doesn't win in practice.
+        """
+        _, __, get_sequence_length, get_batch_size, InputFormat = _get_input_handler()
+
+        # Resolve COMPUTE_BOUND — support both string and enum
+        bottleneck_str = (
+            bottleneck_type.value
+            if hasattr(bottleneck_type, "value")
+            else str(bottleneck_type)
+        )
+        if "compute_bound" in bottleneck_str.lower():
+            logger.info("INT8 gate: SKIP — compute-bound")
+            return False
+
+        # Extract seq_len and batch via InputFormat helpers (or legacy dict path)
+        if isinstance(inputs, InputFormat):
+            seq_len = get_sequence_length(inputs) or 1
+            batch   = get_batch_size(inputs) or 1
+        else:
+            # Legacy dict path — try known key names, then first 2D+ tensor
+            seq_len = 1
+            batch   = 1
+            for key in ("input_ids", "inputs_embeds", "x", "input"):
+                if key in inputs and isinstance(inputs[key], torch.Tensor):
+                    t = inputs[key]
+                    batch   = t.shape[0]
+                    seq_len = t.shape[1] if t.ndim >= 2 else 1
+                    break
+            if seq_len == 1 and batch == 1:
+                for v in inputs.values():
+                    if isinstance(v, torch.Tensor) and v.ndim >= 2:
+                        batch   = v.shape[0]
+                        seq_len = v.shape[1]
+                        break
+
+        param_count = (
+            sum(p.numel() for p in model.parameters()) if model is not None else 0
+        )
+
+        # Tier 1: Very large models >=20B — always memory-bound
+        if param_count >= 20e9:
+            result = seq_len >= 128
+            logger.info(
+                "INT8 gate (>=20B, %.0fB params): seq=%d >= 128 → %s",
+                param_count / 1e9, seq_len, result,
+            )
+            return result
+
+        # Tier 2: Large models >=7B-<20B
+        elif param_count >= 7e9:
+            result = seq_len >= 512
+            logger.info(
+                "INT8 gate (>=7B-<20B, %.0fB params): seq=%d >= 512 → %s",
+                param_count / 1e9, seq_len, result,
+            )
+            return result
+
+        # Tier 3: Small models <7B — original calibrated gate
+        else:
+            result = (seq_len >= 1024) and (batch * seq_len <= 4096)
+            logger.info(
+                "INT8 gate (<7B, %.1fB params): seq=%d>=1024 AND batch*seq=%d<=4096 → %s",
+                param_count / 1e9, seq_len, batch * seq_len, result,
+            )
+            return result
