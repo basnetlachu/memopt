@@ -279,6 +279,18 @@ def _agent_build_sample(model, shape, device):
     return {"input": t}
 
 
+def cmd_scan(args):
+    """Scan GPU processes and print bottleneck report."""
+    from memopt.daemon.cli import cmd_scan as _scan
+    sys.exit(_scan(args))
+
+
+def cmd_apply(args):
+    """Apply optimizations to a running GPU process."""
+    from memopt.daemon.cli import cmd_apply as _apply
+    sys.exit(_apply(args))
+
+
 def cmd_daemon(args):
     """Daemon management commands."""
     from memopt.daemon import MemoptDaemon, DaemonConfig
@@ -464,6 +476,24 @@ def main():
         "--output", "-o", help="Output path for optimized model (default: <model>_optimized.pt)"
     )
     agent_parser.set_defaults(func=cmd_agent)
+
+    # scan command
+    scan_parser = subparsers.add_parser("scan", help="Scan GPU processes and show bottleneck report")
+    scan_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    scan_parser.add_argument("--watch", "-w", action="store_true", help="Continuously refresh")
+    scan_parser.add_argument("--interval", "-i", type=int, default=30, help="Refresh interval in seconds (default: 30)")
+    scan_parser.add_argument("--sample-seconds", type=int, default=5, dest="sample_seconds",
+                             help="Seconds to sample GPU utilization per process (default: 5)")
+    scan_parser.set_defaults(func=cmd_scan)
+
+    # apply command
+    apply_parser = subparsers.add_parser("apply", help="Apply optimizations to a running GPU process")
+    apply_parser.add_argument("--pid", type=int, required=True, help="PID of the GPU process to optimize")
+    apply_parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                              help="Generate wrapper but do not restart the process")
+    apply_parser.add_argument("--sample-seconds", type=int, default=5, dest="sample_seconds",
+                              help="Seconds to sample utilization (default: 5)")
+    apply_parser.set_defaults(func=cmd_apply)
 
     # daemon command
     daemon_parser = subparsers.add_parser("daemon", help="Daemon management")
