@@ -40,9 +40,13 @@ __all__ = [
     "OptimizationEvent",
     "ROICalculator",
     "ROIEstimate",
+    # Control plane reporter
+    "ControlPlaneReporter",
 ]
 
 # Zero-touch daemon + ROI
 from .zero_touch import ZeroTouchDaemon, OptimizationEvent
 from .zero_touch import DaemonConfig as ZeroDaemonConfig
 from .roi_calculator import ROICalculator, ROIEstimate
+# Control plane reporter
+from .reporter import ControlPlaneReporter

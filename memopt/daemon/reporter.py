@@ -366,3 +366,121 @@ def init_reporter(dashboard_url: str = None, **kwargs) -> DashboardReporter:
     global _reporter
     _reporter = DashboardReporter(dashboard_url=dashboard_url, **kwargs)
     return _reporter
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ControlPlaneReporter — sends ZeroTouchDaemon events to the control plane
+# ─────────────────────────────────────────────────────────────────────────────
+
+import urllib.request
+import urllib.error
+
+
+class ControlPlaneReporter:
+    """
+    Reports node status and events to the centralized memopt control plane.
+
+    Usage:
+        reporter = ControlPlaneReporter(
+            control_plane_url="http://control:8080"
+        )
+        reporter.add_events(events)
+        reporter.report(daemon)
+
+    If MEMOPT_CONTROL_PLANE env var is not set:
+        runs in standalone mode — no reporting, no error.
+    """
+
+    def __init__(self, control_plane_url: str = None):
+        self.url = (
+            control_plane_url or
+            os.getenv("MEMOPT_CONTROL_PLANE", "")
+        ).rstrip("/")
+        self.enabled = bool(self.url)
+        self._pending_events: list = []
+        self._lock = threading.Lock()
+
+        if self.enabled:
+            logger.info(f"Control plane reporter: {self.url}")
+        else:
+            logger.info("Control plane not configured — standalone mode")
+
+    def add_events(self, events: list):
+        """Buffer events to be sent on next report."""
+        with self._lock:
+            self._pending_events.extend(events)
+
+    def report(self, daemon) -> bool:
+        """
+        Send node report to control plane.
+        Returns True if successful, False if unreachable.
+        Never raises.
+        """
+        if not self.enabled:
+            return True
+
+        try:
+            import torch
+            gpu_count = torch.cuda.device_count()
+            total_vram_gb = sum(
+                torch.cuda.get_device_properties(i).total_memory / 1e9
+                for i in range(gpu_count)
+            ) if gpu_count > 0 else 0.0
+        except Exception:
+            gpu_count = 0
+            total_vram_gb = 0.0
+
+        with self._lock:
+            events_to_send = list(self._pending_events)
+            self._pending_events.clear()
+
+        summary = daemon.get_summary()
+
+        payload = {
+            "node_name": daemon.config.node_name,
+            "timestamp": time.time(),
+            "gpu_count": gpu_count,
+            "total_vram_gb": round(total_vram_gb, 1),
+            "active_processes": len(daemon.scanner.scan()),
+            "optimizations_applied": summary["total_optimizations"],
+            "dollar_saved_today": summary["total_dollar_saved"],
+            "dollar_saved_total": summary["total_dollar_saved"],
+            "current_workloads": [],
+            "new_events": [
+                {
+                    "timestamp": e.timestamp,
+                    "pid": e.pid,
+                    "model_family": e.model_family,
+                    "gpu_ids": e.gpu_ids,
+                    "optimizations_applied": e.optimizations_applied,
+                    "speedup_min": e.speedup_min,
+                    "speedup_max": e.speedup_max,
+                    "status": e.status,
+                    "dollar_saved_per_hour": e.dollar_saved_per_hour,
+                }
+                for e in events_to_send
+            ],
+        }
+
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.url}/api/v1/report",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    logger.debug(f"Reported to control plane: {resp.status}")
+                    return True
+        except urllib.error.URLError as e:
+            logger.warning(f"Control plane unreachable: {e} — continuing standalone")
+        except Exception as e:
+            logger.warning(f"Control plane report failed: {e}")
+
+        # Re-queue events that failed to send
+        with self._lock:
+            self._pending_events = events_to_send + self._pending_events
+
+        return False

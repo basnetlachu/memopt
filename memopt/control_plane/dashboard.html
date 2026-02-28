@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>memopt — Cluster Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+  header { background: #1a1d27; border-bottom: 1px solid #2d3748;
+           padding: 16px 24px; display: flex; align-items: center;
+           justify-content: space-between; }
+  header h1 { font-size: 20px; font-weight: 600; color: #fff; }
+  header h1 span { color: #6366f1; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%;
+                background: #10b981; display: inline-block; margin-right: 8px; }
+  .last-updated { font-size: 12px; color: #718096; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+  /* Summary cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+           gap: 16px; margin-bottom: 32px; }
+  .card { background: #1a1d27; border: 1px solid #2d3748; border-radius: 8px;
+          padding: 20px; }
+  .card-label { font-size: 12px; color: #718096; text-transform: uppercase;
+                letter-spacing: 0.05em; margin-bottom: 8px; }
+  .card-value { font-size: 28px; font-weight: 700; color: #fff; }
+  .card-value.green { color: #10b981; }
+  .card-value.yellow { color: #f59e0b; }
+  .card-value.blue { color: #6366f1; }
+  .card-sub { font-size: 12px; color: #718096; margin-top: 4px; }
+
+  /* Section */
+  .section { background: #1a1d27; border: 1px solid #2d3748; border-radius: 8px;
+             margin-bottom: 24px; overflow: hidden; }
+  .section-header { padding: 16px 20px; border-bottom: 1px solid #2d3748;
+                    font-size: 14px; font-weight: 600; color: #a0aec0; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; }
+  th { padding: 10px 16px; text-align: left; font-size: 11px;
+       color: #718096; text-transform: uppercase; letter-spacing: 0.05em;
+       border-bottom: 1px solid #2d3748; }
+  td { padding: 12px 16px; font-size: 13px; border-bottom: 1px solid #1e2130; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1e2130; }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+           font-size: 11px; font-weight: 600; }
+  .badge-online  { background: #064e3b; color: #10b981; }
+  .badge-offline { background: #450a0a; color: #f87171; }
+  .badge-idle    { background: #1e3a5f; color: #60a5fa; }
+  .badge-applied     { background: #064e3b; color: #10b981; }
+  .badge-recommended { background: #1e3a5f; color: #60a5fa; }
+  .badge-failed      { background: #450a0a; color: #f87171; }
+
+  .empty { padding: 40px; text-align: center; color: #4a5568; font-size: 14px; }
+  .refresh-btn { background: #2d3748; border: 1px solid #4a5568; color: #e2e8f0;
+                 padding: 6px 14px; border-radius: 6px; cursor: pointer;
+                 font-size: 13px; }
+  .refresh-btn:hover { background: #4a5568; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>mem<span>opt</span> — Cluster Dashboard</h1>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span class="last-updated" id="last-updated">Loading...</span>
+    <button class="refresh-btn" onclick="refresh()">Refresh</button>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Summary cards -->
+  <div class="cards" id="cards">
+    <div class="card">
+      <div class="card-label">Online Nodes</div>
+      <div class="card-value blue" id="c-online">—</div>
+      <div class="card-sub" id="c-total-nodes">of — total</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Total GPUs</div>
+      <div class="card-value blue" id="c-gpus">—</div>
+      <div class="card-sub" id="c-vram">— TB VRAM</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Active Workloads</div>
+      <div class="card-value" id="c-workloads">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Optimizations Applied</div>
+      <div class="card-value green" id="c-opts">—</div>
+      <div class="card-sub">all time</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Saved Last 24h</div>
+      <div class="card-value green" id="c-saved-day">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Annual Run Rate</div>
+      <div class="card-value green" id="c-saved-year">—</div>
+      <div class="card-sub">based on last 24h</div>
+    </div>
+  </div>
+
+  <!-- Nodes table -->
+  <div class="section">
+    <div class="section-header">Nodes</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Node</th>
+          <th>Status</th>
+          <th>GPUs</th>
+          <th>VRAM</th>
+          <th>Active</th>
+          <th>Optimizations</th>
+          <th>Saved Today</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody id="nodes-tbody">
+        <tr><td colspan="8" class="empty">Loading nodes...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Events table -->
+  <div class="section">
+    <div class="section-header">Recent Optimization Events</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Node</th>
+          <th>Model</th>
+          <th>Status</th>
+          <th>Speedup</th>
+          <th>Saved/hr</th>
+          <th>Optimizations</th>
+        </tr>
+      </thead>
+      <tbody id="events-tbody">
+        <tr><td colspan="7" class="empty">Loading events...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+
+<script>
+const fmt = {
+  dollars: v => v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` :
+                v >= 1e3 ? `$${(v/1e3).toFixed(1)}K` : `$${v.toFixed(0)}`,
+  time: ts => {
+    const d = new Date(ts * 1000);
+    return d.toLocaleTimeString();
+  },
+  ago: ts => {
+    const s = Math.floor(Date.now()/1000 - ts);
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    return `${Math.floor(s/3600)}h ago`;
+  },
+};
+
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    return await r.json();
+  } catch(e) {
+    console.error(url, e);
+    return null;
+  }
+}
+
+async function refresh() {
+  const [status, nodes, events] = await Promise.all([
+    fetchJSON('/api/v1/status'),
+    fetchJSON('/api/v1/nodes'),
+    fetchJSON('/api/v1/events?limit=50'),
+  ]);
+
+  if (status) {
+    document.getElementById('c-online').textContent = status.online_nodes ?? '—';
+    document.getElementById('c-total-nodes').textContent =
+      `of ${status.total_nodes ?? 0} total`;
+    document.getElementById('c-gpus').textContent = status.total_gpus ?? '—';
+    document.getElementById('c-vram').textContent =
+      `${((status.total_vram_gb ?? 0)/1024).toFixed(1)} TB VRAM`;
+    document.getElementById('c-workloads').textContent =
+      status.active_processes ?? '—';
+    document.getElementById('c-opts').textContent =
+      status.total_optimizations_applied ?? '—';
+    document.getElementById('c-saved-day').textContent =
+      fmt.dollars(status.dollar_saved_last_24h ?? 0);
+    document.getElementById('c-saved-year').textContent =
+      fmt.dollars(status.dollar_saved_per_year_estimate ?? 0);
+  }
+
+  if (nodes?.nodes) {
+    const tbody = document.getElementById('nodes-tbody');
+    if (!nodes.nodes.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No nodes reporting yet</td></tr>';
+    } else {
+      tbody.innerHTML = nodes.nodes.map(n => `
+        <tr>
+          <td style="font-family:monospace;font-size:12px">${n.node_name}</td>
+          <td><span class="badge badge-${n.status}">${n.status}</span></td>
+          <td>${n.gpu_count}</td>
+          <td>${n.total_vram_gb.toFixed(0)} GB</td>
+          <td>${n.active_processes}</td>
+          <td>${n.optimizations_applied}</td>
+          <td style="color:#10b981">${fmt.dollars(n.dollar_saved_today)}</td>
+          <td style="color:#718096;font-size:12px">${fmt.ago(n.last_seen)}</td>
+        </tr>
+      `).join('');
+    }
+  }
+
+  if (events?.events) {
+    const tbody = document.getElementById('events-tbody');
+    if (!events.events.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No optimization events yet</td></tr>';
+    } else {
+      tbody.innerHTML = events.events.map(e => {
+        let opts = [];
+        try { opts = JSON.parse(e.optimizations); } catch(_) {}
+        return `
+        <tr>
+          <td style="color:#718096;font-size:12px">${fmt.time(e.timestamp)}</td>
+          <td style="font-family:monospace;font-size:12px">${e.node_name}</td>
+          <td>${e.model_family}</td>
+          <td><span class="badge badge-${e.status}">${e.status}</span></td>
+          <td>${e.speedup_min.toFixed(1)}–${e.speedup_max.toFixed(1)}x</td>
+          <td style="color:#10b981">${fmt.dollars(e.dollar_saved_per_hour)}/hr</td>
+          <td style="font-size:11px;color:#718096">${opts.join(', ')}</td>
+        </tr>
+      `}).join('');
+    }
+  }
+
+  document.getElementById('last-updated').textContent =
+    `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+// Auto-refresh every 30 seconds
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

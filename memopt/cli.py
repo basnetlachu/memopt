@@ -279,6 +279,25 @@ def _agent_build_sample(model, shape, device):
     return {"input": t}
 
 
+def cmd_control_plane(args):
+    """Control plane management."""
+    from memopt.control_plane.cli import cmd_start
+    cmd_start(args)
+
+
+def cmd_cluster(args):
+    """Cluster status/nodes/events commands."""
+    from memopt.control_plane import cli as cp_cli
+    if args.cluster_command == "status":
+        cp_cli.cmd_status(args)
+    elif args.cluster_command == "nodes":
+        cp_cli.cmd_nodes(args)
+    elif args.cluster_command == "events":
+        cp_cli.cmd_events(args)
+    else:
+        print("Usage: memopt cluster status|nodes|events")
+
+
 def cmd_scan(args):
     """Scan GPU processes and print bottleneck report."""
     from memopt.daemon.cli import cmd_scan as _scan
@@ -476,6 +495,23 @@ def main():
         "--output", "-o", help="Output path for optimized model (default: <model>_optimized.pt)"
     )
     agent_parser.set_defaults(func=cmd_agent)
+
+    # control-plane command
+    cp_parser = subparsers.add_parser("control-plane", help="Start the memopt control plane server")
+    cp_sub = cp_parser.add_subparsers(dest="cp_command")
+    cp_start = cp_sub.add_parser("start", help="Start the control plane server")
+    cp_start.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
+    cp_start.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+    cp_parser.set_defaults(func=cmd_control_plane)
+
+    # cluster command
+    cluster_parser = subparsers.add_parser("cluster", help="Cluster management commands")
+    cluster_sub = cluster_parser.add_subparsers(dest="cluster_command")
+    cluster_sub.add_parser("status", help="Show cluster-wide status and ROI")
+    cluster_sub.add_parser("nodes", help="List all nodes and their state")
+    events_p = cluster_sub.add_parser("events", help="Show recent optimization events")
+    events_p.add_argument("--limit", type=int, default=20, help="Number of events to show (default: 20)")
+    cluster_parser.set_defaults(func=cmd_cluster)
 
     # scan command
     scan_parser = subparsers.add_parser("scan", help="Scan GPU processes and show bottleneck report")

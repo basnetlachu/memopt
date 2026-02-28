@@ -88,6 +88,10 @@ class ZeroTouchDaemon:
         self.total_optimizations = 0
         self.total_dollar_saved = 0.0
 
+        # Control plane reporter (no-op if MEMOPT_CONTROL_PLANE not set)
+        from memopt.daemon.reporter import ControlPlaneReporter
+        self.reporter = ControlPlaneReporter()
+
     def run(self) -> None:
         """
         Main daemon loop. Runs forever.
@@ -132,6 +136,9 @@ class ZeroTouchDaemon:
                 self.events.append(event)
 
         self._export_metrics(cycle_events)
+        # Report to control plane (no-op if not configured)
+        self.reporter.add_events(cycle_events)
+        self.reporter.report(self)
         return cycle_events
 
     def _handle_process(self, proc: GPUProcess) -> Optional[OptimizationEvent]:
