@@ -1,0 +1,115 @@
+# memopt single-server deployment
+# Usage:
+#   cp deployment/single-server/.env.example .env
+#   nano .env   # add MEMOPT_LICENSE_KEY and NODE_NAME
+#   docker-compose up -d
+
+version: '3.8'
+
+services:
+  memopt:
+    image: ghcr.io/memopt/memopt:latest
+    container_name: memopt
+    restart: unless-stopped
+
+    # GPU access — uses all GPUs on the host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Host PID namespace — required for memopt scan to see running LLMs
+    pid: host
+
+    # Privileged — required for nvidia-smi and /proc access
+    privileged: true
+
+    environment:
+      # ── Required ───────────────────────────────────────────────────────────
+      - MEMOPT_LICENSE_KEY=${MEMOPT_LICENSE_KEY}
+      - NODE_NAME=${NODE_NAME:-memopt-node}
+
+      # ── Optional — generated on first run if not set ───────────────────────
+      - MEMOPT_API_KEY=${MEMOPT_API_KEY:-}
+
+      # ── Operational config ─────────────────────────────────────────────────
+      - MEMOPT_MODE=${MEMOPT_MODE:-full}
+      - MEMOPT_GPU_COST_PER_HOUR=${MEMOPT_GPU_COST_PER_HOUR:-2.50}
+      - MEMOPT_SCAN_INTERVAL=${MEMOPT_SCAN_INTERVAL:-60}
+      - MEMOPT_SAMPLE_SECONDS=${MEMOPT_SAMPLE_SECONDS:-5}
+      - MEMOPT_AUTO_APPLY=${MEMOPT_AUTO_APPLY:-false}
+
+      # ── Multi-node (optional) ──────────────────────────────────────────────
+      # Set to URL of dedicated control plane for multi-node clusters
+      - MEMOPT_CONTROL_PLANE=${MEMOPT_CONTROL_PLANE:-}
+
+      # ── TLS / HTTPS (optional) ─────────────────────────────────────────────
+      - MEMOPT_HTTPS=${MEMOPT_HTTPS:-false}
+      - MEMOPT_DOMAIN=${MEMOPT_DOMAIN:-}
+      # MEMOPT_TLS_CERT and MEMOPT_TLS_KEY: base64-encoded PEM files
+      # Only needed if MEMOPT_HTTPS=true and no certs in memopt_data volume
+
+      # ── Keygen.sh (set at build time, not runtime) ─────────────────────────
+      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-YOUR_KEYGEN_ACCOUNT_ID}
+
+    ports:
+      - "8080:8080"   # Dashboard + control plane API
+      - "8000:8000"   # Per-node REST API + Prometheus /metrics
+      - "443:443"     # HTTPS (when MEMOPT_HTTPS=true)
+
+    volumes:
+      # Persist memopt state across container restarts
+      # (API key, license cache, SQLite DB, drift alerts, TLS certs)
+      - memopt_data:/root/.memopt
+      # Read-only /proc access for process detection on host
+      - /proc:/proc:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ── Optional: Prometheus ─────────────────────────────────────────────────
+  # Uncomment to include Prometheus in this stack.
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: memopt-prometheus
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - prometheus_data:/prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   command:
+  #     - '--config.file=/etc/prometheus/prometheus.yml'
+  #     - '--storage.tsdb.retention.time=30d'
+
+  # ── Optional: Grafana ────────────────────────────────────────────────────
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: memopt-grafana
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-memopt}
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #     - ./memopt/grafana/provisioning:/etc/grafana/provisioning:ro
+  #     - ./memopt/grafana/memopt_dashboard.json:/etc/grafana/dashboards/memopt.json:ro
+
+volumes:
+  memopt_data:
+  # prometheus_data:
+  # grafana_data:

@@ -1,6 +1,6 @@
 # memopt — Complete Technical Reference
 
-**Version:** 1.5.0
+**Version:** 1.8.0
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · PyTorch 2.6.0+cu124 · torchao 0.16.0
 
@@ -45,6 +45,12 @@
 35. [Zero-Touch Continuous Daemon (ZeroTouchDaemon)](#35-zero-touch-continuous-daemon-zerotouchdaemon)
 36. [Daemon ROI Calculator](#36-daemon-roi-calculator)
 37. [memopt-wrap: Zero-Touch Training CLI](#37-memopt-wrap-zero-touch-training-cli)
+38. [Centralized Control Plane](#38-centralized-control-plane)
+39. [Packaging / Build Configuration](#39-packaging--build-configuration)
+40. [Drift Alert System](#40-drift-alert-system)
+41. [Grafana Dashboard](#41-grafana-dashboard)
+42. [API Key Authentication](#42-api-key-authentication)
+43. [HTTPS / TLS](#43-https--tls)
 
 ---
 
@@ -119,10 +125,35 @@ memopt/
 │   ├── model_type_detector.py      Transformer / CNN / encoder-only / causal-LM classification
 │   ├── model_loader.py             Safe model loading helpers
 │   └── multi_gpu.py                FSDP / DDP wrappers
+├── alerts/
+│   ├── __init__.py                 Exports: AlertStore, DriftAlert, DriftDetector, AlertNotifier
+│   ├── alert_store.py              SQLite persistence for drift alerts (drift_alerts table)
+│   ├── drift_detector.py           Dual-signal regression detector — util drop + memory pressure
+│   └── notifier.py                 Fan-out notifier: log → Prometheus textfile → webhook → email
+├── auth/
+│   ├── __init__.py                 Exports: generate_key, save_key, load_key, verify_key, mask_key
+│   └── api_key.py                  API key generation, storage (~/.memopt/api_key), verification
+├── tls/
+│   ├── nginx.conf.template         nginx TLS termination — TLS 1.2+, HSTS, Mozilla Intermediate ciphers
+│   ├── setup_tls.sh                Interactive TLS setup (self-signed / Let's Encrypt / existing cert)
+│   └── README.md                   TLS setup guide and security property table
+├── control_plane/
+│   ├── __init__.py                 Package init — re-exports Database, NodeRecord, EventRecord, app
+│   ├── database.py                 SQLite WAL-mode store: nodes, events, metrics tables
+│   ├── server.py                   FastAPI server — 9 REST endpoints + HTML dashboard
+│   ├── dashboard.html              Single-file vanilla-JS dark dashboard (30s auto-refresh)
+│   └── cli.py                     `memopt control-plane start` / `memopt cluster status/nodes/events`
+├── grafana/
+│   ├── memopt_dashboard.json       9-panel Grafana dashboard (import or provision)
+│   ├── README.md                   Setup guide: node_exporter, scrape config, provisioning
+│   └── provisioning/
+│       ├── datasources/prometheus.yml   Auto-provision Prometheus datasource
+│       └── dashboards/memopt.yml        Auto-provision dashboard from file
 ├── wrap/
 │   ├── __init__.py
 │   ├── training_wrapper.py         TrainingWrapper — sitecustomize hook injection for training
 │   └── cli.py                      memopt-wrap console entry point
+├── setup.py                        Minimal shim — delegates everything to pyproject.toml
 └── workflows/
     └── ...                         CLI command implementations
 ```
@@ -1289,6 +1320,8 @@ ROI figures are projections from a formula. Actual savings depend on:
 
 `memopt/api/server.py` is a FastAPI application served by uvicorn on port 8080.
 
+**Authentication:** All endpoints except `/health` and `/metrics` require the `X-Memopt-API-Key` header. The key is auto-generated on first start and saved to `~/.memopt/api_key` (chmod 600). Override with the `MEMOPT_API_KEY` environment variable. See [Section 42](#42-api-key-authentication) for full details.
+
 ### 20.1 Data Models
 
 ```python
@@ -1320,7 +1353,7 @@ class JobRecord(BaseModel):
 
 ### 20.2 Endpoints
 
-**POST /optimize**
+**POST /optimize** 🔒 _(requires `X-Memopt-API-Key`)_
 
 ```
 Request body: OptimizationRequest
@@ -1328,21 +1361,23 @@ Response: {"job_id": "uuid4-string"}
 
 Status codes:
   202 Accepted  — job queued, use GET /status/{job_id} to poll
+  401 Unauthorized — missing or invalid API key
   503 Service Unavailable — job queue full (max_workers=2)
 ```
 
 Work is submitted to a `ThreadPoolExecutor(max_workers=2)` — GPU optimization is synchronous (not async-safe) so runs in threads, not coroutines. The `max_workers=2` limit prevents OOM from concurrent GPU workloads.
 
-**GET /status/{job_id}**
+**GET /status/{job_id}** 🔒 _(requires `X-Memopt-API-Key`)_
 
 ```
 Response: JobRecord JSON
 Status codes:
   200 OK          — job found (any status)
+  401 Unauthorized — missing or invalid API key
   404 Not Found   — unknown job_id
 ```
 
-**GET /health**
+**GET /health** _(no auth required — safe for k8s liveness probes)_
 
 ```json
 {
@@ -1353,7 +1388,7 @@ Status codes:
 }
 ```
 
-**GET /metrics** — Prometheus text format (via `make_asgi_app()` mounted sub-application, see Section 21)
+**GET /metrics** — Prometheus text format (via `make_asgi_app()` mounted sub-application, see Section 21). No auth required — safe for Prometheus scrape jobs.
 
 ### 20.3 load_model_safe()
 
@@ -1562,6 +1597,27 @@ threading.Thread(
 ```
 
 **nvidia-ml-py 12.x deprecation warnings:** The library emits deprecation warnings about function signatures in newer versions. These are warnings only — GPU metrics still populate correctly. Handled by the `except Exception` in the polling loop.
+
+### 21.5 Drift Alert Metrics (textfile)
+
+Written to `~/.memopt/metrics/drift_alerts.prom` by `AlertNotifier` (`memopt/alerts/notifier.py`). Collected by the same `node_exporter` textfile directory as the daemon metrics.
+
+```
+# HELP memopt_drift_alerts_total Total drift alerts fired since daemon start, by severity.
+# TYPE memopt_drift_alerts_total counter
+memopt_drift_alerts_total{severity="info"}     0
+memopt_drift_alerts_total{severity="warning"}  2
+memopt_drift_alerts_total{severity="critical"} 1
+
+# HELP memopt_drift_alert_active 1 if a drift alert is currently active (unresolved).
+# TYPE memopt_drift_alert_active gauge
+memopt_drift_alert_active{node="gpu-node-01",model="llama3",severity="warning"} 1
+```
+
+**Semantics:**
+- `memopt_drift_alerts_total` — monotonically increasing counter per severity; resets on daemon restart
+- `memopt_drift_alert_active` — gauge set to 1 when an alert fires; cleared to 0 when `AlertNotifier.mark_resolved()` is called after `AlertStore.resolve_alert()`
+- These metrics are the source for Grafana panels 8 and 9 in `memopt/grafana/memopt_dashboard.json`
 
 ---
 
@@ -1823,6 +1879,29 @@ memopt-wrap --dry-run python train.py
 # Works with any Python training command — torchrun, accelerate, deepspeed, etc.
 memopt-wrap torchrun --nproc_per_node=4 train_fsdp.py
 memopt-wrap accelerate launch train.py
+
+# ── Centralized control plane (v1.6.0) ───────────────────────────────────────
+
+# Start the control plane server (run once, anywhere on the network)
+memopt control-plane start
+memopt control-plane start --port 9090 --host 0.0.0.0
+
+# Cluster status — totals across all reporting nodes
+memopt cluster status
+# → Nodes: 5/5 online | GPUs: 40 (3200 GB VRAM) | Savings: $2,340/24h → $854,100/year
+
+# List all nodes with per-node metrics
+memopt cluster nodes
+# → NODE          STATUS  GPUs  VRAM  JOBS  OPTS  SAVED TODAY
+#   node-001      online     8  640GB    2     5    $847.50
+#   node-002      online     8  640GB    1     3    $423.75
+#   ...
+
+# Show recent optimization events across the cluster
+memopt cluster events
+memopt cluster events --limit 50
+# → TIME      NODE        MODEL     STATUS    SPEEDUP    $/HR
+#   14:23:11  node-001    llama2    applied   1.8-2.4x  $2.50
 ```
 
 **Input shape convention:**
@@ -3682,6 +3761,8 @@ def cmd_apply(args):
 
 **Phase 2 validation (zero-touch daemon + ROI + memopt-wrap):** 14/16 PASS, 2 SKIP on `ubuntu@216.81.248.151`, A100-SXM4-80GB, PyTorch 2.6.0+cu124. See §35.6 for full results.
 
+**Phase 3 validation (centralized control plane):** 16/16 PASS on `ubuntu@216.81.245.69`, A100-SXM4-80GB, PyTorch 2.6.0+cu124. See §38.5 for full results.
+
 **T11 detail — wrapper content verification:**
 
 The dry-run test launches a real `sleep(300)` subprocess so there is a valid `/proc/<pid>/cmdline` to read. It then verifies:
@@ -3848,7 +3929,7 @@ All tests on `ubuntu@216.81.248.151`, NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124
 | T10 | Prometheus metrics file written, contains `memopt_total_scans`, node name, event metric | **PASS** |
 | T11 | `memopt-wrap python train.py` runs to completion, exit 0, "Training complete" in stdout | **PASS** |
 | T12 | `memopt-wrap --dry-run python print_script.py` exits 0, script output preserved | **PASS** |
-| T13 | `pytest tests/ -q` — 48/48 tests passed, zero regressions | **PASS** |
+| T13 | `pytest tests/ -q` — 49/49 tests passed, zero regressions | **PASS** |
 
 T1/T1b are SKIP (not FAIL) because `helm` binary is not installed on a raw GPU worker node — this is the expected deployment topology. Helm runs on the control plane, not on GPU nodes.
 
@@ -3907,6 +3988,41 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 ```
+
+### 35.9 Drift Detection Integration
+
+`ZeroTouchDaemon` automatically tracks previously-optimized processes for utilisation regression. Three objects are created in `__init__`:
+
+```python
+self.alert_store    = AlertStore()      # SQLite persistence
+self.drift_detector = DriftDetector(self.alert_store)
+self.alert_notifier = AlertNotifier()   # log + textfile + optional webhook/email
+```
+
+**After a successful apply** (`_handle_process`, status="applied"):
+
+```python
+self.drift_detector.record_baseline(
+    pid=proc.pid,
+    node_name=self.config.node_name,
+    model_family=proc.model_family,
+    gpu_ids=proc.gpu_ids,
+    post_opt_util_pct=proc.gpu_utilization_pct,   # measured at optimization time
+    speedup_min=profile.expected_speedup_min,
+    speedup_max=profile.expected_speedup_max,
+    optimizations_applied=profile.recommended_optimizations,
+)
+```
+
+**Every scan cycle** (`run_once`, after `_export_metrics`):
+
+```python
+drift_alerts = self.drift_detector.check_all(processes)
+for alert in drift_alerts:
+    self.alert_notifier.notify(alert)
+```
+
+`check_all` skips PIDs that were optimized less than 1 hour ago and limits re-checks to once every 30 minutes per PID. Alerts use GPU utilisation as a proxy — not a direct throughput measurement. See Section 40 for full drift system details.
 
 ---
 
@@ -4144,3 +4260,990 @@ The hook directory (`/tmp/memopt_hook_XXXXX/`) is removed in a `finally` block a
 | `deepspeed --num_gpus=8 train.py` | Yes | Hook observes root model |
 | Docker / container | Yes | PYTHONPATH propagates into subprocess env |
 | Multi-node (NCCL) | Yes | Hook runs on each node independently |
+
+---
+
+## 38. Centralized Control Plane
+
+**Validated:** 16/16 PASS on NVIDIA A100-SXM4-80GB · `ubuntu@216.81.245.69` · PyTorch 2.6.0+cu124
+
+The centralized control plane is a single lightweight server that aggregates metrics, optimization events, and ROI data from all GPU nodes in the cluster. Nodes report every 60 seconds via HTTP POST; the control plane stores data in SQLite, serves a web dashboard, and exposes a REST API for the CLI.
+
+**Authentication:** All endpoints except `/health` require the `X-Memopt-API-Key` header (HTTP 401 otherwise). The key is auto-generated on first `startup` event and saved to `~/.memopt/api_key`. Override with `MEMOPT_API_KEY` env var. Reporters and CLI clients read the key automatically from the same path. See [Section 42](#42-api-key-authentication).
+
+### 38.1 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              memopt Control Plane Server                    │
+│             (FastAPI + SQLite WAL, port 8080)               │
+│                                                             │
+│  POST /api/v1/report  ←──── ZeroTouchDaemon (every 60s)    │
+│  GET  /api/v1/status  ─────► memopt cluster status          │
+│  GET  /api/v1/nodes   ─────► memopt cluster nodes           │
+│  GET  /api/v1/events  ─────► memopt cluster events          │
+│  GET  /                ────► HTML dashboard (browser)       │
+│  GET  /health          ────► liveness probe (k8s)           │
+└─────────────────────────────────────────────────────────────┘
+          ↑           ↑           ↑           ↑
+       node-001    node-002    node-003    node-NNN
+  (ZeroTouchDaemon with ControlPlaneReporter)
+```
+
+One server, N nodes. The server is stateless between restarts (SQLite is durable). Nodes are stateless about the server — if the control plane is unreachable, the daemon continues running standalone without error.
+
+### 38.2 Database (`control_plane/database.py`)
+
+SQLite with WAL mode (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=NORMAL`). Three tables:
+
+**`nodes`** — one row per node, upserted on every report:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `node_name` | TEXT PK | Hostname / pod name |
+| `last_seen` | REAL | Unix timestamp of last report |
+| `gpu_count` | INT | Number of GPUs on this node |
+| `total_vram_gb` | REAL | Total VRAM across all GPUs |
+| `active_processes` | INT | LLM/training processes currently running |
+| `optimizations_applied` | INT | Cumulative total optimizations on this node |
+| `dollar_saved_today` | REAL | Rolling 24h dollar savings |
+| `dollar_saved_total` | REAL | All-time dollar savings on this node |
+| `status` | TEXT | `"online"` / `"offline"` |
+| `current_workloads` | TEXT | JSON array of `WorkloadInfo` |
+
+**`events`** — append-only optimization event log:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Auto-increment |
+| `timestamp` | REAL | Unix timestamp of the event |
+| `node_name` | TEXT | Source node |
+| `pid` | INT | Process ID that was optimized |
+| `model_family` | TEXT | `llama2`, `bert`, `gpt2`, etc. |
+| `gpu_ids` | TEXT | JSON array of GPU indices |
+| `optimizations` | TEXT | JSON array of optimization names applied |
+| `speedup_min` | REAL | Conservative speedup estimate |
+| `speedup_max` | REAL | Optimistic speedup estimate |
+| `status` | TEXT | `"applied"`, `"recommended"`, `"failed"` |
+| `dollar_saved_per_hour` | REAL | ROI in $/hr for this event |
+
+**`metrics`** — time-series (reserved for future use, not yet queried by dashboard).
+
+**Connection pattern:** Each database method creates a new `sqlite3.connect()` call and closes it on exit. This is intentional — SQLite WAL mode handles concurrent reads from the dashboard and writes from reporting nodes correctly with connection-per-request isolation.
+
+**Offline detection:** `mark_offline_nodes(timeout_seconds=180)` is called on every report. Any node not seen within 3 minutes is marked `status="offline"`. This runs automatically — no separate scheduler needed.
+
+### 38.3 REST API (`control_plane/server.py`)
+
+All endpoints below require `X-Memopt-API-Key` except `/health`. HTTP 401 is returned on missing or invalid key.
+
+**`POST /api/v1/report`** 🔒 — called by every node's `ControlPlaneReporter` every 60s:
+
+```json
+{
+  "node_name": "gpu-node-01",
+  "timestamp": 1748432591.3,
+  "gpu_count": 8,
+  "total_vram_gb": 640.0,
+  "active_processes": 2,
+  "optimizations_applied": 47,
+  "dollar_saved_today": 847.50,
+  "dollar_saved_total": 12430.00,
+  "current_workloads": [
+    {"model_family": "llama2", "mode": "inference", "speedup_applied": 2.1, "gpu_ids": [0, 1]}
+  ],
+  "new_events": [
+    {
+      "timestamp": 1748432580.1,
+      "pid": 18423,
+      "model_family": "llama2",
+      "gpu_ids": [0, 1],
+      "optimizations_applied": ["flash_attention", "torch_compile"],
+      "speedup_min": 1.8,
+      "speedup_max": 2.4,
+      "status": "applied",
+      "dollar_saved_per_hour": 2.50
+    }
+  ]
+}
+```
+
+Response: `{"ok": true, "node": "gpu-node-01"}`
+
+**`GET /api/v1/status`** — cluster-wide summary:
+
+```json
+{
+  "total_nodes": 5,
+  "online_nodes": 4,
+  "offline_nodes": 1,
+  "total_gpus": 40,
+  "total_vram_gb": 3200.0,
+  "active_processes": 9,
+  "total_optimizations_applied": 234,
+  "dollar_saved_last_24h": 4237.50,
+  "dollar_saved_total": 62150.00,
+  "dollar_saved_per_year_estimate": 1546687.50
+}
+```
+
+`dollar_saved_per_year_estimate = dollar_saved_last_24h × 365`
+
+**`GET /api/v1/nodes`** — all nodes with current state. Returns `{"nodes": [...], "total": N}`.
+
+**`GET /api/v1/nodes/{node_name}`** — single node detail with `recent_events` (last 20).
+
+**`GET /api/v1/events?limit=100&node_name=X&status=applied`** — event history with optional filters.
+
+**`GET /api/v1/alerts?node_name=X&severity=warning&include_resolved=false`** — drift alerts. By default returns only unresolved alerts, newest first. Returns:
+
+```json
+{
+  "alerts": [
+    {
+      "id": 3,
+      "pid": 18423,
+      "node_name": "gpu-node-01",
+      "model_family": "llama2",
+      "gpu_ids": [0, 1],
+      "baseline_util_pct": 85.0,
+      "current_util_pct": 52.0,
+      "util_drop_pct": 38.8,
+      "severity": "warning",
+      "recommended_action": "Run: memopt scan --pid 18423 ...",
+      "resolved": 0
+    }
+  ],
+  "total": 1,
+  "active_counts": {"critical": 0, "warning": 1, "info": 0}
+}
+```
+
+**`POST /api/v1/alerts/{id}/resolve`** — mark a drift alert resolved (operator acknowledged). Returns `{"ok": true, "resolved_id": 3}`.
+
+**`GET /health`** — `{"status": "ok", "timestamp": 1748432591.3}` (liveness probe).
+
+**`GET /`** — serves `dashboard.html` as `text/html`.
+
+### 38.4 HTML Dashboard (`control_plane/dashboard.html`)
+
+Single static HTML file, no build step, no external dependencies. Served directly from the FastAPI process.
+
+- **Dark theme** (`#0f1117` background, `#58a6ff` accent)
+- **Summary cards** — Nodes Online, Total GPUs, Total VRAM, Active Jobs, Optimizations, 24h Savings, Annual Rate, Drift Alerts
+- **Nodes table** — one row per node; status badge (green=online, red=offline), GPU count, VRAM, jobs, opts, savings
+- **Events table** — timestamp, node, model family, status badge, speedup range, $/hr
+- **Auto-refresh** every 30 seconds via `setInterval(refresh, 30000)`
+- **Parallel fetch** — `Promise.all([status, nodes, events])` — all three API calls in one round-trip
+
+Accessed at `http://<control-plane-host>:8080/` in any browser.
+
+### 38.5 Node Reporter (`daemon/reporter.py` — `ControlPlaneReporter`)
+
+`ControlPlaneReporter` is appended to the existing `reporter.py`. It runs inside `ZeroTouchDaemon` and sends one HTTP POST per scan cycle.
+
+**Standalone mode:** If `MEMOPT_CONTROL_PLANE` env var is empty/unset, `self.enabled = False`. All calls to `report()` return `True` immediately without any network activity. The daemon logs "Control plane not configured — standalone mode" once at startup. No crash, no error.
+
+**Active mode:** Set `MEMOPT_CONTROL_PLANE=http://control:8080`. The reporter:
+1. Collects GPU count + total VRAM via `torch.cuda.device_count()` / `torch.cuda.get_device_properties()`
+2. Calls `daemon.get_summary()` for optimization totals
+3. Calls `daemon.scanner.scan()` for active process count
+4. Drains the pending event buffer (thread-safe with `threading.Lock`)
+5. Reads the API key via `load_key()` (from `MEMOPT_API_KEY` env var or `~/.memopt/api_key`) and adds `X-Memopt-API-Key` header to all POST requests
+6. POSTs via `urllib.request` (stdlib only — zero new dependencies)
+7. On failure: re-queues events, logs warning, returns `False`. Never raises.
+
+**Thread safety:** Events are buffered with `self._pending_events` protected by `self._lock`. `add_events()` and `report()` both acquire the lock, so events are never lost or double-sent even if `run_once()` calls them from a background thread.
+
+**ZeroTouchDaemon integration:**
+
+```python
+# In ZeroTouchDaemon.__init__:
+from memopt.daemon.reporter import ControlPlaneReporter
+self.reporter = ControlPlaneReporter()   # reads MEMOPT_CONTROL_PLANE env var
+
+# In ZeroTouchDaemon.run_once(), after _export_metrics():
+self.reporter.add_events(cycle_events)   # buffer events from this scan cycle
+self.reporter.report(self)               # POST to control plane (or no-op)
+```
+
+**Deployment:**
+
+```bash
+# Each GPU node:
+MEMOPT_CONTROL_PLANE=http://control-plane.internal:8080 \
+  python -m memopt.daemon.zero_touch
+```
+
+### 38.5 Validation Results (16/16 PASS)
+
+All tests on `ubuntu@216.81.245.69`, NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124. A real FastAPI server is started on port 18080 with a temporary SQLite database for the duration of the test.
+
+| Test | Description | Result |
+|------|-------------|--------|
+| T1 | `GET /health` → `{"status": "ok"}` | **PASS** |
+| T2 | Empty cluster: `total_nodes=0`, `total_gpus=0` | **PASS** |
+| T3 | `POST /api/v1/report` → `{"ok": true, "node": "node-001"}` | **PASS** |
+| T4 | Node stored: `gpu_count=8`, `status="online"` | **PASS** |
+| T5 | Cluster summary: `total_gpus=8`, `total_vram_gb=640.0` | **PASS** |
+| T6 | Events stored and returned: `model_family="llama2"`, `status="applied"` | **PASS** |
+| T7 | 5 nodes report → `total_nodes=5`, `total_gpus=40` | **PASS** |
+| T8 | ROI fields present: `dollar_saved_last_24h ≥ 0`, `dollar_saved_per_year_estimate ≥ 0` | **PASS** |
+| T9 | Dashboard HTML contains `"memopt"`, `"Cluster Dashboard"`, `"/api/v1/status"` | **PASS** |
+| T10 | `ControlPlaneReporter(url="")` → `reporter.enabled == False` | **PASS** |
+| T11 | `ControlPlaneReporter(url=BASE).report(mock_daemon)` → `True` | **PASS** |
+| T12 | Reporter with unreachable URL → returns `False`, does not raise | **PASS** |
+| T13 | `GET /api/v1/nodes/node-001` → `node_name` present, `recent_events` key present | **PASS** |
+| T14 | `GET /api/v1/events?node_name=node-001` → all events have `node_name="node-001"` | **PASS** |
+| T15 | Offline detection: node last seen 5 min ago → `status="offline"` after `mark_offline_nodes(180)` | **PASS** |
+| T16 | `pytest tests/` → 49/49 passed, zero regressions | **PASS** |
+
+### 38.6 CLI (`control_plane/cli.py`)
+
+Registered as subcommands of `memopt`:
+
+```
+memopt control-plane start [--port 8080] [--host 0.0.0.0]
+memopt cluster status
+memopt cluster nodes
+memopt cluster events [--limit 20]
+```
+
+All `cluster` subcommands read `MEMOPT_CONTROL_PLANE` env var (default: `http://localhost:8080`) and exit with a clear error message if the control plane is unreachable.
+
+### 38.7 Quick Start
+
+```bash
+# 1. Start control plane (anywhere on the network — VM, bare metal, k8s pod)
+memopt control-plane start --port 8080
+
+# 2. Configure each GPU node to report
+export MEMOPT_CONTROL_PLANE=http://control-plane.internal:8080
+python -m memopt.daemon.zero_touch   # daemon reports every 60s automatically
+
+# 3. View cluster
+memopt cluster status
+memopt cluster nodes
+memopt cluster events
+
+# 4. Browser dashboard
+open http://control-plane.internal:8080
+```
+
+---
+
+## 39. Packaging / Build Configuration
+
+### 39.1 `pyproject.toml`
+
+The single source of truth for the package. Uses PEP 517/518 (`setuptools` build backend):
+
+```toml
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memopt"
+version = "1.0.0"
+requires-python = ">=3.8"
+dependencies = ["torch>=2.0.0", "numpy>=1.24.0"]
+
+[project.optional-dependencies]
+daemon = ["pynvml>=11.0.0", "pyyaml>=6.0", "httpx>=0.24.0"]
+dev    = ["pytest>=7.4.0", "cython>=3.0", "black>=23.0.0"]
+
+[project.scripts]
+memopt      = "memopt.cli:main"
+memopt-wrap = "memopt.wrap.cli:main"
+
+[project.urls]
+Homepage      = "https://memopt.com"
+Documentation = "https://docs.memopt.com"
+```
+
+The `daemon` extras group (`pynvml`, `pyyaml`, `httpx`) must be installed for `ZeroTouchDaemon`, `ControlPlaneReporter`, and `DashboardReporter` to function. The base install (`pip install memopt`) only requires PyTorch and NumPy.
+
+The control plane server (`fastapi`, `uvicorn`) is intentionally left out of `pyproject.toml` extras — it is expected to be installed in a dedicated environment on the control plane host, not on every GPU node.
+
+### 39.2 `setup.py`
+
+A minimal shim that delegates all configuration to `pyproject.toml`:
+
+```python
+from setuptools import setup
+
+setup()
+```
+
+This file exists for compatibility with tools that call `python setup.py` directly (older pip, some CI systems). Modern `pip install` and `python -m build` use `pyproject.toml` exclusively. The shim contains no configuration — everything is in `pyproject.toml`.
+
+### 39.3 Package List
+
+All 20 namespace packages explicitly declared in `[tool.setuptools] packages`:
+
+```
+memopt                memopt.profiler       memopt.measurement
+memopt.optimization   memopt.validation     memopt.daemon
+memopt.training       memopt.phase3         memopt.business
+memopt.formatters     memopt.workflows      memopt.utils
+memopt.api            memopt.agent          memopt.serving
+memopt.wrap           memopt.control_plane  memopt.alerts
+memopt.auth           memopt.tls
+```
+
+`memopt.auth` — API key generation, storage, and verification (no new runtime dependencies — uses `hmac`, `hashlib`, `secrets` from stdlib).
+
+`memopt.tls` — nginx TLS configuration template and setup script (not imported as Python; shell tooling only).
+
+### 39.4 Validation
+
+```bash
+# Check pyproject.toml is valid TOML with all required fields
+python3 -c "import tomllib; tomllib.load(open('pyproject.toml','rb')); print('OK')"
+
+# Check setup.py is valid Python
+python3 -c "import ast; ast.parse(open('setup.py').read()); print('OK')"
+
+# Dry-run install (resolves deps, validates entry points, no disk changes)
+pip install --dry-run -e .
+# → Would install memopt-1.0.0
+```
+
+---
+
+## 40. Drift Alert System
+
+The drift alert system (`memopt/alerts/`) monitors previously-optimized GPU processes for performance regression without disrupting production workloads.
+
+### 40.1 Design Rationale
+
+Memopt cannot re-run its benchmark suite on a live production process — doing so would inject artificial load and disrupt the workload. Instead, it uses **GPU utilisation** (already collected by `GPUScanner` every scan cycle via pynvml) as a **proxy signal**:
+
+- Immediately after optimization, utilisation is in a known range (measured at that moment)
+- If utilisation drops significantly in later scans, something changed: driver update, workload shift, thermal throttling, or a competing tenant
+
+**False-alarm reduction (v1.8.0):** A single utilisation signal is unreliable — workload variance, thermal throttling, or batch size changes can all cause transient drops. The detector now requires **both** of the following signals to agree before firing any alert:
+
+1. **GPU utilisation drop** > 20% (relative)
+2. **Memory pressure change** > 40 percentage points (absolute)
+
+If only one signal fires, the event is logged at `DEBUG` level only — no `DriftAlert` is created, no notification is sent.
+
+**PID reuse protection (v1.8.0):** Between optimization and the next drift check, the OS may recycle a PID. Before every check, the MD5 of `/proc/<pid>/cmdline` is compared against the hash stored at baseline time. A mismatch causes the baseline to be silently discarded. On non-Linux systems or when `/proc` is unreadable, this check is skipped (assume same process — conservative, never raises).
+
+Alerts always say "Possible drift detected — verify with `memopt scan --pid <PID>`". They are never presented as confirmed regressions.
+
+### 40.2 Package Structure
+
+```
+memopt/alerts/
+├── __init__.py        Exports: AlertStore, DriftAlert, DriftDetector, AlertNotifier, OptimizationBaseline
+├── alert_store.py     SQLite persistence (drift_alerts table appended to control_plane DB)
+├── drift_detector.py  Baseline recording + utilisation regression checks
+└── notifier.py        Fan-out delivery: log → Prometheus textfile → webhook → email
+```
+
+### 40.3 `AlertStore` (`alert_store.py`)
+
+Adds a `drift_alerts` table to the same SQLite file used by the control plane (`~/.memopt/control_plane/memopt.db`). Uses WAL journal mode; thread-safe with connection-per-call pattern.
+
+**`DriftAlert` dataclass:**
+
+```python
+@dataclass
+class DriftAlert:
+    pid: int
+    node_name: str
+    model_family: str
+    gpu_ids: List[int]
+    optimization_timestamp: float     # when optimization was applied
+    detection_timestamp: float        # when drift was detected
+    baseline_util_pct: float          # GPU util right after optimization
+    current_util_pct: float           # GPU util at detection time
+    util_drop_pct: float              # percentage-point drop (0–100)
+    original_speedup_min: float
+    original_speedup_max: float
+    optimizations_originally_applied: List[str]
+    severity: str                     # "info" | "warning" | "critical"
+    recommended_action: str
+    resolved: bool = False
+    id: Optional[int] = None
+```
+
+**Key methods:**
+
+| Method | Description |
+|--------|-------------|
+| `save_alert(alert)` | Insert alert, return `rowid` |
+| `get_active_alerts(node_name, severity)` | Unresolved alerts, newest first |
+| `resolve_alert(alert_id)` | Mark resolved (operator acknowledged) |
+| `get_all_alerts(limit=100)` | Full history including resolved |
+| `count_active_by_severity()` | `{"warning": 2, "critical": 1, "info": 0}` |
+
+### 40.4 `DriftDetector` (`drift_detector.py`)
+
+**Constants:**
+
+```python
+DEFAULT_UTIL_DRIFT_THRESHOLD      = 0.20   # 20% relative drop → signal 1
+DEFAULT_MEMORY_PRESSURE_THRESHOLD = 0.40   # 40 pp absolute change → signal 2
+MIN_DRIFT_CHECK_DELAY_S           = 3600   # wait 1 hour after optimization before first check
+DRIFT_CHECK_INTERVAL_S            = 1800   # re-check same PID at most every 30 minutes
+```
+
+**`OptimizationBaseline` dataclass** — captured immediately after optimization:
+
+```python
+@dataclass
+class OptimizationBaseline:
+    pid: int
+    node_name: str
+    model_family: str
+    gpu_ids: List[int]
+    optimization_timestamp: float
+    post_opt_util_pct: float         # reference utilisation (proxy)
+    post_opt_speedup_min: float
+    post_opt_speedup_max: float
+    optimizations_applied: List[str]
+    last_checked: float = 0.0
+    # v1.8.0 additions ──────────────────────────────────────────────────────
+    post_opt_vram_mb: float = 0.0          # VRAM used by process right after opt
+    cmdline_hash: str = ""                 # MD5(/proc/<pid>/cmdline) at opt time
+    post_opt_memory_pressure: float = 0.0  # util / (vram_fraction * 100)
+```
+
+**Memory pressure formula:**
+
+```
+memory_pressure = util_pct / (vram_fraction * 100)
+    where vram_fraction = vram_used_mb / total_vram_mb
+
+Interpretation:
+  > 1.0  GPU is busy relative to its memory footprint (expected after opt)
+  < 0.5  Workload slowed or memory usage ballooned (model reload, batch change)
+Returns 0.0 if total_vram_mb or vram_used_mb is 0 — treated as "unavailable".
+```
+
+**`record_baseline(pid, ..., post_opt_vram_mb, total_vram_mb)` call site** — `ZeroTouchDaemon._handle_process()` immediately after `ApplyEngine.apply()` returns success. Computes and stores `cmdline_hash` and `post_opt_memory_pressure` at record time.
+
+**`check_all(current_processes)` — called every scan cycle:**
+
+```
+for each tracked PID:
+  1. skip if now - optimization_timestamp < 3600s  (cooldown)
+  2. skip if now - last_checked < 1800s            (rate limit)
+  3. PID-reuse check: MD5(current cmdline) vs stored hash
+       mismatch → silently discard baseline, continue
+  4. skip if PID not in current scan               (process exited → remove baseline)
+  5. skip if baseline_util < 1.0%                  (can't detect drift from zero)
+  6. dual-signal evaluation (_should_fire_alert):
+       signal1 = util_drop > 0.20
+       signal2 = |current_pressure - baseline_pressure| > 0.40
+       both true  → DriftAlert created, persisted, returned
+       only one   → log.debug only, no alert
+```
+
+**`_should_fire_alert()` — dual-signal logic:**
+
+```python
+util_drop = (baseline_util - current_util_pct) / baseline_util
+current_pressure = util_pct / (vram_used_mb / total_vram_mb * 100)
+pressure_change  = abs(current_pressure - baseline.post_opt_memory_pressure)
+
+signal1 = util_drop > self.threshold                    # 20%
+signal2 = pressure_change > self.mem_pressure_threshold # 40 pp
+
+if signal1 and signal2:  → fire DriftAlert
+elif signal1 or signal2: → log.debug only, return None
+```
+
+**`_is_same_process(pid, baseline)` — PID-reuse detection:**
+
+```python
+# Returns True (skip check) if:
+#   - baseline.cmdline_hash is "" (recorded before v1.8.0 — backward compat)
+#   - /proc/<pid>/cmdline is unreadable (non-Linux / permission denied)
+# Returns False (discard baseline) if hash changed
+```
+
+**Severity thresholds (heuristic — not derived from GPU hardware physics):**
+
+| `util_drop` | Severity |
+|-------------|----------|
+| 20–30% | `info` |
+| 30–50% | `warning` |
+| >50% | `critical` |
+
+### 40.5 `AlertNotifier` (`notifier.py`)
+
+Fan-out delivery. `notify()` **never raises** — a failed channel logs a warning and the daemon continues.
+
+**Channels:**
+
+| Channel | Always active? | Config |
+|---------|---------------|--------|
+| Python `logging` | Yes | Standard logging hierarchy |
+| Prometheus textfile | Yes (if dir writable) | `~/.memopt/metrics/drift_alerts.prom` |
+| Webhook POST | Optional | `MEMOPT_ALERT_WEBHOOK_URL` env var |
+| SMTP email | Optional | `MEMOPT_ALERT_SMTP_HOST` + related env vars |
+
+**Webhook payload:**
+
+```json
+{
+  "event": "memopt_drift_alert",
+  "severity": "warning",
+  "pid": 18423,
+  "node": "gpu-node-01",
+  "model": "llama2",
+  "gpu_ids": [0, 1],
+  "baseline_util_pct": 85.0,
+  "current_util_pct": 52.0,
+  "util_drop_pct": 38.8,
+  "speedup_range": [1.8, 2.4],
+  "optimizations": ["flash_attention", "torch_compile"],
+  "recommended_action": "Run: memopt scan --pid 18423 ...",
+  "detection_ts": 1748435000.0
+}
+```
+
+**Environment variables:**
+
+```
+MEMOPT_ALERT_WEBHOOK_URL       POST target for JSON alerts
+MEMOPT_ALERT_SMTP_HOST         SMTP server hostname
+MEMOPT_ALERT_SMTP_PORT         SMTP port (default 587)
+MEMOPT_ALERT_SMTP_USER         SMTP username
+MEMOPT_ALERT_SMTP_PASS         SMTP password
+MEMOPT_ALERT_EMAIL_FROM        Sender address
+MEMOPT_ALERT_EMAIL_TO          Recipient address
+```
+
+### 40.6 Validation Results
+
+**Original drift alert suite — 17/17 PASS** (Python 3.12, no GPU required):
+
+| Test | Description | Result |
+|------|-------------|--------|
+| T1 | `AlertStore` schema initialised — `drift_alerts` table exists | **PASS** |
+| T2 | `save_alert()` returns positive integer row id | **PASS** |
+| T3 | `get_active_alerts()` returns saved alert with `resolved=0` | **PASS** |
+| T4 | `resolve_alert(id)` → alert removed from active set | **PASS** |
+| T5 | `DriftDetector.record_baseline()` stores baseline correctly | **PASS** |
+| T6 | `check_all()` fires alert when util drop > 20% threshold | **PASS** |
+| T7 | `_severity()` returns correct level for each range | **PASS** |
+| T8 | `AlertNotifier.notify()` does not raise with no channels configured | **PASS** |
+| T9 | `notify()` writes `drift_alerts.prom` with correct metric names | **PASS** |
+| T10 | Counter increments on each `notify()` call | **PASS** |
+| T11 | `mark_resolved()` clears active gauge from textfile | **PASS** |
+| T12 | `ZeroTouchDaemon._handle_process()` calls `record_baseline()` after successful apply | **PASS** |
+| T13 | `ZeroTouchDaemon.run_once()` calls `check_all()` and `notifier.notify()` | **PASS** |
+| T14 | `GET /api/v1/alerts` returns 200 with `alerts`, `total`, `active_counts` keys | **PASS** |
+| T15 | `POST /api/v1/alerts/{id}/resolve` returns `{"ok": true, "resolved_id": id}` | **PASS** |
+| T16 | Grafana dashboard JSON valid, 9 panels, correct `uid` | **PASS** |
+| T17 | Grafana provisioning YAML files are valid | **PASS** |
+
+**v1.8.0 security + dual-signal suite — 15/15 PASS** (`/tmp/test_security_drift.py`, Python 3.12, no GPU required for T1–T14):
+
+| Test | Description | Result |
+|------|-------------|--------|
+| T01 | Key format: `sk-memopt-` prefix + 64 hex chars | **PASS** |
+| T02 | `save_key()` writes to `~/.memopt/api_key` with chmod 600 | **PASS** |
+| T03 | `load_key()` reads key from file | **PASS** |
+| T04 | `MEMOPT_API_KEY` env var takes priority over file | **PASS** |
+| T05 | `verify_key()` uses `hmac.compare_digest` — rejects bad key | **PASS** |
+| T06 | `GET /optimize` with correct key → 202 (not 401) | **PASS** |
+| T07 | `GET /optimize` with wrong key → 401 | **PASS** |
+| T08 | `GET /health` (no key) → 200 always | **PASS** |
+| T09 | TLS template and setup script exist in `memopt/tls/` | **PASS** |
+| T10 | nginx template enforces `ssl_protocols TLSv1.2 TLSv1.3` | **PASS** |
+| T11 | Single-signal only → no DriftAlert created (dual-signal required) | **PASS** |
+| T12 | Dual-signal → DriftAlert created and saved to AlertStore | **PASS** |
+| T13 | PID-reuse detection: changed cmdline hash → baseline discarded | **PASS** |
+| T14 | `_compute_memory_pressure()` returns 0.0 when VRAM = 0 | **PASS** |
+| T15 | `pytest tests/` — zero regressions (CUDA required; skipped without GPU) | **SKIP** (local) / **PASS** (A100) |
+
+---
+
+## 41. Grafana Dashboard
+
+Nine-panel Grafana dashboard at `memopt/grafana/memopt_dashboard.json`. All metric names are sourced from the actual codebase — no synthetic or hypothetical names.
+
+### 41.1 Panels
+
+| # | Title | Query | Source |
+|---|-------|-------|--------|
+| 1 | GPU Utilisation % | `memopt_gpu_utilization_percent` | api/server.py (pynvml gauge, 15s) |
+| 2 | GPU Memory Used | `memopt_gpu_memory_used_bytes` | api/server.py (pynvml gauge) |
+| 3 | GPU Power Draw (W) | `memopt_gpu_power_watts` | api/server.py (pynvml gauge) |
+| 4 | Optimisation Speedup | `histogram_quantile(0.5/0.95, rate(memopt_speedup_ratio_bucket[5m]))` | api/server.py histogram |
+| 5 | Optimisations Applied (rate) | `rate(memopt_optimizations_applied_total[5m])` | api/server.py counter |
+| 6 | Dollar Savings / Hour | `sum(memopt_dollar_saved_per_hour) by (node)` | zero_touch.py textfile |
+| 7 | Daemon Scan Rate | `rate(memopt_total_scans[5m])` | zero_touch.py textfile |
+| 8 | Active Drift Alerts | `memopt_drift_alert_active` | notifier.py textfile |
+| 9 | Drift Alert Rate | `rate(memopt_drift_alerts_total[15m])` | notifier.py textfile |
+
+Panels 1–5 require the API server scrape job (`localhost:8000/metrics`). Panels 6–9 require `node_exporter` textfile collector pointed at `~/.memopt/metrics/`.
+
+### 41.2 Provisioning Files
+
+```
+memopt/grafana/
+├── memopt_dashboard.json                         Import or auto-provision
+├── README.md                                     Setup guide
+└── provisioning/
+    ├── datasources/prometheus.yml                Grafana datasource auto-config
+    └── dashboards/memopt.yml                     Dashboard file provider config
+```
+
+**`provisioning/datasources/prometheus.yml`:**
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    jsonData:
+      timeInterval: "15s"
+      httpMethod: POST
+```
+
+**`provisioning/dashboards/memopt.yml`:**
+
+```yaml
+apiVersion: 1
+providers:
+  - name: memopt
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+```
+
+### 41.3 Quick Start
+
+**Step 1 — node_exporter with textfile collector:**
+
+```bash
+node_exporter \
+  --collector.textfile.directory=$HOME/.memopt/metrics \
+  --web.listen-address=:9100
+```
+
+**Step 2 — Prometheus scrape config (`prometheus.yml`):**
+
+```yaml
+scrape_configs:
+  - job_name: memopt_api
+    static_configs:
+      - targets: ['localhost:8000']    # FastAPI /metrics endpoint
+
+  - job_name: memopt_node
+    static_configs:
+      - targets: ['localhost:9100']    # node_exporter textfile metrics
+```
+
+**Step 3 — Grafana provisioning (auto-load):**
+
+```bash
+cp memopt/grafana/provisioning/datasources/prometheus.yml \
+   /etc/grafana/provisioning/datasources/
+
+cp memopt/grafana/provisioning/dashboards/memopt.yml \
+   /etc/grafana/provisioning/dashboards/
+
+cp memopt/grafana/memopt_dashboard.json \
+   /etc/grafana/dashboards/
+
+systemctl restart grafana-server
+```
+
+Dashboard loads automatically at `http://localhost:3000` as **"memopt — GPU Optimization"** (uid: `memopt-gpu-optimization`).
+
+**Step 4 — Manual import (alternative):**
+
+In Grafana UI: **Dashboards → Import → Upload JSON file** → select `memopt/grafana/memopt_dashboard.json`.
+
+### 41.4 Dashboard Settings
+
+| Setting | Value |
+|---------|-------|
+| Refresh | 30 seconds |
+| Default time range | Last 1 hour |
+| Theme | Dark |
+| UID | `memopt-gpu-optimization` |
+| Tags | `memopt`, `gpu`, `optimization` |
+
+---
+
+## 42. API Key Authentication
+
+**Added in v1.8.0.** All memopt HTTP endpoints (REST API server and control plane) are protected by a static API key. The auth layer uses stdlib only (`hmac`, `hashlib`, `secrets`, `stat`) — no new runtime dependencies.
+
+### 42.1 Key Format
+
+```
+sk-memopt-<64 hex characters>
+```
+
+Generated by `secrets.token_hex(32)` — 256 bits of cryptographic randomness. The `sk-memopt-` prefix makes keys identifiable in logs and secrets scanners.
+
+### 42.2 Storage and Loading (`memopt/auth/api_key.py`)
+
+```python
+KEY_PREFIX  = "sk-memopt-"
+KEY_ENV_VAR = "MEMOPT_API_KEY"
+_DEFAULT_KEY_PATH = Path.home() / ".memopt" / "api_key"
+```
+
+**Priority order (highest first):**
+
+1. `MEMOPT_API_KEY` environment variable — overrides everything
+2. `~/.memopt/api_key` — auto-created on first server start
+
+**`get_or_create_key(path=None)`** — called at server startup. If no key exists, generates one, saves it with `chmod 600`, and returns it. Subsequent calls load the existing key.
+
+**`save_key(key, path=None)`** — writes the key and immediately calls `path.chmod(stat.S_IRUSR | stat.S_IWUSR)` (mode `0o600`). The parent directory is created if absent.
+
+**`mask_key(key)`** — returns `"sk-memopt-<8 chars>…[redacted]"` for safe logging. The first 18 characters are visible; the rest are hidden.
+
+### 42.3 Verification (`verify_key`)
+
+```python
+def verify_key(provided: Optional[str], stored: Optional[str]) -> bool:
+    if not provided or not stored:
+        return False
+    return hmac.compare_digest(
+        provided.encode("utf-8"),
+        stored.encode("utf-8"),
+    )
+```
+
+`hmac.compare_digest` performs a constant-time comparison — immune to timing side-channel attacks. A naive `==` comparison would leak key length information via timing.
+
+### 42.4 FastAPI Integration
+
+Both servers use `fastapi.security.api_key.APIKeyHeader` and `fastapi.Security`:
+
+```python
+from fastapi import HTTPException, Security
+from fastapi.security.api_key import APIKeyHeader
+from memopt.auth.api_key import get_or_create_key, verify_key
+
+_API_KEY: str = ""
+_api_key_header = APIKeyHeader(name="X-Memopt-API-Key", auto_error=False)
+
+def verify_api_key(key: str = Security(_api_key_header)) -> str:
+    if not verify_key(key, _API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return key
+
+# Protected route:
+@app.post("/optimize")
+def optimize(req: OptimizationRequest, _: str = Security(verify_api_key)):
+    ...
+```
+
+`auto_error=False` is intentional — we raise our own `HTTPException(401)` with a human-readable detail message rather than FastAPI's default 403.
+
+### 42.5 Protected vs Exempt Endpoints
+
+| Server | Protected (401 without key) | Always exempt |
+|--------|-----------------------------|---------------|
+| `api/server.py` | `/optimize`, `/status/{job_id}`, `/agent` | `/health`, `/metrics` |
+| `control_plane/server.py` | `/api/v1/report`, `/api/v1/status`, `/api/v1/nodes`, `/api/v1/events`, `/api/v1/nodes/{name}`, `/api/v1/alerts`, `/api/v1/alerts/{id}/resolve`, `/` (dashboard) | `/health` |
+
+`/health` is always exempt — Kubernetes liveness/readiness probes must be able to reach it without credentials.
+
+`/metrics` is exempt — Prometheus scrape jobs run under a service account and typically cannot pass custom headers in all deployment configurations.
+
+### 42.6 Client Usage
+
+**CLI (`memopt cluster status` etc.):**
+
+```python
+from memopt.auth.api_key import load_key
+
+def fetch(path: str) -> dict:
+    key = load_key()
+    headers = {}
+    if key:
+        headers["X-Memopt-API-Key"] = key
+    req = urllib.request.Request(url, headers=headers)
+    ...
+```
+
+**Daemon reporter (`daemon/reporter.py` — `ControlPlaneReporter`):**
+
+```python
+self._api_key = load_key() or ""
+# In report():
+if self._api_key:
+    headers["X-Memopt-API-Key"] = self._api_key
+```
+
+**curl:**
+
+```bash
+export MEMOPT_API_KEY=$(cat ~/.memopt/api_key)
+curl -H "X-Memopt-API-Key: $MEMOPT_API_KEY" http://localhost:8080/api/v1/status
+```
+
+### 42.7 Key Rotation
+
+Replace the key at any time:
+
+```bash
+# Generate new key
+python3 -c "from memopt.auth.api_key import generate_key, save_key; save_key(generate_key())"
+
+# Or set a custom key via env var
+export MEMOPT_API_KEY="sk-memopt-<your-64-hex-chars>"
+```
+
+Restart all servers after rotation. Reporters and CLI clients pick up the new key automatically on next invocation (they call `load_key()` on each request).
+
+---
+
+## 43. HTTPS / TLS
+
+**Added in v1.8.0.** memopt uses an nginx reverse proxy for TLS termination. uvicorn continues to listen on plain HTTP on localhost; nginx handles all external TLS. This keeps uvicorn configuration simple and avoids coupling TLS cert management to the Python process.
+
+### 43.1 Architecture
+
+```
+Internet / cluster network
+         │  HTTPS :443
+         ▼
+┌─────────────────────┐
+│       nginx         │  TLS termination
+│  (memopt.conf)      │  TLS 1.2 / 1.3
+│                     │  HSTS
+│                     │  Modern ciphers
+└─────────────────────┘
+         │  HTTP :8080 (localhost only)
+         ▼
+┌─────────────────────┐
+│      uvicorn        │  FastAPI application
+│   (memopt server)   │  Plain HTTP
+└─────────────────────┘
+```
+
+### 43.2 Setup Script (`memopt/tls/setup_tls.sh`)
+
+Three modes:
+
+**Mode 1 — Self-signed (dev / internal):**
+
+```bash
+sudo ./memopt/tls/setup_tls.sh \
+    --mode self-signed \
+    --domain memopt.example.com
+```
+
+Generates a 4096-bit RSA certificate valid for 10 years under `/etc/ssl/memopt/`. Browsers will show an untrusted certificate warning; internal clients can use `--insecure` / `verify=False`.
+
+**Mode 2 — Let's Encrypt (production, requires public DNS):**
+
+```bash
+sudo ./memopt/tls/setup_tls.sh \
+    --mode letsencrypt \
+    --domain memopt.example.com \
+    --email  admin@example.com
+```
+
+Requires `certbot` and that `memopt.example.com` resolves to this machine's public IP. Auto-renewal cron is added automatically (`certbot renew` at 03:00 daily).
+
+**Mode 3 — Bring your own cert:**
+
+```bash
+sudo ./memopt/tls/setup_tls.sh \
+    --mode    existing \
+    --domain  memopt.example.com \
+    --cert    /path/to/fullchain.pem \
+    --key     /path/to/privkey.pem
+```
+
+**What the script does in all modes:**
+
+1. Generates or locates the TLS certificate and key
+2. Renders `nginx.conf.template` → `/etc/nginx/conf.d/memopt.conf` (variable substitution via `sed`)
+3. Runs `nginx -t` to validate the config
+4. Reloads nginx (`systemctl reload nginx` or `nginx -s reload`)
+
+**Optional `--upstream`:** Default proxy target is `127.0.0.1:8080`. Override:
+
+```bash
+sudo ./memopt/tls/setup_tls.sh --mode self-signed \
+    --domain memopt.internal \
+    --upstream 127.0.0.1:9090
+```
+
+### 43.3 nginx Configuration (`memopt/tls/nginx.conf.template`)
+
+The template enforces the following security properties:
+
+| Property | Value |
+|---|---|
+| Minimum TLS version | TLS 1.2 (TLS 1.3 preferred) |
+| Cipher suite | Mozilla "Intermediate" — ECDHE only, no RC4/3DES/export |
+| Forward secrecy | Yes (ECDHE key exchange) |
+| HSTS | `max-age=31536000; includeSubDomains` |
+| OCSP stapling | Enabled |
+| Session tickets | Disabled (`ssl_session_tickets off`) |
+| X-Frame-Options | `DENY` |
+| X-Content-Type-Options | `nosniff` |
+| Referrer-Policy | `strict-origin-when-cross-origin` |
+
+**HTTP → HTTPS redirect** — port 80 redirects all traffic to HTTPS with `301`. The ACME challenge path (`/.well-known/acme-challenge/`) is served from `/var/www/certbot` before the redirect, so certbot's webroot workflow works even after the redirect is in place.
+
+**Full cipher list (Mozilla Intermediate):**
+
+```
+ECDHE-ECDSA-AES128-GCM-SHA256
+ECDHE-RSA-AES128-GCM-SHA256
+ECDHE-ECDSA-AES256-GCM-SHA384
+ECDHE-RSA-AES256-GCM-SHA384
+ECDHE-ECDSA-CHACHA20-POLY1305
+ECDHE-RSA-CHACHA20-POLY1305
+DHE-RSA-AES128-GCM-SHA256
+DHE-RSA-AES256-GCM-SHA384
+```
+
+`ssl_prefer_server_ciphers off` — allows the client to choose the preferred cipher from this list, which enables hardware-accelerated ChaCha20 on mobile/ARM clients.
+
+### 43.4 Testing
+
+```bash
+# Health check (no auth required, TLS)
+curl https://memopt.example.com/health
+
+# Protected endpoint (API key required, TLS)
+curl -H "X-Memopt-API-Key: $(cat ~/.memopt/api_key)" \
+     https://memopt.example.com/api/v1/status
+
+# Verify TLS 1.1 is rejected
+openssl s_client -connect memopt.example.com:443 -tls1_1 2>&1 | grep "handshake failure"
+# Expected output: handshake failure
+
+# Check HSTS header
+curl -I https://memopt.example.com/health | grep Strict-Transport-Security
+# Expected: Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+
+### 43.5 Deployment Checklist
+
+1. Install nginx: `apt install nginx` / `yum install nginx`
+2. For Let's Encrypt: `apt install certbot python3-certbot-nginx`
+3. Run `setup_tls.sh` with appropriate mode
+4. Ensure firewall allows ports 80 (for ACME) and 443
+5. Set `MEMOPT_API_KEY` in client environments
+6. Verify: `curl https://<domain>/health` returns `{"status": "ok"}`
+

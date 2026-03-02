@@ -23,6 +23,9 @@ from memopt.daemon.scanner import GPUScanner, GPUProcess
 from memopt.daemon.process_inspector import ProcessInspector, ProcessProfile
 from memopt.daemon.apply import ApplyEngine
 from memopt.daemon.roi_calculator import ROICalculator
+from memopt.alerts.alert_store import AlertStore
+from memopt.alerts.drift_detector import DriftDetector
+from memopt.alerts.notifier import AlertNotifier
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +95,11 @@ class ZeroTouchDaemon:
         from memopt.daemon.reporter import ControlPlaneReporter
         self.reporter = ControlPlaneReporter()
 
+        # Drift detection — monitors previously-optimized processes for regression
+        self.alert_store = AlertStore()
+        self.drift_detector = DriftDetector(self.alert_store)
+        self.alert_notifier = AlertNotifier()
+
     def run(self) -> None:
         """
         Main daemon loop. Runs forever.
@@ -139,6 +147,12 @@ class ZeroTouchDaemon:
         # Report to control plane (no-op if not configured)
         self.reporter.add_events(cycle_events)
         self.reporter.report(self)
+
+        # Check all tracked PIDs for utilization drift
+        drift_alerts = self.drift_detector.check_all(processes)
+        for alert in drift_alerts:
+            self.alert_notifier.notify(alert)
+
         return cycle_events
 
     def _handle_process(self, proc: GPUProcess) -> Optional[OptimizationEvent]:
@@ -204,6 +218,17 @@ class ZeroTouchDaemon:
                 self.total_dollar_saved += dollar_saved
                 with self._lock:
                     self._optimized_pids[proc.pid] = time.time()
+                # Record drift baseline — utilization is the proxy metric
+                self.drift_detector.record_baseline(
+                    pid=proc.pid,
+                    node_name=self.config.node_name,
+                    model_family=proc.model_family,
+                    gpu_ids=proc.gpu_ids,
+                    post_opt_util_pct=proc.gpu_utilization_pct,
+                    speedup_min=profile.expected_speedup_min,
+                    speedup_max=profile.expected_speedup_max,
+                    optimizations_applied=profile.recommended_optimizations,
+                )
             else:
                 status = "failed"
 

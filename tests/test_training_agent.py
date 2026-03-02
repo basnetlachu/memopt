@@ -147,7 +147,7 @@ def test_training_step_profiled_not_forward_only() -> _Result:
     # to forward_ms: any full step must be noticeably slower
     # We verify this by running an independent full-step benchmark
     step_ms = _bench_step_ms(
-        report.optimized_model if report.optimized_model else model,
+        report.optimized_model if report.optimized_model is not None else model,
         inp, tgt, optimizer, loss_fn,
     )
 

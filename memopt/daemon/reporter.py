@@ -374,6 +374,7 @@ def init_reporter(dashboard_url: str = None, **kwargs) -> DashboardReporter:
 
 import urllib.request
 import urllib.error
+from memopt.auth.api_key import load_key, mask_key
 
 
 class ControlPlaneReporter:
@@ -399,9 +400,13 @@ class ControlPlaneReporter:
         self.enabled = bool(self.url)
         self._pending_events: list = []
         self._lock = threading.Lock()
+        self._api_key: str = load_key() or ""
 
         if self.enabled:
-            logger.info(f"Control plane reporter: {self.url}")
+            logger.info(
+                "Control plane reporter: %s (key: %s)",
+                self.url, mask_key(self._api_key) if self._api_key else "<none>",
+            )
         else:
             logger.info("Control plane not configured — standalone mode")
 
@@ -464,10 +469,13 @@ class ControlPlaneReporter:
 
         try:
             data = json.dumps(payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if self._api_key:
+                headers["X-Memopt-API-Key"] = self._api_key
             req = urllib.request.Request(
                 f"{self.url}/api/v1/report",
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:

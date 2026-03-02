@@ -1,0 +1,111 @@
+# memopt Helm values
+# Usage:
+#   helm install memopt memopt/memopt \
+#     --namespace memopt --create-namespace \
+#     -f values.yaml \
+#     --set license.key=sk-lic-xxxx
+
+# ── License ────────────────────────────────────────────────────────────────────
+license:
+  # Your Keygen.sh license key (from welcome email)
+  key: ""
+  # Keygen account ID (set by memopt — do not change)
+  keygenAccountId: "YOUR_KEYGEN_ACCOUNT_ID"
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: ghcr.io/memopt/memopt
+  tag: "latest"
+  pullPolicy: IfNotPresent
+  # Credentials for private GHCR repo
+  pullSecretName: memopt-registry-secret
+
+# ── GPU ────────────────────────────────────────────────────────────────────────
+gpu:
+  # 0 = use all GPUs on each node (recommended)
+  limit: 0
+
+# ── Daemon ────────────────────────────────────────────────────────────────────
+daemon:
+  # Seconds between GPU scans
+  scanIntervalSeconds: 60
+  # Seconds of utilization sampling per process
+  sampleSeconds: 5
+  # Auto-apply optimizations (false = report-only mode, recommended to start)
+  autoApply: false
+  # Dollar cost per GPU hour — used for ROI display
+  gpuCostPerHour: 8.00
+  # Node name prefix (pod name suffix is appended automatically)
+  nodeNamePrefix: "memopt-node"
+
+# ── Control Plane ─────────────────────────────────────────────────────────────
+controlPlane:
+  enabled: true
+  port: 8080
+  replicas: 1
+  # Service type — use LoadBalancer or NodePort for external access
+  serviceType: ClusterIP
+
+# ── API Server (per-node) ─────────────────────────────────────────────────────
+apiServer:
+  enabled: true
+  port: 8000
+  # Prometheus scrape annotations
+  prometheus:
+    enabled: true
+    path: /metrics
+    port: 8000
+
+# ── Security ──────────────────────────────────────────────────────────────────
+auth:
+  # Auto-generated on first start if not provided
+  # Set to a pre-generated key for reproducible deployments
+  apiKey: ""
+
+tls:
+  enabled: false
+  # domain: memopt.yourcompany.com
+  # certSecretName: memopt-tls-secret
+
+# ── Storage ────────────────────────────────────────────────────────────────────
+persistence:
+  enabled: true
+  # StorageClass — leave empty to use cluster default
+  storageClass: ""
+  size: 10Gi
+  accessMode: ReadWriteOnce
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+resources:
+  controlPlane:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+  daemon:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+# ── Grafana Integration ────────────────────────────────────────────────────────
+grafana:
+  # Set to true to deploy Grafana alongside memopt
+  enabled: false
+  adminPassword: "memopt"
+  persistence:
+    enabled: true
+    size: 5Gi
+
+# ── Prometheus ─────────────────────────────────────────────────────────────────
+prometheus:
+  # Set to true to deploy Prometheus alongside memopt
+  enabled: false
+  retention: "30d"
+  persistence:
+    enabled: true
+    size: 50Gi

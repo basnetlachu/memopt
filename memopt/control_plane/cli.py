@@ -10,6 +10,7 @@ import sys
 import json
 import urllib.request
 import urllib.error
+from memopt.auth.api_key import load_key
 
 
 def get_control_plane_url() -> str:
@@ -21,7 +22,12 @@ def get_control_plane_url() -> str:
 def fetch(path: str) -> dict:
     url = get_control_plane_url() + path
     try:
-        with urllib.request.urlopen(url, timeout=10) as r:
+        headers = {}
+        key = load_key()
+        if key:
+            headers["X-Memopt-API-Key"] = key
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
     except urllib.error.URLError:
         print(f"Cannot reach control plane at {get_control_plane_url()}")

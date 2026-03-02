@@ -31,9 +31,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security.api_key import APIKeyHeader
 from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from pydantic import BaseModel, field_validator
+from memopt.auth.api_key import get_or_create_key, verify_key, mask_key
 
 log = logging.getLogger("memopt.api")
 logging.basicConfig(
@@ -639,9 +641,23 @@ app = FastAPI(
     version="1.1.0",
 )
 
+# ── API key authentication ────────────────────────────────────────────────────
+# Key is loaded/created once at import time; the closure used by verify_api_key
+# captures the module-level _API_KEY string so it is always current.
+_API_KEY: str = get_or_create_key()
+_api_key_header = APIKeyHeader(name="X-Memopt-API-Key", auto_error=False)
+log.info("memopt API server: key loaded (%s)", mask_key(_API_KEY))
+
+
+def verify_api_key(key: str = Security(_api_key_header)) -> str:
+    """FastAPI dependency — rejects requests without a valid API key."""
+    if not verify_key(key, _API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return key
+
 
 @app.post("/optimize")
-async def optimize(request: OptimizeRequest):
+async def optimize(request: OptimizeRequest, _: str = Security(verify_api_key)):
     """
     Submit a model optimization job.
 
@@ -676,7 +692,7 @@ async def optimize(request: OptimizeRequest):
 
 
 @app.get("/status/{job_id}")
-def status(job_id: str):
+def status(job_id: str, _: str = Security(verify_api_key)):
     """
     Return the current status of an optimization job.
 
@@ -710,7 +726,7 @@ def status(job_id: str):
 
 
 @app.post("/agent")
-async def agent_optimize(request: AgentRequest):
+async def agent_optimize(request: AgentRequest, _: str = Security(verify_api_key)):
     """
     Submit an autonomous multi-round optimization job.
 

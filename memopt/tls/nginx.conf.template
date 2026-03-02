@@ -1,0 +1,80 @@
+# memopt nginx reverse-proxy — TLS termination template
+#
+# Variables (replaced by setup_tls.sh):
+#   ${DOMAIN}     public hostname, e.g. memopt.example.com
+#   ${CERT_PATH}  path to TLS certificate chain (PEM)
+#   ${KEY_PATH}   path to TLS private key (PEM)
+#   ${UPSTREAM}   upstream address, default 127.0.0.1:8080
+#
+# Enforces:
+#   - TLS 1.2 minimum (TLS 1.3 preferred)
+#   - HSTS with 1-year max-age
+#   - Modern cipher suite (no RC4, no 3DES, no export)
+#   - HTTP → HTTPS permanent redirect
+#   - X-Content-Type-Options, X-Frame-Options, Referrer-Policy headers
+
+# ── HTTP redirect ─────────────────────────────────────────────────────────────
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    # Let's Encrypt ACME challenge (certbot webroot)
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── HTTPS ─────────────────────────────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name ${DOMAIN};
+
+    # ── TLS certificate ───────────────────────────────────────────────────────
+    ssl_certificate     ${CERT_PATH};
+    ssl_certificate_key ${KEY_PATH};
+
+    # ── Protocol and ciphers ──────────────────────────────────────────────────
+    # Minimum TLS 1.2; prefer TLS 1.3 when both sides support it.
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Recommended Mozilla "Intermediate" cipher list — no RC4, no export,
+    # no 3DES, no NULL.  Forward-secrecy ECDHE ciphers are preferred.
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    # ── Session ───────────────────────────────────────────────────────────────
+    ssl_session_timeout 1d;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_tickets off;
+
+    # ── OCSP stapling ─────────────────────────────────────────────────────────
+    ssl_stapling        on;
+    ssl_stapling_verify on;
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout 5s;
+
+    # ── Security headers ──────────────────────────────────────────────────────
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options    "nosniff"                             always;
+    add_header X-Frame-Options           "DENY"                                always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin"     always;
+
+    # ── Proxy to uvicorn ──────────────────────────────────────────────────────
+    location / {
+        proxy_pass         http://${UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "upgrade";
+        proxy_set_header   Host       $host;
+        proxy_set_header   X-Real-IP  $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 5s;
+    }
+}

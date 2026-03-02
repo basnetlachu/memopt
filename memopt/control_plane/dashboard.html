@@ -61,6 +61,19 @@
                  padding: 6px 14px; border-radius: 6px; cursor: pointer;
                  font-size: 13px; }
   .refresh-btn:hover { background: #4a5568; }
+
+  /* Drift alert badges */
+  .badge-critical { background: #450a0a; color: #f87171; }
+  .badge-warning  { background: #451a03; color: #fb923c; }
+  .badge-info     { background: #1e3a5f; color: #60a5fa; }
+  /* Alert banner — shown when active critical/warning alerts exist */
+  .alert-banner { background: #450a0a; border: 1px solid #f87171; border-radius: 8px;
+                  padding: 12px 20px; margin-bottom: 16px; font-size: 13px;
+                  color: #fca5a5; display: none; }
+  .resolve-btn { background: #2d3748; border: 1px solid #4a5568; color: #e2e8f0;
+                 padding: 3px 10px; border-radius: 4px; cursor: pointer;
+                 font-size: 11px; }
+  .resolve-btn:hover { background: #4a5568; }
 </style>
 </head>
 <body>
@@ -105,7 +118,15 @@
       <div class="card-value green" id="c-saved-year">—</div>
       <div class="card-sub">based on last 24h</div>
     </div>
+    <div class="card">
+      <div class="card-label">Drift Alerts</div>
+      <div class="card-value yellow" id="c-alerts">—</div>
+      <div class="card-sub" id="c-alerts-sub">active unresolved</div>
+    </div>
   </div>
+
+  <!-- Alert banner (shown only when critical/warning alerts are active) -->
+  <div class="alert-banner" id="alert-banner"></div>
 
   <!-- Nodes table -->
   <div class="section">
@@ -125,6 +146,32 @@
       </thead>
       <tbody id="nodes-tbody">
         <tr><td colspan="8" class="empty">Loading nodes...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Drift alerts table -->
+  <div class="section" id="alerts-section">
+    <div class="section-header">Drift Alerts
+      <span style="float:right;font-size:11px;font-weight:400;color:#718096">
+        GPU-utilisation proxy — verify before acting
+      </span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Severity</th>
+          <th>Node</th>
+          <th>Model</th>
+          <th>PID</th>
+          <th>Util Drop</th>
+          <th>Baseline → Current</th>
+          <th>Detected</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="alerts-tbody">
+        <tr><td colspan="8" class="empty">Loading alerts...</td></tr>
       </tbody>
     </table>
   </div>
@@ -178,11 +225,17 @@ async function fetchJSON(url) {
   }
 }
 
+async function resolveAlert(id) {
+  await fetch(`/api/v1/alerts/${id}/resolve`, { method: 'POST' });
+  refresh();
+}
+
 async function refresh() {
-  const [status, nodes, events] = await Promise.all([
+  const [status, nodes, events, alertsData] = await Promise.all([
     fetchJSON('/api/v1/status'),
     fetchJSON('/api/v1/nodes'),
     fetchJSON('/api/v1/events?limit=50'),
+    fetchJSON('/api/v1/alerts'),
   ]);
 
   if (status) {
@@ -239,6 +292,47 @@ async function refresh() {
           <td>${e.speedup_min.toFixed(1)}–${e.speedup_max.toFixed(1)}x</td>
           <td style="color:#10b981">${fmt.dollars(e.dollar_saved_per_hour)}/hr</td>
           <td style="font-size:11px;color:#718096">${opts.join(', ')}</td>
+        </tr>
+      `}).join('');
+    }
+  }
+
+  if (alertsData) {
+    const counts = alertsData.active_counts ?? {};
+    const totalActive = (counts.critical ?? 0) + (counts.warning ?? 0) + (counts.info ?? 0);
+    document.getElementById('c-alerts').textContent = totalActive;
+    document.getElementById('c-alerts-sub').textContent =
+      `${counts.critical ?? 0} critical · ${counts.warning ?? 0} warning`;
+
+    const banner = document.getElementById('alert-banner');
+    if ((counts.critical ?? 0) + (counts.warning ?? 0) > 0) {
+      banner.style.display = 'block';
+      banner.textContent =
+        `${counts.critical ?? 0} critical · ${counts.warning ?? 0} warning drift alert(s) active — ` +
+        `verify with: memopt scan --pid <PID>`;
+    } else {
+      banner.style.display = 'none';
+    }
+
+    const tbody = document.getElementById('alerts-tbody');
+    const alerts = alertsData.alerts ?? [];
+    if (!alerts.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No active drift alerts</td></tr>';
+    } else {
+      tbody.innerHTML = alerts.map(a => {
+        const drop = typeof a.util_drop_pct === 'number' ? a.util_drop_pct.toFixed(1) : '—';
+        const base = typeof a.baseline_util_pct === 'number' ? a.baseline_util_pct.toFixed(1) : '—';
+        const cur  = typeof a.current_util_pct  === 'number' ? a.current_util_pct.toFixed(1)  : '—';
+        return `
+        <tr>
+          <td><span class="badge badge-${a.severity}">${a.severity}</span></td>
+          <td style="font-family:monospace;font-size:12px">${a.node_name}</td>
+          <td>${a.model_family}</td>
+          <td style="font-family:monospace;font-size:12px">${a.pid}</td>
+          <td style="color:#fb923c">-${drop}%</td>
+          <td style="font-size:12px;color:#718096">${base}% → ${cur}%</td>
+          <td style="color:#718096;font-size:12px">${fmt.ago(a.detection_timestamp)}</td>
+          <td><button class="resolve-btn" onclick="resolveAlert(${a.id})">Resolve</button></td>
         </tr>
       `}).join('');
     }

@@ -2,13 +2,15 @@
 memopt control plane — FastAPI server.
 
 Endpoints:
-  POST /api/v1/report        ← nodes POST here every 60s
-  GET  /api/v1/status        ← cluster summary
-  GET  /api/v1/nodes         ← all nodes
-  GET  /api/v1/nodes/{name}  ← single node detail
-  GET  /api/v1/events        ← event history
-  GET  /health               ← liveness check
-  GET  /                     ← HTML dashboard
+  POST /api/v1/report              ← nodes POST here every 60s  [auth required]
+  GET  /api/v1/status              ← cluster summary             [auth required]
+  GET  /api/v1/nodes               ← all nodes                   [auth required]
+  GET  /api/v1/nodes/{name}        ← single node detail          [auth required]
+  GET  /api/v1/events              ← event history               [auth required]
+  GET  /api/v1/alerts              ← drift alerts (active by default) [auth required]
+  POST /api/v1/alerts/{id}/resolve ← mark alert resolved         [auth required]
+  GET  /health                     ← liveness check              [NO auth]
+  GET  /                           ← HTML dashboard              [auth required]
 
 Run:
   python -m memopt.control_plane.server
@@ -20,10 +22,13 @@ import json
 import logging
 from pathlib import Path
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Security
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from memopt.control_plane.database import Database, NodeRecord, EventRecord
+from memopt.alerts.alert_store import AlertStore
+from memopt.auth.api_key import get_or_create_key, verify_key, mask_key
 
 log = logging.getLogger(__name__)
 
@@ -35,12 +40,26 @@ app = FastAPI(
 
 # Single database instance — initialized on startup
 db = Database()
+alert_store = AlertStore()
+
+# API key — loaded/created at module import time so the dependency closure captures it
+_API_KEY: str = ""
+_api_key_header = APIKeyHeader(name="X-Memopt-API-Key", auto_error=False)
+
+
+def verify_api_key(key: str = Security(_api_key_header)) -> str:
+    """FastAPI dependency — rejects requests without a valid API key."""
+    if not verify_key(key, _API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return key
 
 
 @app.on_event("startup")
 def startup():
+    global _API_KEY
+    _API_KEY = get_or_create_key()
+    log.info("memopt control plane started (key: %s)", mask_key(_API_KEY))
     db.init()
-    log.info("memopt control plane started")
 
 
 # ─────────────────────────────────────────────
@@ -88,7 +107,7 @@ class NodeReport(BaseModel):
 # ─────────────────────────────────────────────
 
 @app.post("/api/v1/report")
-def receive_report(report: NodeReport):
+def receive_report(report: NodeReport, _: str = Security(verify_api_key)):
     """
     Receive node report.
     Called by ZeroTouchDaemon every scan cycle.
@@ -132,13 +151,13 @@ def receive_report(report: NodeReport):
 
 
 @app.get("/api/v1/status")
-def cluster_status():
+def cluster_status(_: str = Security(verify_api_key)):
     """Cluster-wide summary. Used by dashboard and CLI."""
     return db.get_cluster_summary()
 
 
 @app.get("/api/v1/nodes")
-def list_nodes():
+def list_nodes(_: str = Security(verify_api_key)):
     """All nodes with current state."""
     nodes = db.get_all_nodes()
     for node in nodes:
@@ -152,7 +171,7 @@ def list_nodes():
 
 
 @app.get("/api/v1/nodes/{node_name}")
-def get_node(node_name: str):
+def get_node(node_name: str, _: str = Security(verify_api_key)):
     """Single node detail."""
     node = db.get_node(node_name)
     if not node:
@@ -171,6 +190,7 @@ def list_events(
     limit: int = Query(100, le=1000),
     node_name: Optional[str] = None,
     status: Optional[str] = None,
+    _: str = Security(verify_api_key),
 ):
     """Optimization event history."""
     events = db.get_recent_events(
@@ -179,13 +199,53 @@ def list_events(
     return {"events": events, "total": len(events)}
 
 
+@app.get("/api/v1/alerts")
+def list_alerts(
+    node_name: Optional[str] = None,
+    severity: Optional[str] = None,
+    include_resolved: bool = False,
+    _: str = Security(verify_api_key),
+):
+    """
+    Return drift alerts.
+
+    By default returns only unresolved alerts, newest first.
+    Pass include_resolved=true to see full history.
+    """
+    if include_resolved:
+        alerts = alert_store.get_all_alerts(limit=200)
+    else:
+        alerts = alert_store.get_active_alerts(node_name=node_name, severity=severity)
+    counts = alert_store.count_active_by_severity()
+    return {
+        "alerts": alerts,
+        "total": len(alerts),
+        "active_counts": {
+            "critical": counts.get("critical", 0),
+            "warning": counts.get("warning", 0),
+            "info": counts.get("info", 0),
+        },
+    }
+
+
+@app.post("/api/v1/alerts/{alert_id}/resolve")
+def resolve_alert(alert_id: int, _: str = Security(verify_api_key)):
+    """
+    Mark a drift alert as resolved.
+
+    Call after verifying the issue and re-optimizing (or confirming false positive).
+    """
+    alert_store.resolve_alert(alert_id)
+    return {"ok": True, "resolved_id": alert_id}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": time.time()}
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
+def dashboard(_: str = Security(verify_api_key)):
     """Serve the HTML dashboard."""
     html_path = Path(__file__).parent / "dashboard.html"
     if html_path.exists():

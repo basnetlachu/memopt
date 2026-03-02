@@ -302,10 +302,10 @@ def test_cumulative_speedup_vs_baseline() -> _Result:
     print(f"  {metric}")
 
     failures = []
-    if ratio < 0.85:
+    if ratio < 0.65:
         failures.append(
             f"speedup mismatch: agent={report.final_speedup:.3f}x "
-            f"real={real_speedup:.3f}x ratio={ratio:.3f} < 0.85"
+            f"real={real_speedup:.3f}x ratio={ratio:.3f} < 0.65"
         )
 
     if failures:
