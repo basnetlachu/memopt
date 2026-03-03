@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 # Keygen account — replace with your actual account ID
 KEYGEN_ACCOUNT_ID = os.getenv(
-    "KEYGEN_ACCOUNT_ID", "YOUR_KEYGEN_ACCOUNT_ID"
+    "KEYGEN_ACCOUNT_ID", "a44cf991-48c9-435b-bad6-9ed7dd32cc3e"
 )
 KEYGEN_VALIDATE_URL = (
     f"https://api.keygen.sh/v1/accounts/{KEYGEN_ACCOUNT_ID}"
