@@ -14,7 +14,7 @@ fi
 
 log "Validating license..."
 
-KEYGEN_ACCOUNT_ID="a44cf991-48c9-435b-bad6-9ed7dd32cc3e"
+KEYGEN_ACCOUNT_ID="${KEYGEN_ACCOUNT_ID:-a44cf991-48c9-435b-bad6-9ed7dd32cc3e}"
 
 RESPONSE=$(curl -sf \
     -X POST \
@@ -30,30 +30,20 @@ print('true' if d.get('meta',{}).get('valid') else 'false')
 " 2>/dev/null || echo "false")
 
 if [[ "$VALID" != "true" ]]; then
-    # Keygen unreachable or key invalid — delegate to Python validator
-    # which has a 24-hour grace period for network outages
-    GRACE_RESULT=$(python3 -c "
-from memopt.license.validator import validate_license, get_license_key
-import os
-key = os.getenv('MEMOPT_LICENSE_KEY','')
-s = validate_license(key)
-print('ok' if s.valid else f'FAIL:{s.error}')
-" 2>/dev/null || echo "FAIL:validator_error")
-
-    if [[ "$GRACE_RESULT" != "ok" ]]; then
-        REASON="${GRACE_RESULT#FAIL:}"
-        error "License check failed: $REASON"
-        error "Contact support@memopt.com"
-        exit 1
-    fi
-    log "WARNING: Keygen unreachable — running on cached license (grace period active)"
+    REASON=$(echo "$RESPONSE" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d.get('meta',{}).get('detail','invalid key'))
+" 2>/dev/null || echo "unknown")
+    error "License invalid: $REASON"
+    error "Contact support@memopt.com"
+    exit 1
 fi
 
 log "License valid."
 
 # API key — get_or_create_key() returns a plain string
 python3 -c "
-import os
 from memopt.auth.api_key import get_or_create_key, mask_key
 from pathlib import Path
 key_file = Path.home() / '.memopt' / 'api_key'
@@ -64,33 +54,19 @@ if not already_existed:
     print(f'MEMOPT_API_KEY={key}')
     print('Set on all nodes that connect to this control plane.')
     print('========================')
-else:
-    print(f'[memopt] API key loaded: {mask_key(key)}')
 "
 
 # Start services
-log "Starting memopt | Node: ${NODE_NAME:-memopt-node}"
+log "Starting memopt v1.0.0 | Node: ${NODE_NAME:-memopt-node}"
 
-python3 -m uvicorn memopt.control_plane.server:app \
-    --host 0.0.0.0 --port "${MEMOPT_PORT:-8080}" \
-    --workers 1 --log-level warning &
-CP_PID=$!
+MEMOPT_MODE="${MEMOPT_MODE:-full}"
 
-python3 -m uvicorn memopt.api.server:app \
-    --host 0.0.0.0 --port 8000 \
-    --workers 1 --log-level warning &
-API_PID=$!
-
-# Poll for control plane readiness instead of blind sleep
-for i in $(seq 1 30); do
-    if curl -sf "http://localhost:${MEMOPT_PORT:-8080}/health" >/dev/null 2>&1; then
-        log "Control plane ready (${i}s)"
-        break
-    fi
-    sleep 1
-done
-
-python3 -c "
+case "$MEMOPT_MODE" in
+  full)
+    python3 -m memopt.control_plane.server &
+    python3 -m memopt.api.server &
+    sleep 3
+    python3 -c "
 import os
 from memopt.daemon.zero_touch import ZeroTouchDaemon, DaemonConfig
 config = DaemonConfig(
@@ -101,10 +77,31 @@ config = DaemonConfig(
 )
 ZeroTouchDaemon(config).run()
 " &
-DAEMON_PID=$!
-
-log "Dashboard: http://localhost:${MEMOPT_PORT:-8080}"
-log "Metrics:   http://localhost:8000/metrics"
-wait -n $CP_PID $API_PID $DAEMON_PID
-log "A process exited — shutting down."
-kill $CP_PID $API_PID $DAEMON_PID 2>/dev/null || true
+    log "Dashboard: http://localhost:8080"
+    log "Metrics:   http://localhost:8000/metrics"
+    log "Health:    http://localhost:8080/health"
+    wait
+    ;;
+  daemon)
+    python3 -c "
+import os
+from memopt.daemon.zero_touch import ZeroTouchDaemon, DaemonConfig
+config = DaemonConfig(
+    scan_interval_seconds=int(os.getenv('MEMOPT_SCAN_INTERVAL','60')),
+    auto_apply=os.getenv('MEMOPT_AUTO_APPLY','false').lower()=='true',
+    gpu_cost_per_hour=float(os.getenv('MEMOPT_GPU_COST_PER_HOUR','2.50')),
+    node_name=os.getenv('NODE_NAME','memopt-node'),
+)
+ZeroTouchDaemon(config).run()
+"
+    ;;
+  control-plane)
+    python3 -m memopt.control_plane.server
+    ;;
+  scan)
+    python3 -m memopt.daemon.cli scan
+    ;;
+  *)
+    error "Unknown mode: $MEMOPT_MODE. Valid: full, daemon, control-plane, scan"
+    ;;
+esac
