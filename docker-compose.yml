@@ -4,11 +4,10 @@
 #   nano .env   # add MEMOPT_LICENSE_KEY and NODE_NAME
 #   docker-compose up -d
 
-version: '3.8'
 
 services:
   memopt:
-    image: ghcr.io/memopt/memopt:latest
+    image: ghcr.io/basnetlachu/memopt:latest
     container_name: memopt
     restart: unless-stopped
 
