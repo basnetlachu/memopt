@@ -14,9 +14,9 @@ fi
 
 log "Validating license..."
 
-KEYGEN_ACCOUNT_ID="${KEYGEN_ACCOUNT_ID:-a44cf991-48c9-435b-bad6-9ed7dd32cc3e}"
+KEYGEN_ACCOUNT_ID="${KEYGEN_ACCOUNT_ID:-85efe00f-f369-4a5c-95c4-cc1c9a7ebb6a}"
 
-RESPONSE=$(curl -sf \
+RESPONSE=$(curl -s --max-time 10 \
     -X POST \
     "https://api.keygen.sh/v1/accounts/${KEYGEN_ACCOUNT_ID}/licenses/actions/validate-key" \
     -H "Content-Type: application/json" \
