@@ -60,6 +60,7 @@ RUN pip install --no-cache-dir \
     pynvml \
     pyyaml \
     httpx \
+    cryptography \
     nvidia-ml-py
 
 # Copy application code

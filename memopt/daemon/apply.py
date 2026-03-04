@@ -191,6 +191,9 @@ class ApplyEngine:
             python_exe=python_exe,
         )
 
+        if success:
+            self._post_event(profile, applied_opts)
+
         return ApplyResult(
             pid_original=profile.pid,
             pid_new=pid_new,
@@ -358,6 +361,29 @@ class ApplyEngine:
 
         code = "\n".join(preamble_lines + env_lines + exec_lines) + "\n"
         return code, applied_opts
+
+    def _post_event(self, profile: "ProcessProfile", applied_opts: List[str]) -> None:
+        """Fire-and-forget POST to control plane after a successful apply."""
+        try:
+            import httpx
+            control_plane = os.getenv("MEMOPT_CONTROL_PLANE", "http://localhost:8080")
+            api_key = os.getenv("MEMOPT_API_KEY", "")
+            httpx.post(
+                f"{control_plane}/api/v1/events",
+                headers={"X-Memopt-API-Key": api_key},
+                json={
+                    "node": os.getenv("NODE_NAME", "unknown"),
+                    "pid": profile.pid,
+                    "model": profile.model_family or "unknown",
+                    "optimizations": applied_opts or [],
+                    "status": "applied",
+                    "speedup": getattr(profile, "speedup_ratio", None),
+                    "saved_per_hour": getattr(profile, "saved_per_hour", None),
+                },
+                timeout=5.0,
+            )
+        except Exception:
+            pass  # never block the apply flow
 
     def _write_wrapper(self, code: str, pid: int) -> str:
         """Write wrapper code to a temp file and return its path."""

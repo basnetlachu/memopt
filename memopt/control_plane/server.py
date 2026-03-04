@@ -199,6 +199,30 @@ def list_events(
     return {"events": events, "total": len(events)}
 
 
+@app.post("/api/v1/events")
+def record_event(
+    payload: dict,
+    _: str = Security(verify_api_key),
+):
+    """Record an optimization event posted by memopt apply."""
+    import json as _json
+    record = EventRecord(
+        id=None,
+        timestamp=time.time(),
+        node_name=payload.get("node", "unknown"),
+        pid=int(payload.get("pid", 0)),
+        model_family=payload.get("model", "unknown"),
+        gpu_ids=_json.dumps([]),
+        optimizations=_json.dumps(payload.get("optimizations", [])),
+        speedup_min=float(payload.get("speedup") or 0.0),
+        speedup_max=float(payload.get("speedup") or 0.0),
+        status=payload.get("status", "applied"),
+        dollar_saved_per_hour=float(payload.get("saved_per_hour") or 0.0),
+    )
+    db.insert_event(record)
+    return {"ok": True}
+
+
 @app.get("/api/v1/alerts")
 def list_alerts(
     node_name: Optional[str] = None,
@@ -245,8 +269,8 @@ def health():
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(_: str = Security(verify_api_key)):
-    """Serve the HTML dashboard."""
+def dashboard():
+    """Serve the HTML dashboard (public — no auth required)."""
     html_path = Path(__file__).parent / "dashboard.html"
     if html_path.exists():
         return html_path.read_text()

@@ -16,26 +16,21 @@ log "Validating license..."
 
 KEYGEN_ACCOUNT_ID="${KEYGEN_ACCOUNT_ID:-85efe00f-f369-4a5c-95c4-cc1c9a7ebb6a}"
 
-RESPONSE=$(curl -s --max-time 10 \
-    -X POST \
-    "https://api.keygen.sh/v1/accounts/${KEYGEN_ACCOUNT_ID}/licenses/actions/validate-key" \
-    -H "Content-Type: application/json" \
-    -d "{\"meta\": {\"key\": \"${MEMOPT_LICENSE_KEY}\"}}" \
-    2>/dev/null || echo '{"meta":{"valid":false,"detail":"network error"}}')
+VALID=$(python3 -c "
+import sys, os
+sys.path.insert(0, '/app')
+from memopt.license.validator import validate_license
+key = os.environ['MEMOPT_LICENSE_KEY']
+s = validate_license(key)
+print('true' if s.valid else 'false')
+print(s.error or '')
+" 2>/dev/null)
 
-VALID=$(echo "$RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print('true' if d.get('meta',{}).get('valid') else 'false')
-" 2>/dev/null || echo "false")
+VALID_FLAG=$(echo "$VALID" | head -1)
+REASON=$(echo "$VALID" | tail -1)
 
-if [[ "$VALID" != "true" ]]; then
-    REASON=$(echo "$RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('meta',{}).get('detail','invalid key'))
-" 2>/dev/null || echo "unknown")
-    error "License invalid: $REASON"
+if [[ "$VALID_FLAG" != "true" ]]; then
+    error "License invalid: ${REASON:-unknown}"
     error "Contact support@memopt.com"
     exit 1
 fi

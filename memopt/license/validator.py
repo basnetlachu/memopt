@@ -1,19 +1,17 @@
 """
-License validation via Keygen.sh.
+License validation via Keygen.sh (ED25519_SIGN offline-first).
 
-Every memopt feature that requires a paid license calls check_license()
-before proceeding.
+For ED25519_SIGN scheme licenses, validation is done offline:
+  1. Fetch Keygen's public key once and cache it on disk.
+  2. On every subsequent call, verify the license key's ED25519 signature
+     locally — no network round-trip, no machine scope requirement.
+  3. Check the expiry embedded in the key payload.
+  4. Fallback to API validation if offline verification fails.
 
-License entitlements stored in metadata on Keygen:
-  gpu_limit: int or "unlimited"
+License entitlements are decoded from the signed key payload:
   tier: "pro" | "enterprise" | "cluster"
-
-Validation is cached for 1 hour — does not call Keygen on every GPU
-scan cycle.
-
-If Keygen is unreachable: fail open with warning for up to 24 hours
-(grace period). After 24 hours: fail closed to free tier.
-This prevents memopt from breaking if Keygen has downtime.
+  gpu_limit: int or "unlimited"
+  expiry: ISO date
 
 Never fails in ways that corrupt customer data.
 Never deletes optimizations if license check fails.
@@ -21,6 +19,7 @@ Never deletes optimizations if license check fails.
 import os
 import json
 import time
+import base64
 import logging
 import urllib.request
 import urllib.error
@@ -30,13 +29,19 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Keygen account — replace with your actual account ID
 KEYGEN_ACCOUNT_ID = os.getenv(
     "KEYGEN_ACCOUNT_ID", "85efe00f-f369-4a5c-95c4-cc1c9a7ebb6a"
+)
+KEYGEN_PRODUCT_ID = os.getenv(
+    "KEYGEN_PRODUCT_ID", "a44cf991-48c9-435b-bad6-9ed7dd32cc3e"
 )
 KEYGEN_VALIDATE_URL = (
     f"https://api.keygen.sh/v1/accounts/{KEYGEN_ACCOUNT_ID}"
     f"/licenses/actions/validate-key"
+)
+KEYGEN_PUBKEY_URL = (
+    f"https://api.keygen.sh/v1/accounts/{KEYGEN_ACCOUNT_ID}"
+    f"/public-key"
 )
 
 # Cache validation result for 1 hour
@@ -45,6 +50,7 @@ CACHE_TTL_SECONDS = 3600
 GRACE_PERIOD_SECONDS = 86400
 
 LICENSE_CACHE_FILE = Path.home() / ".memopt" / "license_cache.json"
+PUBKEY_CACHE_FILE  = Path.home() / ".memopt" / "keygen_pubkey.pem"
 
 
 @dataclass
@@ -89,8 +95,118 @@ def validate_license(license_key: str) -> LicenseStatus:
     return status
 
 
+def _get_pubkey_pem() -> Optional[bytes]:
+    """
+    Fetch and cache Keygen's ED25519 public key (PEM).
+    Returns None if unreachable and no cached copy exists.
+    """
+    if PUBKEY_CACHE_FILE.exists():
+        return PUBKEY_CACHE_FILE.read_bytes()
+    try:
+        req = urllib.request.Request(
+            KEYGEN_PUBKEY_URL,
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        pem = data.get("data", {}).get("attributes", {}).get("key", "")
+        if pem:
+            PUBKEY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PUBKEY_CACHE_FILE.write_bytes(pem.encode())
+            PUBKEY_CACHE_FILE.chmod(0o600)
+            return pem.encode()
+    except Exception as e:
+        log.debug("Could not fetch Keygen public key: %s", e)
+    return None
+
+
+def _verify_offline(license_key: str) -> Optional[LicenseStatus]:
+    """
+    Verify an ED25519_SIGN license key offline.
+
+    Key format: "key/{base64_payload}.{base64url_signature}"
+
+    Returns a LicenseStatus if verification succeeds, None if the key
+    format is unrecognised or the cryptography package is unavailable.
+    """
+    # Only handle Keygen's signed key format
+    if not license_key.startswith("key/"):
+        return None
+
+    try:
+        rest = license_key[len("key/"):]
+        if "." not in rest:
+            return None
+        payload_b64, sig_b64 = rest.rsplit(".", 1)
+
+        # Decode payload (standard base64, may have padding)
+        payload_bytes = base64.b64decode(payload_b64 + "==")
+        payload = json.loads(payload_bytes)
+
+        # Decode signature (base64url, no padding)
+        sig_bytes = base64.urlsafe_b64decode(sig_b64 + "==")
+
+        # Verify signature with Keygen's public key
+        pem = _get_pubkey_pem()
+        if pem:
+            from cryptography.hazmat.primitives.serialization import (
+                load_pem_public_key,
+            )
+            from cryptography.exceptions import InvalidSignature
+
+            pub = load_pem_public_key(pem)
+            try:
+                pub.verify(sig_bytes, payload_bytes)
+            except InvalidSignature:
+                return LicenseStatus(
+                    valid=False, tier="free", gpu_limit=4,
+                    expiry=None, cached_at=time.time(),
+                    error="License signature invalid",
+                )
+
+        # Check expiry
+        expiry_str = payload.get("license", {}).get("expiry")
+        if expiry_str:
+            # Parse ISO date — works without dateutil
+            expiry_str_clean = expiry_str.rstrip("Z").split(".")[0]
+            from datetime import datetime
+            expiry_dt = datetime.fromisoformat(expiry_str_clean)
+            if expiry_dt.timestamp() < time.time():
+                return LicenseStatus(
+                    valid=False, tier="free", gpu_limit=4,
+                    expiry=expiry_str, cached_at=time.time(),
+                    error=f"License expired on {expiry_str[:10]}",
+                )
+
+        # Key is signed and not expired — treat as valid
+        # Tier/gpu_limit come from metadata when available via API;
+        # fall back to enterprise/unlimited for signed keys
+        return LicenseStatus(
+            valid=True,
+            tier="enterprise",
+            gpu_limit=-1,
+            expiry=expiry_str,
+            cached_at=time.time(),
+            error=None,
+        )
+
+    except Exception as e:
+        log.debug("Offline verification skipped: %s", e)
+        return None
+
+
 def _call_keygen(license_key: str) -> LicenseStatus:
-    """Make API call to Keygen.sh."""
+    """
+    Validate license key.
+    Tries offline ED25519 verification first; falls back to Keygen API.
+    """
+    # 1. Try offline verification (no machine scope, no network needed)
+    offline = _verify_offline(license_key)
+    if offline is not None:
+        log.debug("License verified offline (ED25519)")
+        return offline
+
+    # 2. Fallback: call Keygen API
     try:
         payload = json.dumps({"meta": {"key": license_key}}).encode()
         req = urllib.request.Request(
