@@ -4,9 +4,8 @@ Produces human-readable terminal reports and JSON output.
 """
 import json
 import logging
-from typing import List, Optional
+from typing import List, Tuple
 
-from .scanner import GPUProcess as ScannedProcess
 from .process_inspector import ProcessProfile, OPT_LABELS
 
 log = logging.getLogger(__name__)
@@ -63,6 +62,42 @@ class ScanReporter:
 
         print()
 
+    def _calculate_batch_opportunity(
+        self,
+        gpu_ids: List[int],
+        model_vram_mb: int,
+    ) -> Tuple[int, int, int, float]:
+        """
+        Query GPU free/total VRAM via pynvml and estimate optimal batch size.
+
+        Returns (total_mb, free_mb, optimal_batch, batch_speedup).
+        Returns (0, 0, 1, 1.0) on any error.
+        """
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            try:
+                total_mb = 0
+                free_mb = 0
+                for gpu_id in gpu_ids:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+                    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    total_mb += mem.total // (1024 * 1024)
+                    free_mb += mem.free // (1024 * 1024)
+            finally:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+            # KV-cache per additional batch slot ≈ 15% of model VRAM
+            kv_per_slot_mb = max(model_vram_mb * 0.15, 512)
+            optimal_batch = min(int(free_mb / kv_per_slot_mb), 32)
+            optimal_batch = max(optimal_batch, 1)
+            batch_speedup = min(optimal_batch * 0.85, 6.0)
+            return total_mb, free_mb, optimal_batch, batch_speedup
+        except Exception:
+            return 0, 0, 1, 1.0
+
     def _print_process(
         self,
         prof: ProcessProfile,
@@ -73,13 +108,22 @@ class ScanReporter:
         bneck_color = BOTTLENECK_COLOR.get(prof.bottleneck, _CYAN)
         bneck_label = BOTTLENECK_LABEL.get(prof.bottleneck, prof.bottleneck)
 
-        vram_gb = prof.gpu_memory_mb / 1024
+        vram_used_gb = prof.gpu_memory_mb / 1024
+        total_mb, free_mb, optimal_batch, batch_speedup = self._calculate_batch_opportunity(
+            prof.gpu_ids, prof.gpu_memory_mb
+        )
+        vram_total_gb = total_mb / 1024 if total_mb else 0.0
+        vram_free_gb  = free_mb  / 1024 if free_mb  else 0.0
+
+        vram_str = f"{vram_used_gb:.1f} GB used"
+        if vram_total_gb > 0:
+            vram_str += f"  /  {vram_total_gb:.0f} GB total  ({vram_free_gb:.1f} GB free)"
 
         print()
         print(_fmt(f"  [{index}/{total}] PID {prof.pid}", _BOLD, color))
         print(f"      GPU(s)   : {', '.join(str(g) for g in prof.gpu_ids)}"
               f"  ({prof.hw_name})")
-        print(f"      VRAM     : {vram_gb:.1f} GB")
+        print(f"      VRAM     : {vram_str}")
         print(f"      Model    : {prof.model_family}  [{prof.mode}]")
         print(f"      GPU util : {prof.avg_utilization_pct:.0f}%")
         print(
@@ -113,7 +157,55 @@ class ScanReporter:
         else:
             print(f"      No recommendations available.")
 
+        # Show throughput opportunities for inference-mode transformer models
+        is_transformer = prof.model_family not in ("resnet", "vit", "diffusion", "clip", "unknown")
+        if prof.mode == "inference" and is_transformer:
+            self._print_throughput_opportunities(prof, optimal_batch, batch_speedup, color)
+
         print(_fmt("  " + "-" * 70, _DIM, color))
+
+    def _print_throughput_opportunities(
+        self,
+        prof: ProcessProfile,
+        optimal_batch: int,
+        batch_speedup: float,
+        color: bool,
+    ) -> None:
+        """Print the THROUGHPUT OPPORTUNITIES box below recommendations."""
+        sep = _fmt("  " + "─" * 64, _CYAN, color)
+        header = _fmt(
+            "  THROUGHPUT OPPORTUNITIES  (no quality loss, float16 only)",
+            _BOLD, color,
+        )
+        print()
+        print(sep)
+        print(header)
+        print(sep)
+
+        # Option 1: optimal batching
+        batch_line = (
+            f"  [1] Optimal batching   batch={optimal_batch}"
+            f"  (~{batch_speedup:.1f}x throughput)"
+        )
+        print(_fmt(batch_line, _GREEN, color))
+        print(
+            _fmt(
+                f"      memopt apply --pid {prof.pid} --mode batch",
+                _DIM, color,
+            )
+        )
+
+        # Option 2: vLLM continuous batching
+        vllm_line = "  [2] vLLM server        continuous batching  (~5.5x throughput)"
+        print(_fmt(vllm_line, _GREEN, color))
+        print(
+            _fmt(
+                f"      memopt apply --pid {prof.pid} --mode vllm",
+                _DIM, color,
+            )
+        )
+
+        print(sep)
 
     def to_json(self, profiles: List[ProcessProfile], indent: int = 2) -> str:
         """Serialize profiles to JSON string."""

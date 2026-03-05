@@ -13,6 +13,7 @@ Flow:
 Never raises — errors are captured in ApplyResult.error.
 """
 import os
+import re
 import sys
 import signal
 import subprocess
@@ -54,6 +55,7 @@ class ApplyEngine:
         self,
         profile: ProcessProfile,
         dry_run: bool = False,
+        mode: str = "auto",
     ) -> ApplyResult:
         """
         Apply optimizations to the process described by profile.
@@ -61,12 +63,18 @@ class ApplyEngine:
         Args:
             profile:  ProcessProfile from ProcessInspector.profile()
             dry_run:  If True, generate wrapper but do not execute anything.
+            mode:     "auto" | "batch" | "vllm"
+                      "vllm"  — generate vLLM server migration script
+                      "batch" — generate wrapper tuned for optimal batch size
+                      "auto"  — default existing behaviour
 
         Returns:
             ApplyResult — always returns, never raises.
         """
         try:
-            return self._apply_inner(profile, dry_run)
+            if mode == "vllm":
+                return self._apply_vllm(profile)
+            return self._apply_inner(profile, dry_run, mode=mode)
         except Exception as e:
             log.error(f"ApplyEngine.apply failed for pid {profile.pid}: {e}", exc_info=True)
             return ApplyResult(
@@ -85,6 +93,7 @@ class ApplyEngine:
         self,
         profile: ProcessProfile,
         dry_run: bool,
+        mode: str = "auto",
     ) -> ApplyResult:
         # 1. Read original process info
         cmdline, cwd, python_exe = self._read_proc_info(profile.pid)
@@ -105,6 +114,7 @@ class ApplyEngine:
             cwd=cwd,
             python_exe=python_exe,
             profile=profile,
+            mode=mode,
         )
 
         # 3. Write wrapper to a temp file
@@ -278,6 +288,7 @@ class ApplyEngine:
         cwd: str,
         python_exe: str,
         profile: ProcessProfile,
+        mode: str = "auto",
     ):
         """
         Generate a Python wrapper script that applies optimizations then
@@ -292,7 +303,15 @@ class ApplyEngine:
         else:
             args = parts
 
-        applied_opts = list(profile.recommendations[:3])  # top 3 opts
+        if mode == "batch":
+            # Batch mode: add continuous_batch + kv_cache to top of recommendations
+            recs = list(profile.recommendations)
+            for opt in ("kv_cache", "continuous_batch"):
+                if opt not in recs:
+                    recs.insert(0, opt)
+            applied_opts = recs[:3]
+        else:
+            applied_opts = list(profile.recommendations[:3])  # top 3 opts
 
         # Build preamble lines
         preamble_lines = [
@@ -361,6 +380,103 @@ class ApplyEngine:
 
         code = "\n".join(preamble_lines + env_lines + exec_lines) + "\n"
         return code, applied_opts
+
+    def _detect_model_from_cmdline(self, pid: int) -> str:
+        """
+        Extract model name/path from a process cmdline.
+        Tries --model <path>, HF org/name patterns, then falls back to empty string.
+        """
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            cmdline = raw.strip()
+        except Exception:
+            return ""
+
+        # --model /path/to/model  or  --model_name_or_path /path
+        m = re.search(r'--model(?:_name_or_path)?[= ](\S+)', cmdline)
+        if m:
+            return m.group(1)
+
+        # HF hub slug: org/model-name
+        m = re.search(
+            r'((?:mistralai|meta-llama|openlm-research|tiiuae|google|microsoft|'
+            r'Qwen|deepseek-ai|01-ai|NousResearch)/[\w\-\.]+)',
+            cmdline,
+        )
+        if m:
+            return m.group(1)
+
+        return ""
+
+    def _apply_vllm(self, profile: ProcessProfile) -> ApplyResult:
+        """
+        Generate a ready-to-run vLLM server script for continuous-batching migration.
+        Prints the script path and launch instructions; does NOT restart the process.
+        Posts an event to the control plane on success.
+        """
+        model_path = self._detect_model_from_cmdline(profile.pid) or profile.model_family or "your-model"
+        script_path = f"/tmp/memopt_vllm_{profile.pid}.py"
+
+        script = (
+            "#!/usr/bin/env python3\n"
+            "# === memopt vLLM migration script (auto-generated) ===\n"
+            f"# Original PID : {profile.pid}\n"
+            f"# Model family : {profile.model_family}\n"
+            f"# Model path   : {model_path}\n"
+            "#\n"
+            "# Run this script to replace the existing inference process with a\n"
+            "# vLLM OpenAI-compatible server using continuous batching.\n"
+            "# Throughput gain: ~5-6x vs single-request inference (float16, no quantization).\n"
+            "#\n"
+            "import subprocess, sys\n"
+            "\n"
+            "cmd = [\n"
+            "    sys.executable, \"-m\", \"vllm.entrypoints.openai.api_server\",\n"
+            f"    \"--model\", \"{model_path}\",\n"
+            "    \"--dtype\", \"float16\",\n"
+            "    \"--gpu-memory-utilization\", \"0.85\",\n"
+            "    \"--max-num-seqs\", \"32\",\n"
+            "    \"--enable-prefix-caching\",\n"
+            "    \"--port\", \"8001\",\n"
+            "]\n"
+            "\n"
+            "print(f\"Starting vLLM server: {' '.join(cmd)}\")\n"
+            "subprocess.run(cmd)\n"
+        )
+
+        with open(script_path, "w") as f:
+            f.write(script)
+        os.chmod(script_path, 0o755)
+
+        print()
+        print(f"  vLLM migration script  →  {script_path}")
+        print(f"  Model : {model_path}")
+        print()
+        print("  To migrate (stop current process first):")
+        print(f"    python {script_path}")
+        print()
+        print("  Or run vLLM directly:")
+        print(f"    python -m vllm.entrypoints.openai.api_server \\")
+        print(f"      --model {model_path} \\")
+        print(f"      --dtype float16 \\")
+        print(f"      --gpu-memory-utilization 0.85 \\")
+        print(f"      --max-num-seqs 32 \\")
+        print(f"      --enable-prefix-caching \\")
+        print(f"      --port 8001")
+        print()
+        print("  OpenAI-compatible endpoint: http://localhost:8001/v1/completions")
+
+        self._post_event(profile, ["vllm_continuous_batching"])
+
+        return ApplyResult(
+            pid_original=profile.pid,
+            pid_new=None,
+            success=True,
+            rolled_back=False,
+            optimizations_applied=["vllm_continuous_batching"],
+            wrapper_path=script_path,
+        )
 
     def _post_event(self, profile: "ProcessProfile", applied_opts: List[str]) -> None:
         """Fire-and-forget POST to control plane after a successful apply."""

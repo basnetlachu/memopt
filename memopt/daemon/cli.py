@@ -114,13 +114,16 @@ def cmd_apply(args) -> int:
         sample_seconds=sample_seconds,
     )
 
-    if not profile.recommendations:
+    mode = getattr(args, "mode", "auto")
+
+    # vllm mode does not require prior recommendations
+    if mode not in ("vllm",) and not profile.recommendations:
         print(f"PID {pid}: No recommendations found (bottleneck={profile.bottleneck}).")
         return 0
 
     # Apply
     engine = ApplyEngine()
-    result = engine.apply(profile, dry_run=dry_run)
+    result = engine.apply(profile, dry_run=dry_run, mode=mode)
 
     if result.success:
         opts = ", ".join(result.optimizations_applied)
@@ -174,6 +177,15 @@ def build_parser() -> argparse.ArgumentParser:
     apply_p.add_argument(
         "--sample-seconds", type=int, default=5, dest="sample_seconds",
         help="Seconds to sample utilization before choosing optimizations (default: 5)",
+    )
+    apply_p.add_argument(
+        "--mode", choices=["auto", "batch", "vllm"], default="auto",
+        help=(
+            "Optimization mode: "
+            "auto = default recommendations; "
+            "batch = tune for optimal batch size; "
+            "vllm = generate vLLM continuous-batching migration script"
+        ),
     )
     apply_p.set_defaults(func=cmd_apply)
 
