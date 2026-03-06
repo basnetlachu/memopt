@@ -46,7 +46,7 @@ COPY setup.py ./
 
 # Install PyTorch first (large, cache separately)
 RUN pip install --no-cache-dir \
-    torch==2.6.0 \
+    torch==2.6.0+cu124 \
     torchvision \
     torchaudio \
     --index-url https://download.pytorch.org/whl/cu124
