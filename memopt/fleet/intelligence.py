@@ -541,6 +541,61 @@ class FleetIntelligence:
             },
         }
 
+    def get_recent_drift_events(self, limit: int = 100) -> List[dict]:
+        """Query drift events from SQLite. Used by control plane to show alerts."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT node_name, gpu_index, pid, detected_at,
+                       baseline_tps, current_tps, drop_pct,
+                       severity, auto_remediated, remediation_result
+                FROM drift_events
+                ORDER BY detected_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_avg_power_baseline(self, hours: float = 24.0) -> float:
+        """Average power for un-optimized GPUs over last N hours (watts)."""
+        since = time.time() - hours * 3600
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT AVG(power_watts) FROM node_metrics "
+                "WHERE timestamp > ? AND optimization_applied = 0 AND power_watts > 0",
+                (since,),
+            ).fetchone()
+        return round(float(row[0]), 1) if row and row[0] is not None else 0.0
+
+    def get_avg_power_optimized(self, hours: float = 24.0) -> float:
+        """Average power for optimized GPUs over last N hours (watts)."""
+        since = time.time() - hours * 3600
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT AVG(power_watts) FROM node_metrics "
+                "WHERE timestamp > ? AND optimization_applied = 1 AND power_watts > 0",
+                (since,),
+            ).fetchone()
+        return round(float(row[0]), 1) if row and row[0] is not None else 0.0
+
+    def get_power_reduction_pct(self, hours: float = 24.0) -> float:
+        """Percentage power reduction from optimizations. 0.0 if no data."""
+        baseline  = self.get_avg_power_baseline(hours)
+        optimized = self.get_avg_power_optimized(hours)
+        if baseline <= 0:
+            return 0.0
+        return round((baseline - optimized) / baseline * 100.0, 1)
+
+    def get_electricity_savings(self, hours: float = 24.0, kwh_cost: float = 0.10) -> float:
+        """Estimated electricity savings in dollars over N hours."""
+        baseline  = self.get_avg_power_baseline(hours)
+        optimized = self.get_avg_power_optimized(hours)
+        if baseline <= 0 or optimized >= baseline:
+            return 0.0
+        kwh_saved = (baseline - optimized) / 1000.0 * hours
+        return round(kwh_saved * kwh_cost, 4)
+
     # ── BACKGROUND MONITOR ─────────────────────────────────────────────────
 
     def start_monitoring(

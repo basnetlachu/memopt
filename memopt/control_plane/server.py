@@ -28,6 +28,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from memopt.control_plane.database import Database, NodeRecord, EventRecord
 from memopt.alerts.alert_store import AlertStore
+from memopt.fleet.intelligence import FleetIntelligence
 from memopt.auth.api_key import get_or_create_key, verify_key, mask_key
 
 log = logging.getLogger(__name__)
@@ -41,6 +42,10 @@ app = FastAPI(
 # Single database instance — initialized on startup
 db = Database()
 alert_store = AlertStore()
+_fleet = FleetIntelligence(
+    db_path=str(Path.home() / ".memopt" / "fleet.db"),
+    auto_remediate=False,
+)
 
 # API key — loaded/created at module import time so the dependency closure captures it
 _API_KEY: str = ""
@@ -153,7 +158,14 @@ def receive_report(report: NodeReport, _: str = Security(verify_api_key)):
 @app.get("/api/v1/status")
 def cluster_status(_: str = Security(verify_api_key)):
     """Cluster-wide summary. Used by dashboard and CLI."""
-    return db.get_cluster_summary()
+    summary = db.get_cluster_summary()
+    summary["power_metrics"] = {
+        "avg_power_baseline_watts":   _fleet.get_avg_power_baseline(),
+        "avg_power_optimized_watts":  _fleet.get_avg_power_optimized(),
+        "power_reduction_pct":        _fleet.get_power_reduction_pct(),
+        "electricity_savings_24h_usd": _fleet.get_electricity_savings(),
+    }
+    return summary
 
 
 @app.get("/api/v1/nodes")
@@ -231,23 +243,37 @@ def list_alerts(
     _: str = Security(verify_api_key),
 ):
     """
-    Return drift alerts.
+    Return drift alerts from both FleetIntelligence and legacy AlertStore.
 
     By default returns only unresolved alerts, newest first.
     Pass include_resolved=true to see full history.
     """
+    # Fleet drift events (from daemon's FleetIntelligence SQLite)
+    fleet_drifts = _fleet.get_recent_drift_events(limit=200)
+    if node_name:
+        fleet_drifts = [d for d in fleet_drifts if d.get("node_name") == node_name]
+    if severity:
+        fleet_drifts = [d for d in fleet_drifts if d.get("severity") == severity]
+
+    # Legacy alert store (backward compat)
     if include_resolved:
-        alerts = alert_store.get_all_alerts(limit=200)
+        legacy = alert_store.get_all_alerts(limit=200)
     else:
-        alerts = alert_store.get_active_alerts(node_name=node_name, severity=severity)
-    counts = alert_store.count_active_by_severity()
+        legacy = alert_store.get_active_alerts(node_name=node_name, severity=severity)
+
+    all_alerts = fleet_drifts + legacy
+    fleet_counts = alert_store.count_active_by_severity()
+    for d in fleet_drifts:
+        sev = d.get("severity", "info")
+        fleet_counts[sev] = fleet_counts.get(sev, 0) + 1
+
     return {
-        "alerts": alerts,
-        "total": len(alerts),
+        "alerts": all_alerts,
+        "total": len(all_alerts),
         "active_counts": {
-            "critical": counts.get("critical", 0),
-            "warning": counts.get("warning", 0),
-            "info": counts.get("info", 0),
+            "critical": fleet_counts.get("critical", 0),
+            "warning":  fleet_counts.get("warning", 0),
+            "info":     fleet_counts.get("info", 0),
         },
     }
 

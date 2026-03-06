@@ -123,6 +123,11 @@
       <div class="card-value yellow" id="c-alerts">—</div>
       <div class="card-sub" id="c-alerts-sub">active unresolved</div>
     </div>
+    <div class="card">
+      <div class="card-label">Power Reduction</div>
+      <div class="card-value green" id="c-power-reduction">—</div>
+      <div class="card-sub" id="c-power-watts">— W avg</div>
+    </div>
   </div>
 
   <!-- Alert banner (shown only when critical/warning alerts are active) -->
@@ -253,6 +258,16 @@ async function refresh() {
       fmt.dollars(status.dollar_saved_last_24h ?? 0);
     document.getElementById('c-saved-year').textContent =
       fmt.dollars(status.dollar_saved_per_year_estimate ?? 0);
+
+    const pm = status.power_metrics;
+    if (pm) {
+      document.getElementById('c-power-reduction').textContent =
+        pm.power_reduction_pct > 0 ? `${pm.power_reduction_pct.toFixed(1)}%` : '—';
+      const w = pm.avg_power_optimized_watts > 0 ? pm.avg_power_optimized_watts
+                : pm.avg_power_baseline_watts > 0 ? pm.avg_power_baseline_watts : 0;
+      document.getElementById('c-power-watts').textContent =
+        w > 0 ? `${w.toFixed(0)}W avg` : '— W avg';
+    }
   }
 
   if (nodes?.nodes) {

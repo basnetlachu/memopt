@@ -51,158 +51,31 @@ class RooflineProfiler:
     """
     GPU roofline profiler.
     Source: NVIDIA/AMD official datasheets + CUDA Programming Guide.
+
+    GPU specs are sourced from hardware_counters.GPU_SPECS (single source of truth).
     """
 
-    GPU_DATABASE: Dict[str, dict] = {
-        # ── NVIDIA Hopper ──────────────────────────────────────────────────
-        "H100 SXM": {
-            "memory_bandwidth_gbs":    3350,
-            "compute_tflops_fp16":     1979,
-            "compute_tflops_bf16":     1979,
-            "compute_tflops_fp8":      3958,
-            "flash_attention_version": "flash_attention_3",
-            "supports_bf16":           True,
-            "supports_fp8":            True,
-            "nvlink_bandwidth_gbs":    900,
-            "cuda_compute_capability": (9, 0),
-        },
-        "H100 PCIe": {
-            "memory_bandwidth_gbs":    2000,
-            "compute_tflops_fp16":     1513,
-            "compute_tflops_bf16":     1513,
-            "compute_tflops_fp8":      3026,
-            "flash_attention_version": "flash_attention_3",
-            "supports_bf16":           True,
-            "supports_fp8":            True,
+    @staticmethod
+    def _spec_to_dict(spec) -> dict:
+        """Convert a GPUSpec from hardware_counters to the roofline dict format."""
+        cc = spec.compute_capability or (8, 0)
+        supports_fp8  = cc >= (8, 9)   # Ada Lovelace+ and Hopper+
+        supports_bf16 = cc >= (8, 0)   # Ampere+
+        fa_version = "flash_attention_3" if cc >= (9, 0) else "flash_attention_2"
+        # Pascal and older GPUs report fp16_tflops=0; use fp32 as compute ceiling
+        effective_fp16 = spec.peak_fp16_tflops or spec.peak_fp32_tflops
+        fp8_tflops = round(effective_fp16 * 2.0, 0) if supports_fp8 else None
+        return {
+            "memory_bandwidth_gbs":    spec.peak_memory_bandwidth_gbps,
+            "compute_tflops_fp16":     effective_fp16,
+            "compute_tflops_bf16":     effective_fp16,
+            "compute_tflops_fp8":      fp8_tflops,
+            "flash_attention_version": fa_version,
+            "supports_bf16":           supports_bf16,
+            "supports_fp8":            supports_fp8,
             "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (9, 0),
-        },
-        "H200": {
-            "memory_bandwidth_gbs":    4800,
-            "compute_tflops_fp16":     1979,
-            "compute_tflops_bf16":     1979,
-            "compute_tflops_fp8":      3958,
-            "flash_attention_version": "flash_attention_3",
-            "supports_bf16":           True,
-            "supports_fp8":            True,
-            "nvlink_bandwidth_gbs":    900,
-            "cuda_compute_capability": (9, 0),
-        },
-        # ── NVIDIA Ampere ──────────────────────────────────────────────────
-        "A100 SXM": {
-            "memory_bandwidth_gbs":    2000,
-            "compute_tflops_fp16":     312,
-            "compute_tflops_bf16":     312,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    600,
-            "cuda_compute_capability": (8, 0),
-        },
-        "A100 PCIe": {
-            "memory_bandwidth_gbs":    1935,
-            "compute_tflops_fp16":     312,
-            "compute_tflops_bf16":     312,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 0),
-        },
-        "A10": {
-            "memory_bandwidth_gbs":    600,
-            "compute_tflops_fp16":     125,
-            "compute_tflops_bf16":     125,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 6),
-        },
-        "A30": {
-            "memory_bandwidth_gbs":    933,
-            "compute_tflops_fp16":     165,
-            "compute_tflops_bf16":     165,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 0),
-        },
-        # ── NVIDIA Ada Lovelace ────────────────────────────────────────────
-        "RTX 4090": {
-            "memory_bandwidth_gbs":    1008,
-            "compute_tflops_fp16":     82,
-            "compute_tflops_bf16":     82,
-            "compute_tflops_fp8":      165,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            True,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 9),
-        },
-        "RTX 4080": {
-            "memory_bandwidth_gbs":    717,
-            "compute_tflops_fp16":     49,
-            "compute_tflops_bf16":     49,
-            "compute_tflops_fp8":      98,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            True,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 9),
-        },
-        # ── NVIDIA Ampere consumer ─────────────────────────────────────────
-        "RTX 3090": {
-            "memory_bandwidth_gbs":    936,
-            "compute_tflops_fp16":     35,
-            "compute_tflops_bf16":     35,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 6),
-        },
-        "RTX 3080": {
-            "memory_bandwidth_gbs":    760,
-            "compute_tflops_fp16":     30,
-            "compute_tflops_bf16":     30,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": (8, 6),
-        },
-        # ── AMD ────────────────────────────────────────────────────────────
-        "MI300X": {
-            "memory_bandwidth_gbs":    5300,
-            "compute_tflops_fp16":     1307,
-            "compute_tflops_bf16":     1307,
-            "compute_tflops_fp8":      2614,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            True,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": None,
-        },
-        "MI250X": {
-            "memory_bandwidth_gbs":    3277,
-            "compute_tflops_fp16":     383,
-            "compute_tflops_bf16":     383,
-            "compute_tflops_fp8":      None,
-            "flash_attention_version": "flash_attention_2",
-            "supports_bf16":           True,
-            "supports_fp8":            False,
-            "nvlink_bandwidth_gbs":    None,
-            "cuda_compute_capability": None,
-        },
-    }
+            "cuda_compute_capability": cc,
+        }
 
     def profile_gpu(self, gpu_index: int = 0) -> HardwareProfile:
         """Profile a specific GPU index. Queries nvidia-smi for live stats."""
@@ -311,20 +184,23 @@ class RooflineProfiler:
             return "Unknown GPU", 80 * 1024, 60 * 1024
 
     def _lookup_gpu_specs(self, gpu_name: str) -> dict:
-        """Match live GPU name to specs database. Longest key match wins."""
-        best_key, best_specs = None, None
-        for key, specs in self.GPU_DATABASE.items():
-            if key.lower() in gpu_name.lower():
-                if best_key is None or len(key) > len(best_key):
-                    best_key, best_specs = key, specs
+        """Match live GPU name to hardware_counters.GPU_SPECS. Longest key match wins."""
+        from memopt.profiler.hardware_counters import GPU_SPECS
 
-        if best_specs:
+        best_key, best_spec = None, None
+        normalized_name = gpu_name.lower().replace("-", " ")
+        for key, spec in GPU_SPECS.items():
+            normalized_key = key.lower().replace("-", " ")
+            if normalized_key in normalized_name:
+                if best_key is None or len(key) > len(best_key):
+                    best_key, best_spec = key, spec
+
+        if best_spec is not None:
             logger.info(f"Matched '{gpu_name}' → '{best_key}'")
-            return best_specs
+            return self._spec_to_dict(best_spec)
 
         logger.warning(
-            f"GPU '{gpu_name}' not in database — using conservative defaults. "
-            f"Add it to RooflineProfiler.GPU_DATABASE for accurate recommendations."
+            f"GPU '{gpu_name}' not in hardware_counters.GPU_SPECS — using conservative defaults."
         )
         return {
             "memory_bandwidth_gbs":    900,

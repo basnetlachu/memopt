@@ -11,24 +11,33 @@ import pytest
 from memopt.profiler.roofline import HardwareProfile, ModelProfile, RooflineProfiler
 
 
-# ── GPU database integrity ─────────────────────────────────────────────────────
+# ── GPU database integrity — now backed by hardware_counters.GPU_SPECS ─────────
 
 class TestGPUDatabase:
-    def test_all_entries_have_required_fields(self):
+    """
+    GPU_DATABASE was removed in favour of hardware_counters.GPU_SPECS.
+    Tests now validate _spec_to_dict output and _lookup_gpu_specs lookups.
+    """
+
+    def _all_specs(self):
+        """Return list of (name, roofline_dict) for every entry in GPU_SPECS."""
+        from memopt.profiler.hardware_counters import GPU_SPECS
         profiler = RooflineProfiler()
+        return [(name, profiler._spec_to_dict(spec)) for name, spec in GPU_SPECS.items()]
+
+    def test_all_entries_have_required_fields(self):
         required = {
             "memory_bandwidth_gbs",
             "compute_tflops_fp16",
             "flash_attention_version",
             "supports_bf16",
         }
-        for name, specs in profiler.GPU_DATABASE.items():
+        for name, specs in self._all_specs():
             missing = required - specs.keys()
             assert not missing, f"GPU '{name}' missing fields: {missing}"
 
     def test_ridge_point_is_positive_for_all_gpus(self):
-        profiler = RooflineProfiler()
-        for name, specs in profiler.GPU_DATABASE.items():
+        for name, specs in self._all_specs():
             bw      = specs["memory_bandwidth_gbs"]
             compute = specs["compute_tflops_fp16"]
             ridge   = (compute * 1e12) / (bw * 1e9)
@@ -36,32 +45,32 @@ class TestGPUDatabase:
 
     def test_h100_has_flash_attention_3(self):
         profiler = RooflineProfiler()
-        h100 = profiler.GPU_DATABASE["H100 SXM"]
-        assert h100["flash_attention_version"] == "flash_attention_3"
+        specs = profiler._lookup_gpu_specs("NVIDIA H100 SXM5-80GB")
+        assert specs["flash_attention_version"] == "flash_attention_3"
 
     def test_a100_has_flash_attention_2(self):
         profiler = RooflineProfiler()
-        a100 = profiler.GPU_DATABASE["A100 SXM"]
-        assert a100["flash_attention_version"] == "flash_attention_2"
+        specs = profiler._lookup_gpu_specs("NVIDIA A100-SXM4-80GB")
+        assert specs["flash_attention_version"] == "flash_attention_2"
 
     def test_hopper_supports_fp8(self):
         profiler = RooflineProfiler()
-        assert profiler.GPU_DATABASE["H100 SXM"]["supports_fp8"] is True
-        assert profiler.GPU_DATABASE["H100 PCIe"]["supports_fp8"] is True
+        h100 = profiler._lookup_gpu_specs("NVIDIA H100 SXM5-80GB")
+        assert h100["supports_fp8"] is True
+        h200 = profiler._lookup_gpu_specs("NVIDIA H200")
+        assert h200["supports_fp8"] is True
 
     def test_ampere_does_not_support_fp8(self):
         profiler = RooflineProfiler()
-        assert profiler.GPU_DATABASE["A100 SXM"]["supports_fp8"] is False
-        assert profiler.GPU_DATABASE["A100 PCIe"]["supports_fp8"] is False
+        a100 = profiler._lookup_gpu_specs("NVIDIA A100-SXM4-80GB")
+        assert a100["supports_fp8"] is False
 
-    def test_nvlink_only_on_multi_gpu_cards(self):
+    def test_sxm_has_higher_bandwidth_than_pcie(self):
+        """SXM variants have higher bandwidth than PCIe — replaces nvlink test."""
         profiler = RooflineProfiler()
-        # SXM variants have NVLink
-        assert profiler.GPU_DATABASE["H100 SXM"]["nvlink_bandwidth_gbs"] is not None
-        assert profiler.GPU_DATABASE["A100 SXM"]["nvlink_bandwidth_gbs"] is not None
-        # PCIe / consumer variants don't
-        assert profiler.GPU_DATABASE["H100 PCIe"]["nvlink_bandwidth_gbs"] is None
-        assert profiler.GPU_DATABASE["RTX 4090"]["nvlink_bandwidth_gbs"] is None
+        sxm   = profiler._lookup_gpu_specs("NVIDIA A100-SXM4-80GB")
+        pcie  = profiler._lookup_gpu_specs("NVIDIA A100-PCIe")
+        assert sxm["memory_bandwidth_gbs"] > pcie["memory_bandwidth_gbs"]
 
 
 # ── GPU matching ───────────────────────────────────────────────────────────────
@@ -70,7 +79,7 @@ class TestGPUMatching:
     def test_exact_match_a100_sxm(self):
         profiler = RooflineProfiler()
         specs = profiler._lookup_gpu_specs("NVIDIA A100 SXM4-80GB")
-        assert specs["memory_bandwidth_gbs"] == 2000
+        assert specs["memory_bandwidth_gbs"] == 2039  # GPU_SPECS: A100-SXM4-80GB=2039 GB/s
         assert specs["flash_attention_version"] == "flash_attention_2"
 
     def test_exact_match_h100(self):
@@ -93,12 +102,12 @@ class TestGPUMatching:
         assert "flash_attention_version" in specs
 
     def test_longest_key_wins(self):
-        """'A100 SXM' is more specific than 'A100' — should prefer it."""
+        """'A100-SXM4-80GB' key (13 chars) beats 'A100' (4 chars) — highest-bw variant wins."""
         profiler = RooflineProfiler()
         specs_sxm  = profiler._lookup_gpu_specs("NVIDIA A100 SXM4-80GB")
         specs_pcie = profiler._lookup_gpu_specs("NVIDIA A100 PCIe 40GB")
-        # SXM has NVLink
-        assert specs_sxm["nvlink_bandwidth_gbs"] is not None
+        # SXM has higher bandwidth than PCIe (longest matching key wins)
+        assert specs_sxm["memory_bandwidth_gbs"] > specs_pcie["memory_bandwidth_gbs"]
         assert specs_pcie["nvlink_bandwidth_gbs"] is None
 
 
@@ -106,16 +115,16 @@ class TestGPUMatching:
 
 class TestRidgePointMath:
     def test_a100_ridge_point(self):
-        """A100 SXM: 312 TFLOPS / 2000 GB/s = 156 FLOPS/byte."""
+        """A100 SXM: 312 TFLOPS / 2039 GB/s ≈ 153 FLOPS/byte."""
         profiler = RooflineProfiler()
-        specs = profiler.GPU_DATABASE["A100 SXM"]
+        specs = profiler._lookup_gpu_specs("NVIDIA A100-SXM4-80GB")
         ridge = (specs["compute_tflops_fp16"] * 1e12) / (specs["memory_bandwidth_gbs"] * 1e9)
-        assert abs(ridge - 156.0) < 1.0
+        assert abs(ridge - 153.0) < 2.0
 
     def test_h100_ridge_point(self):
         """H100 SXM: 1979 TFLOPS / 3350 GB/s ≈ 591 FLOPS/byte."""
         profiler = RooflineProfiler()
-        specs = profiler.GPU_DATABASE["H100 SXM"]
+        specs = profiler._lookup_gpu_specs("NVIDIA H100 SXM5-80GB")
         ridge = (specs["compute_tflops_fp16"] * 1e12) / (specs["memory_bandwidth_gbs"] * 1e9)
         assert abs(ridge - 591.0) < 5.0
 

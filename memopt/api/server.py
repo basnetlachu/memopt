@@ -414,17 +414,16 @@ def run_optimization(job_id: str) -> None:
         model.eval()
 
         # ── Build sample input ───────────────────────────────────────────────
+        from memopt.utils.input_handler import detect_input_format, forward as _ih_forward
         raw_sample = _build_sample_input(model, job.input_shape, device)
         positional_tensor = raw_sample.pop("_positional", None)
-        sample_input = raw_sample   # may be empty if positional path taken
+        probe = positional_tensor if positional_tensor is not None else raw_sample
+        with torch.no_grad():
+            _fmt = detect_input_format(model, probe, device=str(device))
+        sample_input = _fmt.inputs   # normalized dict for select_optimizations
 
-        # Wrap model calls so positional fallback is transparent everywhere.
-        if positional_tensor is not None:
-            def _call(m: torch.nn.Module) -> Any:
-                return m(positional_tensor)
-        else:
-            def _call(m: torch.nn.Module) -> Any:
-                return m(**sample_input)
+        def _call(m: torch.nn.Module) -> Any:
+            return _ih_forward(m, _fmt)
 
         # ── Baseline measurement (with power) ────────────────────────────────
         with PowerSampler() as _bps:

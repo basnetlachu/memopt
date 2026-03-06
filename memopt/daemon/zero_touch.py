@@ -23,9 +23,9 @@ from memopt.daemon.scanner import GPUScanner, GPUProcess
 from memopt.daemon.process_inspector import ProcessInspector, ProcessProfile
 from memopt.daemon.apply import ApplyEngine
 from memopt.daemon.roi_calculator import ROICalculator
-from memopt.alerts.alert_store import AlertStore
-from memopt.alerts.drift_detector import DriftDetector
-from memopt.alerts.notifier import AlertNotifier
+from memopt.fleet.intelligence import FleetIntelligence, NodeMetrics
+from memopt.migration.engine import AutoMigrationEngine
+from memopt.profiler.roofline import RooflineProfiler
 
 log = logging.getLogger(__name__)
 
@@ -95,10 +95,16 @@ class ZeroTouchDaemon:
         from memopt.daemon.reporter import ControlPlaneReporter
         self.reporter = ControlPlaneReporter()
 
-        # Drift detection — monitors previously-optimized processes for regression
-        self.alert_store = AlertStore()
-        self.drift_detector = DriftDetector(self.alert_store)
-        self.alert_notifier = AlertNotifier()
+        # Fleet intelligence — unified drift detection and metrics
+        self.fleet = FleetIntelligence(
+            db_path=str(Path.home() / ".memopt" / "fleet.db"),
+            gpu_cost_per_hour=self.config.gpu_cost_per_hour,
+            auto_remediate=False,
+        )
+        # Zero-downtime migration engine
+        self.migration_engine = AutoMigrationEngine()
+        self.roofline_profiler = RooflineProfiler()
+        self._migrated_pids: set = set()
 
     def run(self) -> None:
         """
@@ -148,10 +154,23 @@ class ZeroTouchDaemon:
         self.reporter.add_events(cycle_events)
         self.reporter.report(self)
 
-        # Check all tracked PIDs for utilization drift
-        drift_alerts = self.drift_detector.check_all(processes)
-        for alert in drift_alerts:
-            self.alert_notifier.notify(alert)
+        # Push metrics to fleet intelligence layer for unified drift detection
+        for proc in processes:
+            self.fleet.ingest_metrics(NodeMetrics(
+                node_name=self.config.node_name,
+                timestamp=time.time(),
+                gpu_index=proc.gpu_ids[0] if proc.gpu_ids else 0,
+                gpu_name="",
+                vram_used_mb=proc.gpu_memory_mb or 0,
+                vram_total_mb=0,
+                gpu_util_pct=proc.gpu_utilization_pct or 0.0,
+                power_watts=0.0,
+                temperature_c=0.0,
+                active_pid=proc.pid,
+                tokens_per_second=proc.gpu_utilization_pct,
+                optimization_applied=proc.pid in self._optimized_pids,
+                backend=proc.mode or "unknown",
+            ))
 
         return cycle_events
 
@@ -218,17 +237,21 @@ class ZeroTouchDaemon:
                 self.total_dollar_saved += dollar_saved
                 with self._lock:
                     self._optimized_pids[proc.pid] = time.time()
-                # Record drift baseline — utilization is the proxy metric
-                self.drift_detector.record_baseline(
-                    pid=proc.pid,
+                # Record fleet baseline and optimization for unified drift tracking
+                _node_key = f"{self.config.node_name}:gpu{proc.gpu_ids[0] if proc.gpu_ids else 0}"
+                self.fleet.set_baseline(_node_key, proc.gpu_utilization_pct or 1.0)
+                self.fleet.record_optimization(
                     node_name=self.config.node_name,
-                    model_family=proc.model_family,
-                    gpu_ids=proc.gpu_ids,
-                    post_opt_util_pct=proc.gpu_utilization_pct,
-                    speedup_min=profile.expected_speedup_min,
-                    speedup_max=profile.expected_speedup_max,
-                    optimizations_applied=profile.recommended_optimizations,
+                    pid=proc.pid,
+                    model_name=proc.model_family or "unknown",
+                    backend_before="unoptimized",
+                    backend_after="optimized",
+                    tps_before=None,
+                    tps_after=None,
+                    optimizations=profile.recommended_optimizations,
+                    status="applied",
                 )
+                self._maybe_migrate(proc)
             else:
                 status = "failed"
 
@@ -244,6 +267,44 @@ class ZeroTouchDaemon:
             status=status,
             dollar_saved_per_hour=dollar_saved if status == "applied" else 0.0,
         )
+
+    def _maybe_migrate(self, proc: GPUProcess) -> None:
+        """Attempt zero-downtime backend migration if expected speedup >= 2.0x."""
+        if proc.pid in self._migrated_pids:
+            return
+        if proc.mode != "inference":
+            return
+        try:
+            gpu_id = proc.gpu_ids[0] if proc.gpu_ids else 0
+            hw = self.roofline_profiler.profile_gpu(gpu_id)
+            hw_dict = {
+                "gpu_indices":   proc.gpu_ids,
+                "vram_total_mb": hw.vram_total_mb,
+                "vram_free_mb":  hw.vram_free_mb,
+                "model_vram_mb": proc.gpu_memory_mb or 0,
+                "gpu_name":      hw.gpu_name,
+            }
+            plan = self.migration_engine.build_plan(proc.pid, hw_dict)
+            if plan.estimated_speedup < 2.0:
+                log.debug(
+                    f"PID {proc.pid}: migration speedup {plan.estimated_speedup:.1f}x < 2.0 — skip"
+                )
+                return
+            log.info(
+                f"PID {proc.pid}: migrating to {plan.target_backend} "
+                f"(expected {plan.estimated_speedup:.1f}x)"
+            )
+            result = self.migration_engine.execute(plan)
+            if result.success:
+                self._migrated_pids.add(proc.pid)
+                log.info(
+                    f"PID {proc.pid} → {result.backend} "
+                    f"new_pid={result.new_pid} measured={result.measured_speedup:.2f}x"
+                )
+            else:
+                log.warning(f"PID {proc.pid}: migration failed — {result.error}")
+        except Exception as e:
+            log.error(f"_maybe_migrate PID {proc.pid}: {e}", exc_info=True)
 
     def _export_metrics(self, events: List[OptimizationEvent]) -> None:
         """

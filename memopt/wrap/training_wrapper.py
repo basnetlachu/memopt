@@ -162,6 +162,36 @@ def _write_report(applied, dry_run=False):
     report_file.write_text(json.dumps(report, indent=2))
     log.info(f"memopt: report written to {{report_file}}")
 
+    if not dry_run and applied:
+        _post_to_control_plane(applied)
+
+
+def _post_to_control_plane(applied):
+    try:
+        import urllib.request as _urlreq, json as _json
+        _cp = os.getenv("MEMOPT_CONTROL_PLANE", "")
+        if not _cp:
+            return
+        _key = os.getenv("MEMOPT_API_KEY", "")
+        _payload = _json.dumps({{
+            "node":          _NODE_NAME,
+            "pid":           os.getpid(),
+            "model":         sys.argv[0] if sys.argv else "unknown",
+            "optimizations": applied,
+            "status":        "applied",
+            "speedup":       None,
+            "saved_per_hour": None,
+        }}).encode()
+        _req = _urlreq.Request(
+            f"{{_cp}}/api/v1/events",
+            data=_payload,
+            headers={{"Content-Type": "application/json", "X-Memopt-API-Key": _key}},
+        )
+        _urlreq.urlopen(_req, timeout=5)
+        log.info(f"memopt: training event posted to control plane {{_cp}}")
+    except Exception as _e:
+        log.debug(f"memopt: control plane post failed: {{_e}}")
+
 
 def _patched_train(self, mode=True):
     result = _original_train(self, mode)

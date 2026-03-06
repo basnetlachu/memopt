@@ -137,6 +137,65 @@ def cmd_apply(args) -> int:
         return 1
 
 
+def cmd_migrate(args) -> int:
+    """
+    Migrate a running GPU process to a faster backend (e.g., Turbo Engine).
+    Returns exit code (0 = success/no-op, 1 = error).
+    """
+    from .scanner import GPUScanner
+    from memopt.migration.engine import AutoMigrationEngine
+    from memopt.profiler.roofline import RooflineProfiler
+
+    pid = args.pid
+    dry_run = getattr(args, "dry_run", False)
+
+    scanner = GPUScanner()
+    processes = scanner.scan()
+    target = next((p for p in processes if p.pid == pid), None)
+
+    if target is None:
+        print(f"Error: PID {pid} is not a known GPU process.")
+        print("Run 'memopt scan' to see active GPU processes.")
+        return 1
+
+    profiler = RooflineProfiler()
+    gpu_id = target.gpu_ids[0] if target.gpu_ids else 0
+    hw = profiler.profile_gpu(gpu_id)
+    hw_dict = {
+        "gpu_indices":   target.gpu_ids,
+        "vram_total_mb": hw.vram_total_mb,
+        "vram_free_mb":  hw.vram_free_mb,
+        "model_vram_mb": target.gpu_memory_mb or 0,
+        "gpu_name":      hw.gpu_name,
+    }
+
+    engine = AutoMigrationEngine()
+    plan = engine.build_plan(pid, hw_dict)
+
+    print(f"\n  PID {pid}  →  target: {plan.target_backend}")
+    print(f"  Model   : {plan.model_name}")
+    print(f"  Expected: {plan.estimated_speedup:.1f}x speedup")
+
+    if plan.estimated_speedup < 1.5:
+        print(f"  No beneficial migration available.")
+        return 0
+
+    if dry_run:
+        print("  [dry-run] No changes made.")
+        return 0
+
+    result = engine.execute(plan)
+    if result.success:
+        print(
+            f"\n  Migrated  PID {result.new_pid}  "
+            f"backend={result.backend}  measured={result.measured_speedup:.2f}x"
+        )
+        return 0
+    else:
+        print(f"\n  Migration failed: {result.error}")
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memopt.daemon.cli",
@@ -192,6 +251,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     apply_p.set_defaults(func=cmd_apply)
+
+    # ── migrate ───────────────────────────────────────────────────────────────
+    migrate_p = sub.add_parser(
+        "migrate",
+        help="Migrate a running GPU process to a faster backend (Turbo Engine, TensorRT-LLM)",
+    )
+    migrate_p.add_argument(
+        "--pid", type=int, required=True,
+        help="PID of the GPU process to migrate",
+    )
+    migrate_p.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Plan migration but do not execute",
+    )
+    migrate_p.set_defaults(func=cmd_migrate)
 
     return parser
 
