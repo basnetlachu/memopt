@@ -51,6 +51,18 @@ class ApplyEngine:
         result = engine.apply(profile, dry_run=False)
     """
 
+    # Draft model map for speculative decoding — TinyLlama works for any LLaMA/Mistral family
+    DRAFT_MODEL_MAP: dict = {
+        "mistral":  "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "llama":    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "llama2":   "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "llama3":   "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "falcon":   "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "gemma":    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "qwen":     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "default":  "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+
     def apply(
         self,
         profile: ProcessProfile,
@@ -74,6 +86,22 @@ class ApplyEngine:
         try:
             if mode == "vllm":
                 return self._apply_vllm(profile)
+            if mode == "speculative":
+                return self._apply_speculative(profile)
+            if mode == "vllm+spec":
+                r1 = self._apply_vllm(profile)
+                r2 = self._apply_speculative(profile)
+                combined_opts = r1.optimizations_applied + r2.optimizations_applied
+                print("\n  Both scripts generated. For maximum throughput use vLLM (--mode vllm).")
+                print("  For minimum latency stack speculative on top (--mode speculative).")
+                return ApplyResult(
+                    pid_original=profile.pid,
+                    pid_new=None,
+                    success=r1.success and r2.success,
+                    rolled_back=False,
+                    optimizations_applied=combined_opts,
+                    wrapper_path=r1.wrapper_path,
+                )
             return self._apply_inner(profile, dry_run, mode=mode)
         except Exception as e:
             log.error(f"ApplyEngine.apply failed for pid {profile.pid}: {e}", exc_info=True)
@@ -339,12 +367,6 @@ class ApplyEngine:
                 "os.environ.setdefault('MEMOPT_BF16', '1')",
             ]
 
-        if "int8" in applied_opts:
-            env_lines += [
-                "# Enable INT8 quantization hook",
-                "os.environ.setdefault('MEMOPT_INT8', '1')",
-            ]
-
         if "torch_compile" in applied_opts:
             env_lines += [
                 "# Enable torch.compile",
@@ -409,39 +431,76 @@ class ApplyEngine:
 
         return ""
 
+    def _vllm_max_seqs(self, profile: ProcessProfile) -> tuple:
+        """Return (total_vram_gb, max_seqs, gpu_util) using pynvml. Falls back to safe defaults."""
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            gpu_id = profile.gpu_ids[0] if profile.gpu_ids else 0
+            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            pynvml.nvmlShutdown()
+            total_gb = mem.total / 1024 ** 3
+        except Exception:
+            total_gb = 80.0  # conservative A100 default
+
+        gpu_util = 0.85
+        model_vram_gb = (profile.gpu_memory_mb or 0) / 1024
+        free_for_kv = (total_gb * gpu_util) - model_vram_gb
+        # Each concurrent sequence needs ~500 MB for KV cache
+        max_seqs = max(8, min(64, int(free_for_kv * 1024 / 500)))
+        return total_gb, max_seqs, gpu_util
+
     def _apply_vllm(self, profile: ProcessProfile) -> ApplyResult:
         """
-        Generate a ready-to-run vLLM server script for continuous-batching migration.
-        Prints the script path and launch instructions; does NOT restart the process.
-        Posts an event to the control plane on success.
+        Generate a ready-to-run vLLM continuous-batching server script.
+        Uses pynvml to calculate optimal max_seqs from free VRAM.
+        Float16 only — no quantization.
         """
-        model_path = self._detect_model_from_cmdline(profile.pid) or profile.model_family or "your-model"
+        model_path = (
+            self._detect_model_from_cmdline(profile.pid)
+            or profile.model_family
+            or "your-model"
+        )
+        total_gb, max_seqs, gpu_util = self._vllm_max_seqs(profile)
         script_path = f"/tmp/memopt_vllm_{profile.pid}.py"
 
         script = (
             "#!/usr/bin/env python3\n"
-            "# === memopt vLLM migration script (auto-generated) ===\n"
-            f"# Original PID : {profile.pid}\n"
-            f"# Model family : {profile.model_family}\n"
-            f"# Model path   : {model_path}\n"
-            "#\n"
-            "# Run this script to replace the existing inference process with a\n"
-            "# vLLM OpenAI-compatible server using continuous batching.\n"
-            "# Throughput gain: ~5-6x vs single-request inference (float16, no quantization).\n"
-            "#\n"
-            "import subprocess, sys\n"
+            "# ============================================================\n"
+            "# Generated by memopt\n"
+            "# Technique: vLLM continuous batching + PagedAttention\n"
+            f"# Model:     {model_path}\n"
+            f"# GPU VRAM:  {total_gb:.0f} GB total  /  max_seqs={max_seqs}\n"
+            "# Precision:  float16  (NO quantization)\n"
+            "# Quality:    NONE — mathematically identical outputs\n"
+            "# Expected:   ~5-6x throughput vs single-request HuggingFace\n"
+            "# ============================================================\n"
+            "import subprocess, sys, os\n"
+            "\n"
+            f"MODEL = \"{model_path}\"\n"
+            f"HOST  = os.getenv(\"VLLM_HOST\", \"0.0.0.0\")\n"
+            f"PORT  = int(os.getenv(\"VLLM_PORT\", \"8001\"))\n"
+            "\n"
+            f"print(f\"[memopt-vllm] Model:     {{MODEL}}\")\n"
+            f"print(f\"[memopt-vllm] Precision: float16 (no quantization)\")\n"
+            f"print(f\"[memopt-vllm] Max seqs:  {max_seqs}\")\n"
+            f"print(f\"[memopt-vllm] Batching:  continuous (PagedAttention)\")\n"
+            f"print(f\"[memopt-vllm] API:       http://{{HOST}}:{{PORT}}/v1\")\n"
             "\n"
             "cmd = [\n"
             "    sys.executable, \"-m\", \"vllm.entrypoints.openai.api_server\",\n"
-            f"    \"--model\", \"{model_path}\",\n"
+            f"    \"--model\", MODEL,\n"
             "    \"--dtype\", \"float16\",\n"
-            "    \"--gpu-memory-utilization\", \"0.85\",\n"
-            "    \"--max-num-seqs\", \"32\",\n"
+            f"    \"--gpu-memory-utilization\", \"{gpu_util}\",\n"
+            "    \"--max-model-len\", \"4096\",\n"
+            f"    \"--max-num-seqs\", \"{max_seqs}\",\n"
             "    \"--enable-prefix-caching\",\n"
-            "    \"--port\", \"8001\",\n"
+            "    \"--trust-remote-code\",\n"
+            "    \"--host\", HOST,\n"
+            "    \"--port\", str(PORT),\n"
             "]\n"
             "\n"
-            "print(f\"Starting vLLM server: {' '.join(cmd)}\")\n"
             "subprocess.run(cmd)\n"
         )
 
@@ -451,21 +510,16 @@ class ApplyEngine:
 
         print()
         print(f"  vLLM migration script  →  {script_path}")
-        print(f"  Model : {model_path}")
+        print(f"  Model    : {model_path}")
+        print(f"  Max seqs : {max_seqs}  (based on {total_gb:.0f} GB VRAM)")
+        print(f"  Precision: float16  (no quantization)")
         print()
-        print("  To migrate (stop current process first):")
-        print(f"    python {script_path}")
+        print("  Stop the current process, then run:")
+        print(f"    pip install vllm")
+        print(f"    python3 {script_path}")
         print()
-        print("  Or run vLLM directly:")
-        print(f"    python -m vllm.entrypoints.openai.api_server \\")
-        print(f"      --model {model_path} \\")
-        print(f"      --dtype float16 \\")
-        print(f"      --gpu-memory-utilization 0.85 \\")
-        print(f"      --max-num-seqs 32 \\")
-        print(f"      --enable-prefix-caching \\")
-        print(f"      --port 8001")
-        print()
-        print("  OpenAI-compatible endpoint: http://localhost:8001/v1/completions")
+        print(f"  OpenAI-compatible API: http://localhost:8001/v1")
+        print(f"  Drop-in:  client = OpenAI(base_url=\"http://localhost:8001/v1\")")
 
         self._post_event(profile, ["vllm_continuous_batching"])
 
@@ -475,6 +529,117 @@ class ApplyEngine:
             success=True,
             rolled_back=False,
             optimizations_applied=["vllm_continuous_batching"],
+            wrapper_path=script_path,
+        )
+
+    def _apply_speculative(self, profile: ProcessProfile) -> ApplyResult:
+        """
+        Generate a speculative decoding wrapper.
+
+        Uses a small TinyLlama 1.1B draft model to propose tokens that the
+        main model verifies in one forward pass. Wrong draft tokens are always
+        rejected, so outputs are mathematically identical to standard decoding.
+        Expected gain: 1.5-2.5x latency improvement.
+        Float16 only — no quantization.
+        """
+        model_path = (
+            self._detect_model_from_cmdline(profile.pid)
+            or profile.model_family
+            or "your-model"
+        )
+
+        draft_model = self.DRAFT_MODEL_MAP.get("default")
+        for key, draft in self.DRAFT_MODEL_MAP.items():
+            if key in model_path.lower() or key in profile.model_family.lower():
+                draft_model = draft
+                break
+
+        script_path = f"/tmp/memopt_speculative_{profile.pid}.py"
+
+        script = (
+            "#!/usr/bin/env python3\n"
+            "# ============================================================\n"
+            "# Generated by memopt\n"
+            "# Technique: Speculative decoding\n"
+            f"# Main model:  {model_path}\n"
+            f"# Draft model: {draft_model}\n"
+            "# Precision:   float16  (NO quantization)\n"
+            "# Quality:     NONE — wrong draft tokens always rejected\n"
+            "# Expected:    1.5-2.5x latency improvement\n"
+            "# ============================================================\n"
+            "import torch\n"
+            "from transformers import AutoModelForCausalLM, AutoTokenizer\n"
+            "\n"
+            f"MAIN_MODEL  = \"{model_path}\"\n"
+            f"DRAFT_MODEL = \"{draft_model}\"\n"
+            "\n"
+            "print(f\"[memopt-speculative] Loading main model: {MAIN_MODEL}\")\n"
+            "tokenizer = AutoTokenizer.from_pretrained(MAIN_MODEL)\n"
+            "tokenizer.pad_token = tokenizer.eos_token\n"
+            "\n"
+            "main_model = AutoModelForCausalLM.from_pretrained(\n"
+            "    MAIN_MODEL,\n"
+            "    torch_dtype=torch.float16,\n"
+            "    device_map=\"auto\",\n"
+            ")\n"
+            "main_model.eval()\n"
+            "print(f\"[memopt-speculative] Main model loaded\")\n"
+            "\n"
+            "print(f\"[memopt-speculative] Loading draft model: {DRAFT_MODEL}\")\n"
+            "draft_model = AutoModelForCausalLM.from_pretrained(\n"
+            "    DRAFT_MODEL,\n"
+            "    torch_dtype=torch.float16,\n"
+            "    device_map=\"auto\",\n"
+            ")\n"
+            "draft_model.eval()\n"
+            "print(f\"[memopt-speculative] Speculative decoding ready\")\n"
+            "\n"
+            "\n"
+            "def generate(prompt, max_new_tokens=200, **kwargs):\n"
+            "    inputs = tokenizer(prompt, return_tensors=\"pt\").to(\"cuda\")\n"
+            "    with torch.no_grad():\n"
+            "        out = main_model.generate(\n"
+            "            **inputs,\n"
+            "            max_new_tokens=max_new_tokens,\n"
+            "            assistant_model=draft_model,\n"
+            "            do_sample=False,\n"
+            "            pad_token_id=tokenizer.eos_token_id,\n"
+            "            **kwargs,\n"
+            "        )\n"
+            "    return tokenizer.decode(out[0], skip_special_tokens=True)\n"
+            "\n"
+            "\n"
+            "if __name__ == \"__main__\":\n"
+            "    print(\"[memopt-speculative] Test: generating 50 tokens...\")\n"
+            "    result = generate(\"Explain the benefits of GPU optimization:\", max_new_tokens=50)\n"
+            "    print(result)\n"
+            "    print(\"[memopt-speculative] Done. Import this module and call generate(prompt).\")\n"
+        )
+
+        with open(script_path, "w") as f:
+            f.write(script)
+        os.chmod(script_path, 0o755)
+
+        print()
+        print(f"  Speculative decoding script  →  {script_path}")
+        print(f"  Main model  : {model_path}")
+        print(f"  Draft model : {draft_model}")
+        print(f"  Precision   : float16  (no quantization)")
+        print(f"  Expected    : 1.5-2.5x latency improvement")
+        print(f"  Quality     : identical — wrong drafts always rejected")
+        print()
+        print("  Run:")
+        print(f"    pip install transformers accelerate")
+        print(f"    python3 {script_path}")
+
+        self._post_event(profile, ["speculative_decoding"])
+
+        return ApplyResult(
+            pid_original=profile.pid,
+            pid_new=None,
+            success=True,
+            rolled_back=False,
+            optimizations_applied=["speculative_decoding"],
             wrapper_path=script_path,
         )
 

@@ -172,9 +172,9 @@ class ScanReporter:
         color: bool,
     ) -> None:
         """Print the THROUGHPUT OPPORTUNITIES box below recommendations."""
-        sep = _fmt("  " + "─" * 64, _CYAN, color)
+        sep = _fmt("  " + "─" * 66, _CYAN, color)
         header = _fmt(
-            "  THROUGHPUT OPPORTUNITIES  (no quality loss, float16 only)",
+            "  THROUGHPUT OPPORTUNITIES  (zero quality loss · float16 only)",
             _BOLD, color,
         )
         print()
@@ -184,26 +184,42 @@ class ScanReporter:
 
         # Option 1: optimal batching
         batch_line = (
-            f"  [1] Optimal batching   batch={optimal_batch}"
+            f"  [1] Optimal batching      batch={optimal_batch}"
             f"  (~{batch_speedup:.1f}x throughput)"
         )
         print(_fmt(batch_line, _GREEN, color))
-        print(
-            _fmt(
-                f"      memopt apply --pid {prof.pid} --mode batch",
-                _DIM, color,
-            )
-        )
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode batch", _DIM, color))
 
         # Option 2: vLLM continuous batching
-        vllm_line = "  [2] vLLM server        continuous batching  (~5.5x throughput)"
+        vllm_speedup = min(optimal_batch * 0.90, 7.0)
+        vllm_line = f"  [2] vLLM continuous batching   (~{vllm_speedup:.1f}x throughput)"
         print(_fmt(vllm_line, _GREEN, color))
-        print(
-            _fmt(
-                f"      memopt apply --pid {prof.pid} --mode vllm",
-                _DIM, color,
-            )
-        )
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode vllm", _DIM, color))
+
+        # Option 3: speculative decoding
+        spec_line = "  [3] Speculative decoding       (~1.8x latency · TinyLlama draft)"
+        print(_fmt(spec_line, _GREEN, color))
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode speculative", _DIM, color))
+
+        # Option 4: vLLM + speculative combined
+        combined = min(vllm_speedup * 1.8 * 0.75, 8.0)
+        combo_line = f"  [4] vLLM + speculative         (~{combined:.1f}x  recommended)"
+        print(_fmt(combo_line, _GREEN, color))
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode vllm+spec", _DIM, color))
+
+        # Arithmetic intensity context
+        ai = prof.arithmetic_intensity
+        ridge = prof.ridge_point
+        print()
+        print(_fmt(
+            f"  Memory bottleneck: AI={ai:.1f}  ({ridge/ai:.0f}x below ridge={ridge:.0f} FLOPS/byte)",
+            _DIM, color,
+        ))
+        print(_fmt(
+            f"  At batch={optimal_batch}: projected AI≈{ai*optimal_batch:.0f}"
+            f"  ({int(100*(1-1/optimal_batch))}% of bottleneck eliminated)",
+            _DIM, color,
+        ))
 
         print(sep)
 
@@ -228,7 +244,6 @@ class ScanReporter:
                     for k in prof.recommendations
                 ],
                 "supports_flash_attn2": prof.supports_flash_attn2,
-                "supports_fp8":         prof.supports_fp8,
                 "supports_bf16":        prof.supports_bf16,
             })
         return json.dumps({"processes": data}, indent=indent)

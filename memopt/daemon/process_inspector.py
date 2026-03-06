@@ -34,27 +34,24 @@ _MODEL_FAMILY_AI = {
 }
 
 # Expected speedup range per optimization key: (min, max)
+# Only techniques with zero quality degradation — no quantization.
 _OPT_SPEEDUP: Dict[str, Tuple[float, float]] = {
     "flash_attention":   (1.5, 2.5),
-    "int8":              (1.5, 2.0),
     "bf16":              (1.2, 1.8),
     "torch_compile":     (1.1, 1.5),
     "kv_cache":          (1.3, 2.0),
     "continuous_batch":  (2.0, 5.0),
     "channels_last":     (1.1, 1.3),
-    "fp8":               (1.3, 2.0),
     "tensor_parallel":   (1.5, 3.0),
 }
 
-# Optimization labels
+# Optimization labels — float16 / zero-quality-loss techniques only
 OPT_LABELS = {
     "flash_attention":   "Flash Attention 2",
-    "int8":              "INT8 quantization",
     "bf16":              "BF16 precision",
     "torch_compile":     "torch.compile()",
     "kv_cache":          "KV-cache reuse",
     "channels_last":     "channels-last layout",
-    "fp8":               "FP8 quantization",
     "tensor_parallel":   "Tensor parallelism",
     "continuous_batch":  "Continuous batching",
 }
@@ -84,7 +81,6 @@ class ProcessProfile:
     hw_arch: str = ""
     hw_name: str = ""
     supports_flash_attn2: bool = False
-    supports_fp8: bool = False
     supports_bf16: bool = False
 
 
@@ -128,7 +124,6 @@ class ProcessInspector:
         hw_arch       = hw.arch                if hw else "unknown"
         hw_name       = hw.device_name         if hw else "unknown"
         supports_fa2  = hw.supports_flash_attn2 if hw else False
-        supports_fp8  = hw.supports_fp8         if hw else False
         supports_bf16 = hw.supports_bf16        if hw else False
 
         # Sample utilization
@@ -150,7 +145,6 @@ class ProcessInspector:
             gpu_memory_mb=gpu_memory_mb,
             hw_arch=hw_arch,
             supports_fa2=supports_fa2,
-            supports_fp8=supports_fp8,
             supports_bf16=supports_bf16,
         )
 
@@ -184,7 +178,6 @@ class ProcessInspector:
             hw_arch=hw_arch,
             hw_name=hw_name,
             supports_flash_attn2=supports_fa2,
-            supports_fp8=supports_fp8,
             supports_bf16=supports_bf16,
         )
 
@@ -250,9 +243,12 @@ class ProcessInspector:
         gpu_memory_mb: int,
         hw_arch: str,
         supports_fa2: bool,
-        supports_fp8: bool,
         supports_bf16: bool,
     ) -> List[str]:
+        """
+        Build recommendations — float16 / zero quality-loss techniques only.
+        No quantization (INT8, FP8, GPTQ, AWQ) is ever recommended.
+        """
         recs = []
         is_transformer = model_family not in ("resnet", "vit", "diffusion", "clip", "unknown")
 
@@ -261,9 +257,6 @@ class ProcessInspector:
                 recs.append("flash_attention")
             if supports_bf16:
                 recs.append("bf16")
-            recs.append("int8")
-            if supports_fp8:
-                recs.append("fp8")
             if mode == "inference" and is_transformer:
                 recs.append("kv_cache")
             if mode == "inference" and is_transformer:
@@ -272,11 +265,8 @@ class ProcessInspector:
 
         elif bottleneck == "compute":
             recs.append("torch_compile")
-            if supports_fp8:
-                recs.append("fp8")
             if supports_bf16:
                 recs.append("bf16")
-            recs.append("int8")
             if is_transformer and supports_fa2:
                 recs.append("flash_attention")
             if model_family in ("resnet", "vit"):
@@ -288,7 +278,6 @@ class ProcessInspector:
             if supports_bf16:
                 recs.append("bf16")
             recs.append("torch_compile")
-            recs.append("int8")
 
         # Deduplicate preserving order
         seen: set = set()
