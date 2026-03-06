@@ -117,7 +117,7 @@ def cmd_apply(args) -> int:
     mode = getattr(args, "mode", "auto")
 
     # Script-generating modes do not require prior recommendations
-    if mode not in ("vllm", "speculative", "vllm+spec") and not profile.recommendations:
+    if mode not in ("turbo", "draft", "turbo+draft") and not profile.recommendations:
         print(f"PID {pid}: No recommendations found (bottleneck={profile.bottleneck}).")
         return 0
 
@@ -180,15 +180,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply_p.add_argument(
         "--mode",
-        choices=["auto", "batch", "vllm", "speculative", "vllm+spec"],
+        choices=["auto", "batch", "turbo", "draft", "turbo+draft"],
         default="auto",
         help=(
             "Optimization mode (float16 only, zero quality loss): "
             "auto = flash+compile (default); "
             "batch = optimal batch size wrapper; "
-            "vllm = vLLM continuous batching server (~5-6x); "
-            "speculative = speculative decoding with TinyLlama draft (~1.8x latency); "
-            "vllm+spec = both combined (~6-8x)"
+            "turbo = Turbo Engine continuous batching server (~5-6x); "
+            "draft = Draft Acceleration (~1.8x latency); "
+            "turbo+draft = both combined (~6-8x)"
         ),
     )
     apply_p.set_defaults(func=cmd_apply)

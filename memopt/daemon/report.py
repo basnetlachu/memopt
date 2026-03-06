@@ -190,22 +190,22 @@ class ScanReporter:
         print(_fmt(batch_line, _GREEN, color))
         print(_fmt(f"      memopt apply --pid {prof.pid} --mode batch", _DIM, color))
 
-        # Option 2: vLLM continuous batching
+        # Option 2: memopt Turbo Engine (continuous batching)
         vllm_speedup = min(optimal_batch * 0.90, 7.0)
-        vllm_line = f"  [2] vLLM continuous batching   (~{vllm_speedup:.1f}x throughput)"
-        print(_fmt(vllm_line, _GREEN, color))
-        print(_fmt(f"      memopt apply --pid {prof.pid} --mode vllm", _DIM, color))
+        turbo_line = f"  [2] Turbo Engine               (~{vllm_speedup:.1f}x throughput)"
+        print(_fmt(turbo_line, _GREEN, color))
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode turbo", _DIM, color))
 
-        # Option 3: speculative decoding
-        spec_line = "  [3] Speculative decoding       (~1.8x latency · TinyLlama draft)"
+        # Option 3: Draft Acceleration
+        spec_line = "  [3] Draft Acceleration         (~1.8x latency)"
         print(_fmt(spec_line, _GREEN, color))
-        print(_fmt(f"      memopt apply --pid {prof.pid} --mode speculative", _DIM, color))
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode draft", _DIM, color))
 
-        # Option 4: vLLM + speculative combined
+        # Option 4: Turbo + Draft combined
         combined = min(vllm_speedup * 1.8 * 0.75, 8.0)
-        combo_line = f"  [4] vLLM + speculative         (~{combined:.1f}x  recommended)"
+        combo_line = f"  [4] Turbo + Draft              (~{combined:.1f}x  recommended)"
         print(_fmt(combo_line, _GREEN, color))
-        print(_fmt(f"      memopt apply --pid {prof.pid} --mode vllm+spec", _DIM, color))
+        print(_fmt(f"      memopt apply --pid {prof.pid} --mode turbo+draft", _DIM, color))
 
         # Arithmetic intensity context
         ai = prof.arithmetic_intensity
