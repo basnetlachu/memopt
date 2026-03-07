@@ -1,6 +1,6 @@
 # memopt — Complete Technical Reference
 
-**Version:** 1.9.0
+**Version:** 2.0.0
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · H100 80GB HBM3 · PyTorch 2.6.0+cu124 · torchao 0.16.0
 
@@ -84,7 +84,7 @@ memopt/
 │   ├── bottleneck_classifier.py    Phase 1: 5-way classification with confidence scores
 │   ├── hardware_metrics.py         Computed metrics helpers
 │   ├── gpu_specs.py                Single-source-of-truth GPU L2 cache table
-│   ├── roofline.py                 RooflineProfiler — 14-GPU database, ridge point math, ModelProfile
+│   ├── roofline.py                 RooflineProfiler — GPU_SPECS-backed (28+ GPUs), _spec_to_dict(), ridge point math, ModelProfile
 │   ├── access_pattern_analyzer.py  Phase 2: Coalescing, redundant fetch, cache thrashing
 │   ├── optimization_synthesis.py   Phase 2: candidates with expected impact %
 │   └── power_sampler.py            NVML background-thread power polling + PowerReport
@@ -3234,17 +3234,38 @@ These replace the scattered `shape[0]`, `shape[1]` assumptions in `universal_opt
 
 ### 32.7 Integration Points
 
-After the fix, every call site in `optimization_agent.py` and `universal_optimizer.py` that previously did `model(**sample_input)` now does `forward(model, fmt)`. The `fmt` object is created once at the top of `agent.run()`:
+Every call site that previously did `model(**sample_input)` now uses `forward(model, fmt)`. This covers `optimization_agent.py`, `universal_optimizer.py`, and `api/server.py` (Fix 6).
+
+**`api/server.py` — Fix 6:**
 
 ```python
-# Before (broken for non-dict inputs)
-sample_input: Dict = {...}
+# Before (broken for CNN / positional / non-dict inputs)
 out = model(**sample_input)
 
-# After (works for CNNs, tokenizer output, tuples, raw tensors)
+# After — works for any model input style
+from memopt.utils.input_handler import detect_input_format, forward as _ih_forward
+
+raw_sample = _build_sample_input(model, job.input_shape, device)
+positional_tensor = raw_sample.pop("_positional", None)
+probe = positional_tensor if positional_tensor is not None else raw_sample
+
+with torch.no_grad():
+    _fmt = detect_input_format(model, probe, device=str(device))
+
+sample_input = _fmt.inputs    # normalised dict for select_optimizations
+
+def _call(m: torch.nn.Module) -> Any:
+    return _ih_forward(m, _fmt)
+```
+
+**`optimization_agent.py` + `universal_optimizer.py`:**
+
+```python
 fmt: InputFormat = detect_input_format(model, sample)
 out = forward(model, fmt)
 ```
+
+The `fmt` object is created once at agent startup and reused for every benchmark call — there is no detection overhead per iteration.
 
 ---
 
@@ -3526,7 +3547,7 @@ else:
     bottleneck = "unknown"
 ```
 
-`ridge_point` comes from `detect_hardware()` — the hardware-specific FLOPS/byte threshold. For an A100 (312 TFLOPS FP16, 2000 GB/s HBM): `ridge_point = 312,000 / 2000 = 156 FLOPS/byte`. A model with AI=4 sits far left of the ridge → memory-bandwidth-bound at any utilization.
+`ridge_point` comes from `detect_hardware()` — the hardware-specific FLOPS/byte threshold. For an A100-SXM4-80GB (312 TFLOPS FP16, 2039 GB/s HBM): `ridge_point = 312,000 / 2039 ≈ 153 FLOPS/byte`. A model with AI=4 sits far left of the ridge → memory-bandwidth-bound at any utilization.
 
 **`ProcessProfile` dataclass:**
 
@@ -3715,11 +3736,12 @@ class ApplyResult:
 
 ### 34.6 Daemon CLI (`daemon/cli.py`)
 
-`memopt/daemon/cli.py` is a standalone module implementing `scan` and `apply` as proper argparse subcommands. It is also invokable directly:
+`memopt/daemon/cli.py` is a standalone module implementing `scan`, `apply`, and `migrate` as proper argparse subcommands. It is also invokable directly:
 
 ```bash
 python -m memopt.daemon.cli scan --json
 python -m memopt.daemon.cli apply --pid 12345 --dry-run
+python -m memopt.daemon.cli migrate --pid 12345
 ```
 
 **`scan` flags:**
@@ -3739,7 +3761,16 @@ python -m memopt.daemon.cli apply --pid 12345 --dry-run
 | `--dry-run` | no | Preview wrapper without killing/restarting process |
 | `--sample-seconds` | no (5) | Utilization sampling duration |
 
-Both are also exposed on the top-level `memopt` CLI via `memopt/cli.py`:
+**`migrate` flags (Fix 1 — wires AutoMigrationEngine):**
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--pid` | yes | PID of the running inference process to migrate |
+| `--dry-run` | no | Build and print the `MigrationPlan` without executing |
+
+`memopt migrate --pid <PID>` calls `RooflineProfiler.profile_gpu()` on the process's GPU, builds a `MigrationPlan` via `AutoMigrationEngine.build_plan()`, and executes zero-downtime backend migration if `plan.estimated_speedup >= 2.0`. The migration is also exposed as `memopt migrate` on the top-level CLI.
+
+All three are also exposed on the top-level `memopt` CLI via `memopt/cli.py`:
 
 ```python
 def cmd_scan(args):
@@ -4000,40 +4031,88 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-### 35.9 Drift Detection Integration
+### 35.9 Fleet Intelligence + Migration Integration (Fix 1 + Fix 2)
 
-`ZeroTouchDaemon` automatically tracks previously-optimized processes for utilisation regression. Three objects are created in `__init__`:
+`ZeroTouchDaemon` now uses `FleetIntelligence` as its observability backbone (replacing the legacy `AlertStore`/`DriftDetector`/`AlertNotifier` trio) and `AutoMigrationEngine` for zero-downtime backend migration. Four objects are created in `__init__`:
 
 ```python
-self.alert_store    = AlertStore()      # SQLite persistence
-self.drift_detector = DriftDetector(self.alert_store)
-self.alert_notifier = AlertNotifier()   # log + textfile + optional webhook/email
+self.fleet = FleetIntelligence(
+    db_path=str(Path.home() / ".memopt" / "fleet.db"),
+    gpu_cost_per_hour=self.config.gpu_cost_per_hour,
+    auto_remediate=False,   # daemon controls migration manually
+)
+self.migration_engine  = AutoMigrationEngine()
+self.roofline_profiler = RooflineProfiler()
+self._migrated_pids: set = set()   # guard against re-migrating same PID
+```
+
+**Every scan cycle** (`run_once`, after `_export_metrics`), each discovered process is ingested into FleetIntelligence:
+
+```python
+for proc in processes:
+    self.fleet.ingest_metrics(NodeMetrics(
+        node_name=self.config.node_name,
+        timestamp=time.time(),
+        gpu_index=proc.gpu_ids[0] if proc.gpu_ids else 0,
+        gpu_name="",
+        vram_used_mb=proc.gpu_memory_mb or 0,
+        vram_total_mb=0,
+        gpu_util_pct=proc.gpu_utilization_pct or 0.0,
+        power_watts=0.0,
+        temperature_c=0.0,
+        active_pid=proc.pid,
+        tokens_per_second=proc.gpu_utilization_pct,   # proxy
+        optimization_applied=proc.pid in self._optimized_pids,
+        backend=proc.mode or "unknown",
+    ))
 ```
 
 **After a successful apply** (`_handle_process`, status="applied"):
 
 ```python
-self.drift_detector.record_baseline(
-    pid=proc.pid,
+_node_key = f"{self.config.node_name}:gpu{proc.gpu_ids[0] if proc.gpu_ids else 0}"
+self.fleet.set_baseline(_node_key, proc.gpu_utilization_pct or 1.0)
+self.fleet.record_optimization(
     node_name=self.config.node_name,
-    model_family=proc.model_family,
-    gpu_ids=proc.gpu_ids,
-    post_opt_util_pct=proc.gpu_utilization_pct,   # measured at optimization time
-    speedup_min=profile.expected_speedup_min,
-    speedup_max=profile.expected_speedup_max,
-    optimizations_applied=profile.recommended_optimizations,
+    pid=proc.pid,
+    model_name=proc.model_family or "unknown",
+    backend_before="unoptimized",
+    backend_after="optimized",
+    tps_before=None,
+    tps_after=None,
+    optimizations=profile.recommended_optimizations,
+    status="applied",
 )
+self._maybe_migrate(proc)
 ```
 
-**Every scan cycle** (`run_once`, after `_export_metrics`):
+**`_maybe_migrate(proc)`** — triggers AutoMigrationEngine when a non-migrated inference process is eligible:
 
 ```python
-drift_alerts = self.drift_detector.check_all(processes)
-for alert in drift_alerts:
-    self.alert_notifier.notify(alert)
+def _maybe_migrate(self, proc: GPUProcess) -> None:
+    if proc.pid in self._migrated_pids or proc.mode != "inference":
+        return
+    try:
+        gpu_id = proc.gpu_ids[0] if proc.gpu_ids else 0
+        hw = self.roofline_profiler.profile_gpu(gpu_id)
+        hw_dict = {
+            "gpu_indices": proc.gpu_ids,
+            "vram_total_mb": hw.vram_total_mb,
+            "vram_free_mb":  hw.vram_free_mb,
+            "model_vram_mb": proc.gpu_memory_mb or 0,
+            "gpu_name":      hw.gpu_name,
+        }
+        plan = self.migration_engine.build_plan(proc.pid, hw_dict)
+        if plan.estimated_speedup < 2.0:
+            return   # not worth migrating
+        result = self.migration_engine.execute(plan)
+        if result.success:
+            self._migrated_pids.add(proc.pid)
+    except Exception as e:
+        log.error(f"_maybe_migrate PID {proc.pid}: {e}", exc_info=True)
 ```
 
-`check_all` skips PIDs that were optimized less than 1 hour ago and limits re-checks to once every 30 minutes per PID. Alerts use GPU utilisation as a proxy — not a direct throughput measurement. See Section 40 for full drift system details.
+`FleetIntelligence.ingest_metrics()` handles drift detection internally — `active_drift` dict is updated automatically when throughput drops. See Section 46 for full FleetIntelligence details.
 
 ---
 
@@ -4200,7 +4279,7 @@ After `profile_batches` forward passes, `_apply_optimizations()` runs once:
 
 Gradient checkpointing is the only optimization applied automatically because it has zero mathematical impact — it recomputes activations in the backward pass instead of storing them, reducing VRAM at the cost of ~30% more compute. BF16 and torch.compile require changes to the training loop (loss scaling, optimizer casting) that cannot be done safely without user oversight.
 
-### 37.4 Session Report
+### 37.4 Session Report + Control Plane Posting (Fix 5)
 
 After optimization, a JSON report is written to `~/.memopt/training_sessions/training_<timestamp>.json`:
 
@@ -4219,6 +4298,32 @@ After optimization, a JSON report is written to `~/.memopt/training_sessions/tra
     "script": "train.py"
 }
 ```
+
+If `MEMOPT_CONTROL_PLANE` is set, the hook also POSTs an event to the control plane immediately after writing the session file:
+
+```python
+def _post_to_control_plane(applied: list) -> None:
+    import urllib.request as _urlreq, json as _json
+    _cp = os.getenv("MEMOPT_CONTROL_PLANE", "")
+    if not _cp:
+        return
+    _key = os.getenv("MEMOPT_API_KEY", "")
+    _payload = _json.dumps({
+        "event": "training_optimization",
+        "node": os.getenv("NODE_NAME", socket.gethostname()),
+        "script": sys.argv[0],
+        "optimizations_applied": applied,
+        "timestamp": time.time(),
+    }).encode()
+    _req = _urlreq.Request(
+        f"{_cp}/api/v1/events",
+        data=_payload,
+        headers={"Content-Type": "application/json", "X-Memopt-API-Key": _key},
+    )
+    _urlreq.urlopen(_req, timeout=5)
+```
+
+This uses `urllib.request` (stdlib only — zero extra dependencies). Failures are silently swallowed so a network outage never disrupts training.
 
 ### 37.5 CLI Flags
 
@@ -4381,7 +4486,7 @@ All endpoints below require `X-Memopt-API-Key` except `/health`. HTTP 401 is ret
 
 Response: `{"ok": true, "node": "gpu-node-01"}`
 
-**`GET /api/v1/status`** — cluster-wide summary:
+**`GET /api/v1/status`** — cluster-wide summary (includes `power_metrics` — Fix 4):
 
 ```json
 {
@@ -4394,7 +4499,13 @@ Response: `{"ok": true, "node": "gpu-node-01"}`
   "total_optimizations_applied": 234,
   "dollar_saved_last_24h": 4237.50,
   "dollar_saved_total": 62150.00,
-  "dollar_saved_per_year_estimate": 1546687.50
+  "dollar_saved_per_year_estimate": 1546687.50,
+  "power_metrics": {
+    "avg_power_baseline_watts": 210.4,
+    "avg_power_optimized_watts": 183.7,
+    "power_reduction_pct": 12.7,
+    "electricity_savings_24h_usd": 0.64
+  }
 }
 ```
 
@@ -4406,7 +4517,7 @@ Response: `{"ok": true, "node": "gpu-node-01"}`
 
 **`GET /api/v1/events?limit=100&node_name=X&status=applied`** — event history with optional filters.
 
-**`GET /api/v1/alerts?node_name=X&severity=warning&include_resolved=false`** — drift alerts. By default returns only unresolved alerts, newest first. Returns:
+**`GET /api/v1/alerts?node_name=X&severity=warning&include_resolved=false`** — drift alerts merged from both `AlertStore` (legacy) and `FleetIntelligence.get_recent_drift_events()` (Fix 2). By default returns only unresolved alerts, newest first. Returns:
 
 ```json
 {
@@ -4442,6 +4553,7 @@ Single static HTML file, no build step, no external dependencies. Served directl
 
 - **Dark theme** (`#0f1117` background, `#58a6ff` accent)
 - **Summary cards** — Nodes Online, Total GPUs, Total VRAM, Active Jobs, Optimizations, 24h Savings, Annual Rate, Drift Alerts
+- **Power Reduction card** (Fix 4) — shows `power_metrics.power_reduction_pct` (e.g. "12.7% reduction") and average watts before/after optimization. Populated from `FleetIntelligence` power queries via `/api/v1/status`.
 - **Nodes table** — one row per node; status badge (green=online, red=offline), GPU count, VRAM, jobs, opts, savings
 - **Events table** — timestamp, node, model family, status badge, speedup range, $/hr
 - **Auto-refresh** every 30 seconds via `setInterval(refresh, 30000)`
@@ -5385,28 +5497,48 @@ optimizations will actually help:
 - Memory-bound → Flash Attention, quantization, smaller batches
 - Compute-bound → torch.compile, operator fusion, larger batches
 
-### 45.2 GPU Database
+### 45.2 GPU Database (Fix 3 — single source of truth)
 
-`RooflineProfiler.GPU_DATABASE` contains verified datasheet specs for 14 GPUs:
+`RooflineProfiler.GPU_DATABASE` was removed. `_lookup_gpu_specs()` now reads directly from `hardware_counters.GPU_SPECS` (28+ GPUs, authoritative `GPUSpec` dataclass), converting on-the-fly via `_spec_to_dict()`. There is no longer a separate hard-coded dict in `roofline.py`.
 
-| GPU | BW (GB/s) | Compute FP16 (TFLOPS) | Ridge (FLOPS/byte) | FA Version |
-|-----|-----------|----------------------|-------------------|------------|
-| H200 SXM | 4800 | 1979 | 412 | flash_attention_3 |
-| H100 SXM | 3350 | 1979 | 591 | flash_attention_3 |
-| H100 PCIe | 2000 | 1513 | 757 | flash_attention_3 |
-| A100 SXM | 2000 | 312 | 156 | flash_attention_2 |
-| A100 PCIe | 1935 | 312 | 161 | flash_attention_2 |
-| A10 | 600 | 125 | 208 | flash_attention_2 |
-| A30 | 933 | 165 | 177 | flash_attention_2 |
-| RTX 4090 | 1008 | 165 | 164 | flash_attention_2 |
-| RTX 4080 | 717 | 97 | 135 | flash_attention_2 |
-| RTX 3090 | 936 | 71 | 76 | flash_attention_2 |
-| RTX 3080 | 760 | 30 | 39 | flash_attention_2 |
-| MI300X | 5300 | 1307 | 247 | flash_attention_2 |
-| MI250X | 3276 | 383 | 117 | flash_attention_2 |
+**`_spec_to_dict(spec: GPUSpec) → dict` — the conversion bridge:**
 
-H100/H200 support FP8; all others are FP8=False.
-SXM variants include NVLink bandwidth; PCIe and consumer variants have `nvlink_bandwidth_gbs=None`.
+```python
+@staticmethod
+def _spec_to_dict(spec) -> dict:
+    cc = spec.compute_capability or (8, 0)
+    supports_fp8  = cc >= (8, 9)      # Ada Lovelace+, Hopper+
+    supports_bf16 = cc >= (8, 0)      # Ampere+
+    fa_version = "flash_attention_3" if cc >= (9, 0) else "flash_attention_2"
+    effective_fp16 = spec.peak_fp16_tflops or spec.peak_fp32_tflops  # fallback for Pascal (P40)
+    fp8_tflops = round(effective_fp16 * 2.0, 0) if supports_fp8 else None
+    return {
+        "memory_bandwidth_gbs":    spec.peak_memory_bandwidth_gbps,
+        "compute_tflops_fp16":     effective_fp16,
+        "compute_tflops_bf16":     effective_fp16,
+        "compute_tflops_fp8":      fp8_tflops,
+        "flash_attention_version": fa_version,
+        "supports_bf16":           supports_bf16,
+        "supports_fp8":            supports_fp8,
+        "nvlink_bandwidth_gbs":    None,   # not in GPUSpec schema
+        "cuda_compute_capability": cc,
+    }
+```
+
+Key GPU values derived from `GPU_SPECS` (see Section 4 for complete table):
+
+| GPU | BW (GB/s) | FP16 TFLOPS | Ridge (FLOPS/byte) | FA Version | FP8 |
+|-----|-----------|-------------|-------------------|------------|-----|
+| H100/H100-SXM5 | 3350 | 1979 | ~591 | flash_attention_3 | Yes |
+| H100-PCIe | 2000 | 1513 | ~757 | flash_attention_3 | Yes |
+| H200 | 4800 | 1979 | ~412 | flash_attention_3 | Yes |
+| A100-SXM4-80GB | 2039 | 312 | ~153 | flash_attention_2 | No |
+| A100-PCIe | 1555 | 312 | ~201 | flash_attention_2 | No |
+| RTX 4090 | 1008 | 165 | ~164 | flash_attention_2 | Yes |
+| L40S | 864 | 366 | ~424 | flash_attention_2 | Yes |
+| P40 | 346 | 0 (uses FP32=12.0) | ~35 | flash_attention_2 | No |
+
+Pascal GPUs (P40, P100) have `peak_fp16_tflops=0`; `_spec_to_dict` falls back to `peak_fp32_tflops` so the ridge point is always positive.
 
 ### 45.3 Ridge Point Formula
 
@@ -5416,18 +5548,18 @@ ridge_point (FLOPS/byte) = compute_tflops_fp16 × 10¹²
                            memory_bandwidth_gbs × 10⁹
 ```
 
-Example — A100 SXM: `312 × 10¹² / 2000 × 10⁹ = 156 FLOPS/byte`
+Example — A100 SXM4-80GB: `312 × 10¹² / 2039 × 10⁹ ≈ 153 FLOPS/byte`
 
 A workload with arithmetic intensity below the ridge is memory-bandwidth bound; above it is compute bound.
 
 ### 45.4 GPU Name Matching
 
-`_lookup_gpu_specs(gpu_name_from_nvidia_smi)` uses longest-key substring matching:
+`_lookup_gpu_specs(gpu_name_from_nvidia_smi)` uses longest-key substring matching against `hardware_counters.GPU_SPECS`:
 
-1. Normalise the raw name to uppercase
-2. For each key in `GPU_DATABASE`, check if the key appears in the normalised name
-3. Return the specs for the **longest matching key** (ensures `A100 SXM` wins over `A100`)
-4. If no key matches, return conservative defaults (bw=900, tflops=100, FA2, no FP8/NVLink)
+1. Normalise both the raw GPU name and each `GPU_SPECS` key (lowercase, replace `-` with space)
+2. For each key, check if the normalised key appears in the normalised name
+3. Return `_spec_to_dict(spec)` for the **longest matching key** (ensures `A100-SXM4-80GB` wins over `A100`)
+4. If no key matches, return conservative defaults (bw=900, tflops=100, FA2, no FP8)
 
 ### 45.5 Key Data Classes
 
@@ -5481,19 +5613,21 @@ print(f"Recommendations: {model.recommended_optimizations}")
 
 ### 45.7 Test Coverage
 
-`tests/test_roofline_profiler.py` — **22 tests** (live GPU test skipped if `nvidia-smi` absent)
+`tests/test_roofline_profiler.py` — **26 tests, 0 skipped** (live GPU test runs if `nvidia-smi` present)
 
 | Category | Tests |
 |----------|-------|
-| GPU database integrity (required fields, ridge > 0) | 3 |
-| Hardware capability flags (FA3, FP8, NVLink) | 4 |
-| GPU name matching (exact, longest-key, unknown defaults) | 5 |
-| Ridge point math (A100, H100) | 2 |
+| GPU database integrity via `GPU_SPECS`+`_spec_to_dict` (required fields, ridge > 0 for all 28+ GPUs) | 7 |
+| Hardware capability flags (FA3, FP8, SXM vs PCIe bandwidth) | 3 |
+| GPU name matching (exact, longest-key, unknown defaults, RTX 4090) | 5 |
+| Ridge point math (A100 ≈153, H100 ≈591) | 2 |
 | Arithmetic intensity (ordering, positivity, memory-bound check) | 3 |
 | VRAM → param estimation | 2 |
 | profile_gpu with mocked nvidia-smi (A100, H100, unknown) | 3 |
-| profile_model classification (memory/compute bound + recommendations) | 3 |
-| Live GPU (requires nvidia-smi) | 1 (skipped without GPU) |
+| profile_model classification (memory/compute bound + recommendations) | 2 |
+| Live GPU (requires nvidia-smi) | 1 |
+
+All 26 tests pass on A100-SXM4-80GB (95.133.253.19, PyTorch 2.6.0+cu124).
 
 ---
 
@@ -5599,7 +5733,31 @@ fi = FleetIntelligence(
 
 Auto-remediation is disabled in test mode (`auto_remediate=False`) to prevent live process manipulation.
 
-### 46.6 Savings Calculation
+### 46.6 Power Query Methods (Fix 4)
+
+Five new methods query the `node_metrics` table for power draw before and after optimizations:
+
+```python
+fleet.get_recent_drift_events(limit=100)
+# → List[dict] — recent rows from drift_events table (newest first)
+
+fleet.get_avg_power_baseline(hours=24.0)
+# → float — AVG(power_watts) WHERE optimization_applied=0 in last N hours
+
+fleet.get_avg_power_optimized(hours=24.0)
+# → float — AVG(power_watts) WHERE optimization_applied=1 in last N hours
+
+fleet.get_power_reduction_pct(hours=24.0)
+# → float — (baseline - optimized) / baseline × 100
+# Returns 0.0 if baseline == 0
+
+fleet.get_electricity_savings(hours=24.0, kwh_cost=0.10)
+# → float — watts_saved / 1000 × hours × kwh_cost (USD)
+```
+
+These are called by `control_plane/server.py` to populate `power_metrics` in the `/api/v1/status` response and the dashboard Power Reduction card.
+
+### 46.7 Savings Calculation
 
 `calculate_savings(hours=24)` queries `optimization_events` for the time window and computes:
 
@@ -5626,7 +5784,7 @@ class FleetSavingsReport:
     def to_text(self) -> str:  ...   # human-readable CLI report
 ```
 
-### 46.7 Sample Savings Report Output
+### 46.8 Sample Savings Report Output
 
 ```
 ╔══════════════════════════════════════════════════════╗
@@ -5645,7 +5803,7 @@ class FleetSavingsReport:
 ╚══════════════════════════════════════════════════════╝
 ```
 
-### 46.8 Background Monitor
+### 46.9 Background Monitor
 
 ```python
 def sampler() -> list[NodeMetrics]:
@@ -5660,7 +5818,7 @@ fi.stop_monitoring()
 The monitor loop runs in a daemon thread (`_monitor_thread`). If `node_sampler` raises an exception,
 the loop logs the error and continues — one bad sample never stops monitoring.
 
-### 46.9 SQLite Schema
+### 46.10 SQLite Schema
 
 ```sql
 CREATE TABLE node_metrics (
@@ -5711,7 +5869,7 @@ CREATE TABLE optimization_events (
 All three tables are indexed on `(node_name, timestamp)` for fast time-range queries.
 WAL mode is enabled at init: `PRAGMA journal_mode=WAL` — allows concurrent readers during writes.
 
-### 46.10 Test Coverage
+### 46.11 Test Coverage
 
 `tests/test_fleet_intelligence.py` — **37 tests, 0 skipped**
 
