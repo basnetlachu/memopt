@@ -21,6 +21,8 @@ import os
 import time
 import json
 import logging
+import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query, Security
@@ -46,6 +48,12 @@ alert_store = AlertStore()
 _fleet = FleetIntelligence(
     db_path=str(Path.home() / ".memopt" / "fleet.db"),
     auto_remediate=False,
+)
+
+# Gossip knowledge base — fleet-wide optimization recipe store
+from memopt.fleet.gossip import GossipKnowledgeBase, OptimizationRecipe  # noqa: E402
+_gossip_kb = GossipKnowledgeBase(
+    db_path=str(Path.home() / ".memopt" / "gossip.db")
 )
 
 # API key — loaded/created at module import time so the dependency closure captures it
@@ -416,6 +424,94 @@ def _carbon_intensity() -> tuple:
         except Exception as exc:
             log.warning("WattTime API unavailable (%s), using US average", exc)
     return 0.386, "us_average"
+
+
+# ─────────────────────────────────────────────
+# GOSSIP KNOWLEDGE BASE
+# ─────────────────────────────────────────────
+
+@app.get("/api/v1/gossip/recipes")
+def list_recipes(_: str = Security(verify_api_key)):
+    """Return all known optimization recipes, newest first."""
+    recipes = _gossip_kb.all_recipes()
+    return {
+        "count":   len(recipes),
+        "recipes": [asdict(r) for r in recipes],
+    }
+
+
+@app.get("/api/v1/gossip/recipes/{recipe_hash}")
+def get_recipe(recipe_hash: str, _: str = Security(verify_api_key)):
+    """Return a single recipe by its 16-char hash. 404 if not found."""
+    with sqlite3.connect(_gossip_kb.db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM recipes WHERE recipe_hash = ?",
+            (recipe_hash,)
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+
+    return {
+        "recipe_hash":        row[0],  "model_family":     row[1],
+        "gpu_family":         row[2],  "dtype":            row[3],
+        "backend":            row[4],  "batch_size":       row[5],
+        "max_model_len":      row[6],  "flash_attention":  row[7],
+        "gpu_memory_util":    row[8],  "tensor_parallel":  row[9],
+        "extra_flags":        json.loads(row[10] or "{}"),
+        "measured_speedup":   row[11], "measured_tps":     row[12],
+        "verified_by_node":   row[13], "verified_at":      row[14],
+        "verification_count": row[15],
+    }
+
+
+@app.post("/api/v1/gossip/recipes", status_code=201)
+def publish_recipe(recipe: dict, _: str = Security(verify_api_key)):
+    """
+    Node publishes a verified optimization recipe.
+    If the recipe hash already exists, increment verification_count
+    (another node confirmed the same config works).
+    """
+    final_count = _gossip_kb.upsert_publish(recipe)
+    return {"status": "stored", "recipe_hash": recipe["recipe_hash"],
+            "verification_count": final_count}
+
+
+@app.get("/api/v1/gossip/stats")
+def gossip_stats(_: str = Security(verify_api_key)):
+    """Fleet-wide gossip knowledge base statistics."""
+    return _gossip_kb.stats()
+
+
+# ─────────────────────────────────────────────
+# FLEET RISK (PREDICTIVE MIGRATION)
+# ─────────────────────────────────────────────
+
+@app.get("/api/v1/fleet/risk")
+def fleet_risk(_: str = Security(verify_api_key)):
+    """
+    Current predictive migration risk scores.
+    Reads the most recent node_metrics entries (last 5 minutes)
+    to report how many GPUs are at elevated risk.
+    """
+    cutoff = time.time() - 300
+    with sqlite3.connect(str(Path.home() / ".memopt" / "fleet.db")) as conn:
+        try:
+            rows = conn.execute("""
+                SELECT node_name, gpu_index, timestamp, optimization_applied
+                FROM node_metrics
+                WHERE timestamp > ?
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """, (cutoff,)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+
+    return {
+        "monitored_gpus": len(rows),
+        "high_risk":      sum(1 for r in rows if not r[3]),
+        "timestamp":      time.time(),
+    }
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080):

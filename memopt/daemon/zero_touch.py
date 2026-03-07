@@ -106,6 +106,31 @@ class ZeroTouchDaemon:
         self.roofline_profiler = RooflineProfiler()
         self._migrated_pids: set = set()
 
+        # Gossip client — check fleet knowledge base before test-measure-commit
+        self.gossip = None
+        try:
+            from memopt.fleet.gossip import GossipClient
+            _cp  = os.getenv("MEMOPT_CONTROL_PLANE", "http://localhost:8080")
+            _key = os.getenv("MEMOPT_API_KEY", "")
+            self.gossip = GossipClient(
+                node_name=self.config.node_name,
+                control_plane_url=_cp,
+                api_key=_key,
+            )
+            self.gossip.sync_all_recipes()
+            log.info("Gossip client initialized and knowledge base synced")
+        except Exception as _ge:
+            log.warning("Gossip client unavailable (proceeding without it): %s", _ge)
+
+        # Predictive predictor — migrate before performance degrades
+        self.predictor = None
+        try:
+            from memopt.fleet.predictor import PredictivePredictor
+            self.predictor = PredictivePredictor()
+            log.info("PredictivePredictor initialized")
+        except Exception as _pe:
+            log.warning("PredictivePredictor unavailable: %s", _pe)
+
     def run(self) -> None:
         """
         Main daemon loop. Runs forever.
@@ -142,6 +167,15 @@ class ZeroTouchDaemon:
             return []
 
         log.info(f"Found {len(processes)} GPU process(es)")
+
+        # Predictive check: collect telemetry + risk per GPU before regular scan
+        if self.predictor is not None:
+            seen_gpu_indices: set = set()
+            for proc in processes:
+                for gpu_id in (proc.gpu_ids or []):
+                    if gpu_id not in seen_gpu_indices:
+                        seen_gpu_indices.add(gpu_id)
+                        self._predictive_check(gpu_id, proc.pid)
 
         for proc in processes:
             event = self._handle_process(proc)
@@ -294,17 +328,178 @@ class ZeroTouchDaemon:
                 f"PID {proc.pid}: migrating to {plan.target_backend} "
                 f"(expected {plan.estimated_speedup:.1f}x)"
             )
-            result = self.migration_engine.execute(plan)
+
+            # Check gossip knowledge base BEFORE running test-measure-commit
+            recipe = None
+            if self.gossip is not None:
+                recipe = self.gossip.check_before_optimize(
+                    model_family=plan.model_family,
+                    gpu_family=self._get_gpu_family(hw.gpu_name),
+                    dtype="float16",
+                )
+
+            if recipe is not None:
+                result = self._apply_recipe(recipe, proc.pid)
+            else:
+                result = self.migration_engine.execute(plan)
+                # Publish successful result so the whole fleet benefits
+                if result.success and result.measured_speedup and self.gossip is not None:
+                    self.gossip.publish_success(
+                        model_family=plan.model_family,
+                        gpu_family=self._get_gpu_family(hw.gpu_name),
+                        dtype="float16",
+                        backend=result.backend.value,
+                        batch_size=plan.optimal_batch_size,
+                        flash_attention=plan.flash_attention_version,
+                        gpu_memory_util=0.85,
+                        tensor_parallel=len(plan.gpu_indices),
+                        measured_speedup=result.measured_speedup,
+                        measured_tps=result.measured_speedup * 19.6,
+                    )
+
             if result.success:
                 self._migrated_pids.add(proc.pid)
                 log.info(
                     f"PID {proc.pid} → {result.backend} "
-                    f"new_pid={result.new_pid} measured={result.measured_speedup:.2f}x"
+                    f"new_pid={result.new_pid} measured={result.measured_speedup}"
                 )
             else:
                 log.warning(f"PID {proc.pid}: migration failed — {result.error}")
         except Exception as e:
             log.error(f"_maybe_migrate PID {proc.pid}: {e}", exc_info=True)
+
+    # ── Predictive migration helpers ──────────────────────────────────────
+
+    def _predictive_check(self, gpu_index: int, active_pid: Optional[int]) -> None:
+        """
+        Collect fresh telemetry and compute risk for one GPU.
+        Triggers preemptive migration if risk_score >= 0.70 and auto_apply is on.
+        Called every scan cycle, before regular process handling.
+        """
+        telemetry = self.predictor.collect_telemetry(gpu_index)
+        if telemetry is None:
+            return
+
+        signal = self.predictor.predict(gpu_index)
+        if signal is None:
+            return
+
+        log.debug(
+            "GPU %d risk=%.2f mem=%.1f%%",
+            gpu_index, signal.migration_risk_score,
+            telemetry.memory_pressure_pct * 100,
+        )
+
+        if (signal.should_migrate_now
+                and active_pid
+                and active_pid not in self._migrated_pids
+                and self.config.auto_apply):
+            log.warning(
+                "PREEMPTIVE MIGRATION: GPU %d PID %d | risk=%.2f | %s",
+                gpu_index, active_pid, signal.migration_risk_score, signal.reason,
+            )
+            self._post_prediction_event(gpu_index, active_pid, signal)
+            try:
+                hw = self.roofline_profiler.profile_gpu(gpu_index)
+                hw_dict = {
+                    "gpu_indices":   [gpu_index],
+                    "vram_total_mb": hw.vram_total_mb,
+                    "vram_free_mb":  hw.vram_free_mb,
+                    "model_vram_mb": telemetry.memory_used_mb,
+                    "gpu_name":      hw.gpu_name,
+                }
+                plan   = self.migration_engine.build_plan(active_pid, hw_dict)
+                result = self.migration_engine.execute(plan)
+                if result.success:
+                    self._migrated_pids.add(active_pid)
+                    log.info(
+                        "Preemptive migration complete: GPU %d → %s PID %d",
+                        gpu_index, result.backend.value, result.new_pid,
+                    )
+            except Exception as exc:
+                log.error("Preemptive migration failed for GPU %d: %s", gpu_index, exc)
+
+    def _post_prediction_event(self, gpu_index: int, pid: int, signal) -> None:
+        """Post a predictive-migration event to the control plane for dashboard visibility."""
+        try:
+            import requests as _req
+            cp  = os.getenv("MEMOPT_CONTROL_PLANE", "http://localhost:8080")
+            key = os.getenv("MEMOPT_API_KEY", "")
+            _req.post(
+                f"{cp}/api/v1/events",
+                headers={"X-Memopt-API-Key": key},
+                json={
+                    "node":       self.config.node_name,
+                    "pid":        pid,
+                    "gpu_index":  gpu_index,
+                    "event_type": "predictive_migration",
+                    "risk_score": signal.migration_risk_score,
+                    "reason":     signal.reason,
+                    "status":     "triggered",
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass  # Non-fatal — dashboard event is best-effort
+
+    @staticmethod
+    def _get_gpu_family(gpu_name: str) -> str:
+        """Normalise a raw GPU name string to a short family label for gossip hashing."""
+        name = (gpu_name or "").lower()
+        if "h100"  in name: return "h100"
+        if "a100"  in name: return "a100"
+        if "a10"   in name: return "a10"
+        if "4090"  in name: return "rtx4090"
+        if "3090"  in name: return "rtx3090"
+        if "6000"  in name: return "rtx6000"
+        if "mi300" in name: return "mi300x"
+        return "unknown"
+
+    def _apply_recipe(self, recipe, pid: int):
+        """Apply a verified gossip recipe directly — skip test-measure-commit."""
+        from memopt.migration.engine import MigrationResult, MigrationStatus, Backend
+        import subprocess
+
+        log.info(
+            "Applying gossip recipe: %s/%s verified %dx, expected %.2fx",
+            recipe.model_family, recipe.gpu_family,
+            recipe.verification_count, recipe.measured_speedup,
+        )
+
+        port = self.migration_engine._find_free_port(8001)
+        vllm_cmd = [
+            "python3", "-m", "vllm.entrypoints.openai.api_server",
+            "--model",                  recipe.model_family,
+            "--dtype",                  recipe.dtype,
+            "--max-model-len",          str(recipe.max_model_len),
+            "--gpu-memory-utilization", str(recipe.gpu_memory_util),
+            "--max-num-seqs",           str(recipe.batch_size),
+            "--port",                   str(port),
+        ]
+
+        log_file = open(f"/tmp/memopt_gossip_{pid}.log", "w")
+        proc = subprocess.Popen(
+            vllm_cmd, stdout=log_file, stderr=log_file, start_new_session=True
+        )
+
+        healthy = self.migration_engine._wait_for_health(port, 180)
+        if not healthy:
+            proc.terminate()
+            return MigrationResult(
+                success=False, status=MigrationStatus.FAILED,
+                original_pid=pid, new_pid=None,
+                backend=Backend.VLLM, port=None, measured_speedup=None,
+                error="Gossip recipe failed health check",
+            )
+
+        self.migration_engine._graceful_kill(pid)
+
+        return MigrationResult(
+            success=True, status=MigrationStatus.COMPLETED,
+            original_pid=pid, new_pid=proc.pid,
+            backend=Backend.VLLM, port=port,
+            measured_speedup=recipe.measured_speedup,
+        )
 
     def _export_metrics(self, events: List[OptimizationEvent]) -> None:
         """
