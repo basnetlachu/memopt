@@ -17,6 +17,7 @@ Run:
   OR
   memopt control-plane start --port 8080
 """
+import os
 import time
 import json
 import logging
@@ -301,6 +302,120 @@ def dashboard():
     if html_path.exists():
         return html_path.read_text()
     return HTMLResponse("<h1>memopt Control Plane</h1><p>Dashboard not found.</p>")
+
+
+# ─────────────────────────────────────────────
+# EXECUTIVE DASHBOARD
+# ─────────────────────────────────────────────
+
+@app.get("/executive", response_class=HTMLResponse)
+def executive_dashboard():
+    """Serve the Executive ROI dashboard (public page — API calls require auth)."""
+    html_path = Path(__file__).parent / "executive.html"
+    if html_path.exists():
+        return html_path.read_text()
+    return HTMLResponse("<h1>Executive Dashboard</h1><p>Dashboard not found.</p>")
+
+
+@app.get("/api/v1/executive/summary")
+def executive_summary(
+    hours: float = Query(24.0, ge=1.0, le=8760.0),
+    _: str = Security(verify_api_key),
+):
+    """CFO-facing ROI summary — dollar savings, GPU utilisation uplift, fleet health."""
+    savings = _fleet.calculate_savings(hours=hours)
+    electricity_savings = _fleet.get_electricity_savings(
+        hours=hours,
+        kwh_cost=float(os.environ.get("ELECTRICITY_COST_PER_KWH", "0.12")),
+    )
+    power_reduction_pct = _fleet.get_power_reduction_pct(hours=hours)
+    return {
+        "period_hours":            hours,
+        "period_start":            savings.period_start.isoformat() if savings.period_start else None,
+        "period_end":              savings.period_end.isoformat()   if savings.period_end   else None,
+        "total_nodes":             savings.total_nodes,
+        "total_gpus":              savings.total_gpus,
+        "optimized_gpus":          savings.optimized_gpus,
+        "throughput_multiplier":   round(savings.throughput_multiplier, 3),
+        "gpu_hours_saved":         round(savings.gpu_hours_saved, 2),
+        "dollar_savings":          round(savings.dollar_savings, 2),
+        "dollar_savings_annual":   round(savings.dollar_savings_annual, 0),
+        "gpu_cost_per_hour":       savings.gpu_cost_per_hour,
+        "electricity_savings_usd": round(electricity_savings, 2),
+        "power_reduction_pct":     round(power_reduction_pct, 1),
+        "top_savings_nodes":       savings.top_savings_nodes,
+    }
+
+
+@app.get("/api/v1/executive/carbon")
+def executive_carbon(
+    hours: float = Query(24.0, ge=1.0, le=8760.0),
+    _: str = Security(verify_api_key),
+):
+    """Carbon and Green-AI metrics for ESG reporting."""
+    baseline_w          = _fleet.get_avg_power_baseline(hours=hours)
+    optimized_w         = _fleet.get_avg_power_optimized(hours=hours)
+    power_reduction_pct = _fleet.get_power_reduction_pct(hours=hours)
+
+    # kWh saved — per-GPU watt difference × GPU count × hours
+    all_nodes  = db.get_all_nodes()
+    total_gpus = sum(n.get("gpu_count", 0) for n in all_nodes) or 1
+    watts_saved_per_gpu = max(baseline_w - optimized_w, 0.0)
+    kwh_saved = (watts_saved_per_gpu * total_gpus * hours) / 1000.0
+
+    # Carbon intensity — live WattTime or US average fallback
+    kg_co2_per_kwh, carbon_source = _carbon_intensity()
+    kg_co2_saved     = kwh_saved * kg_co2_per_kwh
+    tonnes_co2_saved = kg_co2_saved / 1000.0
+
+    return {
+        "period_hours":        hours,
+        "power_reduction_pct": round(power_reduction_pct, 1),
+        "kwh_saved":           round(kwh_saved, 2),
+        "kg_co2_saved":        round(kg_co2_saved, 2),
+        "tonnes_co2_saved":    round(tonnes_co2_saved, 4),
+        "carbon_source":       carbon_source,
+        "equivalencies": {
+            "cars_removed":    round(tonnes_co2_saved / 4.6,  2),
+            "trees_planted":   round(kg_co2_saved     / 21,   1),
+            "flights_avoided": round(kg_co2_saved     / 986,  2),
+        },
+        "annual_projection": {
+            "kwh_saved":        round(kwh_saved        * 8760 / max(hours, 1), 1),
+            "kg_co2_saved":     round(kg_co2_saved     * 8760 / max(hours, 1), 1),
+            "tonnes_co2_saved": round(tonnes_co2_saved * 8760 / max(hours, 1), 2),
+        },
+    }
+
+
+def _carbon_intensity() -> tuple:
+    """Return (kg_CO2_per_kWh, source_name). Falls back to US average (0.386)."""
+    user   = os.environ.get("WATTTIME_USERNAME", "")
+    passwd = os.environ.get("WATTTIME_PASSWORD", "")
+    region = os.environ.get("WATTTIME_REGION",   "")
+    if user and passwd and region:
+        try:
+            import base64
+            import urllib.request
+            creds = base64.b64encode(f"{user}:{passwd}".encode()).decode()
+            req = urllib.request.Request(
+                "https://api.watttime.org/login",
+                headers={"Authorization": f"Basic {creds}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                token = json.loads(resp.read())["token"]
+            req2 = urllib.request.Request(
+                f"https://api.watttime.org/v3/signal-types/co2_moer/forecasts?"
+                f"region={region}&signal_type=co2_moer",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req2, timeout=5) as resp2:
+                data = json.loads(resp2.read())
+            moer_lbs_mwh = data["data"][0]["value"]   # lbs CO2/MWh
+            return moer_lbs_mwh * 0.453592 / 1000.0, "watttime"
+        except Exception as exc:
+            log.warning("WattTime API unavailable (%s), using US average", exc)
+    return 0.386, "us_average"
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080):
