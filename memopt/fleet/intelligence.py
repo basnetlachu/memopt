@@ -596,6 +596,67 @@ class FleetIntelligence:
         kwh_saved = (baseline - optimized) / 1000.0 * hours
         return round(kwh_saved * kwh_cost, 4)
 
+    def get_thermal_profile(self) -> dict:
+        """
+        Returns temperature and power data before/after optimization.
+        Uses existing node_metrics rows — no new columns required.
+        Only returns non-zero reductions when both pre and post data exist.
+        """
+        since = time.time() - 86400
+        with self._get_conn() as conn:
+            temp_before_row = conn.execute(
+                "SELECT AVG(temperature_c) FROM node_metrics "
+                "WHERE timestamp > ? AND optimization_applied = 0 AND temperature_c > 0",
+                (since,),
+            ).fetchone()
+            temp_after_row = conn.execute(
+                "SELECT AVG(temperature_c) FROM node_metrics "
+                "WHERE timestamp > ? AND optimization_applied = 1 AND temperature_c > 0",
+                (since,),
+            ).fetchone()
+            power_before_row = conn.execute(
+                "SELECT AVG(power_watts) FROM node_metrics "
+                "WHERE timestamp > ? AND optimization_applied = 0 AND power_watts > 0",
+                (since,),
+            ).fetchone()
+            power_after_row = conn.execute(
+                "SELECT AVG(power_watts) FROM node_metrics "
+                "WHERE timestamp > ? AND optimization_applied = 1 AND power_watts > 0",
+                (since,),
+            ).fetchone()
+
+        temp_before  = temp_before_row[0]  if temp_before_row  else None
+        temp_after   = temp_after_row[0]   if temp_after_row   else None
+        power_before = power_before_row[0] if power_before_row else None
+        power_after  = power_after_row[0]  if power_after_row  else None
+
+        temp_reduction_c   = 0.0
+        temp_reduction_pct = 0.0
+        power_reduction_pct = 0.0
+
+        if temp_before and temp_after and temp_before > 0:
+            temp_reduction_c   = temp_before - temp_after
+            temp_reduction_pct = (temp_reduction_c / temp_before) * 100
+
+        if power_before and power_after and power_before > 0:
+            power_reduction_pct = ((power_before - power_after) / power_before) * 100
+
+        health_score = min(100, round(
+            (temp_reduction_pct * 0.6) + (power_reduction_pct * 0.4)
+        ))
+
+        return {
+            "temp_before_c":       round(temp_before  or 0.0, 1),
+            "temp_after_c":        round(temp_after   or 0.0, 1),
+            "temp_reduction_c":    round(temp_reduction_c,    1),
+            "temp_reduction_pct":  round(temp_reduction_pct,  1),
+            "power_before_w":      round(power_before or 0.0, 1),
+            "power_after_w":       round(power_after  or 0.0, 1),
+            "power_reduction_pct": round(power_reduction_pct, 1),
+            "health_score":        health_score,
+            "data_available":      (temp_before is not None and temp_after is not None),
+        }
+
     # ── BACKGROUND MONITOR ─────────────────────────────────────────────────
 
     def start_monitoring(

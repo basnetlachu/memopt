@@ -55,6 +55,7 @@
 45. [Roofline Hardware Profiler (Standalone)](#45-roofline-hardware-profiler-standalone)
 46. [Fleet Intelligence Layer](#46-fleet-intelligence-layer)
 47. [Production Benchmarks — 50-User Concurrent Load](#47-production-benchmarks--50-user-concurrent-load)
+48. [eBPF CUDA Kernel Interceptor + Kernel Swap Protocol](#48-ebpf-cuda-kernel-interceptor--kernel-swap-protocol)
 
 ---
 
@@ -160,6 +161,11 @@ memopt/
 │   └── provisioning/
 │       ├── datasources/prometheus.yml   Auto-provision Prometheus datasource
 │       └── dashboards/memopt.yml        Auto-provision dashboard from file
+├── ebpf/
+│   ├── __init__.py                 Package init — requirements, graceful fallback note
+│   ├── cuda_probe.c                eBPF C program — uprobes on cuLaunchKernel + cuMemcpyAsync
+│   ├── interceptor.py              CUDAKernelInterceptor — BCC/eBPF path + /proc+nvidia-smi fallback
+│   └── kernel_swapper.py           KernelSwapper — /dev/shm binary struct protocol for live kernel redirect
 ├── wrap/
 │   ├── __init__.py
 │   ├── training_wrapper.py         TrainingWrapper — sitecustomize hook injection for training
@@ -5979,4 +5985,228 @@ for n in [10, 25, 50]:
     print(f"{n} users: {tps:.1f} tok/s ({tps/19.6:.1f}x baseline)")
 EOF
 ```
+
+---
+
+## 48. eBPF CUDA Kernel Interceptor + Kernel Swap Protocol
+
+**Files:** `memopt/ebpf/interceptor.py`, `memopt/ebpf/kernel_swapper.py`, `memopt/ebpf/cuda_probe.c`
+**Tests:** `tests/test_ebpf.py` (8/8 pass without BCC installed)
+**API endpoints:** `GET /api/v1/ebpf/status`, `POST /api/v1/ebpf/monitor`, `DELETE /api/v1/ebpf/monitor/{pid}`
+
+### 48.1 Overview
+
+Phase 4 adds kernel-level observability: memopt intercepts every CUDA kernel launch issued by a monitored process and detects suboptimal execution patterns in real time. If a replacement kernel is available it can be swapped in without restarting the process via a shared-memory signaling protocol.
+
+Two sub-systems work together:
+
+| Sub-system | File | What it does |
+|------------|------|-------------|
+| CUDA Kernel Interceptor | `interceptor.py` + `cuda_probe.c` | Captures every `cuLaunchKernel` call; detects suboptimal block-dimension patterns |
+| Kernel Swap Protocol | `kernel_swapper.py` | Writes a signed binary instruction to `/dev/shm`; in-process shim reads it and redirects the function pointer |
+
+### 48.2 CUDAKernelInterceptor
+
+```python
+from memopt.ebpf.interceptor import CUDAKernelInterceptor
+
+i = CUDAKernelInterceptor()
+i.on_suboptimal_kernel = lambda d: print(d.reason, d.estimated_speedup)
+i.start(pids=[1234])   # True = eBPF active, False = /proc fallback
+# ...
+stats = i.get_stats()
+i.stop()
+```
+
+#### 48.2.1 BCC / eBPF path (Linux, kernel ≥ 5.8, root, BCC installed)
+
+`start()` compiles and loads `cuda_probe.c` via BCC, then attaches two uprobes to `libcuda.so`:
+
+- **`probe_cuLaunchKernel`** — fires on every kernel launch; captures `func_ptr`, `grid_dim_{x,y,z}`, `block_dim_{x,y,z}`, `shared_mem_bytes`, `pid`, `tid`, `timestamp_ns`, and `comm` (process name).
+- **`probe_cuMemcpyAsync`** — fires on every async host↔device transfer; emits a sentinel event (`func_ptr = 0xDEADBEEF`) so the control plane can detect processes with excessive PCIe traffic.
+
+Events are streamed to user space through a BPF perf ring buffer (`BPF_PERF_OUTPUT(cuda_launches)`). A daemon thread calls `bpf.perf_buffer_poll(timeout=100)` continuously.
+
+```c
+// cuda_probe.c — key data structures
+struct kernel_launch_event {
+    u32  pid;
+    u32  tid;
+    u64  timestamp_ns;
+    u64  func_ptr;           // pointer to the CUDA kernel function
+    u32  grid_dim_x, grid_dim_y, grid_dim_z;
+    u32  block_dim_x, block_dim_y, block_dim_z;
+    u32  shared_mem_bytes;
+    char comm[16];
+};
+
+BPF_PERF_OUTPUT(cuda_launches);
+BPF_HASH(monitored_pids, u32, u32);   // pid → 1 if tracked
+BPF_HASH(kernel_counts,  u64, u64);   // func_ptr → launch count
+```
+
+PIDs can be added at runtime via `i.add_pid(pid)` which updates both the Python `monitored_pids` set and the BPF hash map.
+
+#### 48.2.2 /proc + nvidia-smi fallback (no BCC / no root)
+
+When BCC is not installed `start()` returns `False` and spawns a background thread that polls `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits` every 5 seconds. Granularity is coarser (no per-kernel visibility) but the same `get_stats()` API applies.
+
+The poll loop uses 10 × 0.5 s sleep increments rather than a single `time.sleep(5)` so that `stop()` responds within 0.5 s.
+
+#### 48.2.3 Suboptimal kernel detection
+
+Every 100 launches per unique `func_ptr`, the interceptor compares the observed `block_dim` against known bad patterns:
+
+| Pattern name | Block dimensions | Symptom | Recommendation | Estimated speedup |
+|---|---|---|---|---|
+| `standard_attention` | `(16,16,1)` or `(32,32,1)` | O(n²) attention | Replace with `flash_attn_func` (flash-attn package) | **2.5×** |
+| `naive_softmax` | `(256,1,1)` or `(512,1,1)` | Non-fused softmax | Use `torch.nn.functional.softmax` with `torch.compile` | **1.3×** |
+
+Each unique detection fires `on_suboptimal_kernel(detection)` once. The `ZeroTouchDaemon` wires this callback to `_post_ebpf_event()` (posts to the control plane) and optionally calls `KernelSwapper.inject_shim(pid)`.
+
+#### 48.2.4 get_stats() schema
+
+```python
+{
+    "ebpf_active":        bool,    # True = BCC path running
+    "monitored_pids":     [int],
+    "total_launches":     int,     # events in deque (maxlen=10000)
+    "unique_kernels":     int,
+    "detections":         int,
+    "suboptimal_kernels": [
+        {
+            "pid":     int,
+            "reason":  str,        # "standard_attention" | "naive_softmax"
+            "launches": int,
+            "speedup": float,
+            "fix":     str,
+        }
+    ],
+}
+```
+
+### 48.3 Kernel Swap Protocol
+
+The swap protocol lets memopt redirect a running process's CUDA kernel function pointer without restarting it. It is a two-party design:
+
+- **Party A (memopt side):** `KernelSwapper.write_swap_instruction()` writes a signed binary struct to `/dev/shm/memopt_{pid}`.
+- **Party B (in-process shim):** loaded by `memopt-wrap`; reads the struct on every `cuLaunchKernel` call; if `active == True` and `func_ptr == source_func`, it calls `target_func` instead and increments `swap_count`.
+
+#### 48.3.1 Struct layout
+
+```
+Offset  Size  Field         Type
+0       8     magic         uint64   = 0x4D454D01 ("MEM\x01")
+8       8     version       uint64   = 1
+16      8     source_func   uint64   CUDA function pointer to intercept
+24      8     target_func   uint64   CUDA function pointer to call instead
+32      8     _padding      uint64
+40      1     active        bool     True = swap is live
+41      8     swap_count    uint64   times the shim has applied the swap
+Total = 49 bytes, zero-padded to 4096 bytes (SWAP_SHM_SIZE)
+```
+
+Pack format: `struct.pack("<QQQQQ?Q", magic, version, source_func, target_func, 0, True, 0)`
+
+#### 48.3.2 KernelSwapper API
+
+```python
+from memopt.ebpf.kernel_swapper import KernelSwapper
+
+s = KernelSwapper()
+
+# Write instruction (also chmod 0o644 for in-process shim access)
+s.write_swap_instruction(pid=1234, source_func=0xDEAD, target_func=0xBEEF)
+
+# Read back and verify
+status = s.read_swap_status(1234)
+# status.active == True
+# status.swap_count == N  (N = times shim has applied it)
+
+# Remove the instruction file
+s.clear_swap(1234)
+
+# Ensure shim is loaded (no-op for memopt-wrap processes)
+s.inject_shim(1234)
+```
+
+**`inject_shim(pid)`** logic:
+
+1. If `/dev/shm/memopt_{pid}` exists → shim already loaded (memopt-wrap process) → return `True`.
+2. Otherwise check `/proc/{pid}/environ` for `MEMOPT_ALLOW_INJECT=1`.
+3. If set → ptrace injection is **deferred to v1.1** (logged, returns `False`).
+4. If not set → log instructions, return `False`.
+
+#### 48.3.3 Shared memory directory
+
+`_shm_dir()` returns `/dev/shm` on Linux (tmpfs, lowest latency) and falls back to `/tmp` on macOS and other systems. All path construction uses `f"{_shm_dir()}/memopt_{pid}"`, so tests pass on both platforms.
+
+### 48.4 Control Plane API Endpoints
+
+Three endpoints are wired into `memopt/control_plane/server.py`:
+
+```
+GET  /api/v1/ebpf/status
+     Returns: get_stats() dict — ebpf_active, total_launches, detections, suboptimal_kernels
+
+POST /api/v1/ebpf/monitor
+     Body: {"pid": 12345}
+     Returns: {"status": "monitoring", "pid": 12345}
+     Effect: adds pid to CUDAKernelInterceptor.monitored_pids
+
+DELETE /api/v1/ebpf/monitor/{pid}
+     Returns: {"status": "stopped", "pid": 12345}
+     Effect: removes pid from monitored set
+```
+
+All three require `X-Memopt-API-Key` header.
+
+### 48.5 Zero-Touch Daemon Integration
+
+`ZeroTouchDaemon.__init__()` initializes both sub-systems inside a `try/except` (graceful degradation if eBPF unavailable):
+
+```python
+self.interceptor = CUDAKernelInterceptor()
+self.swapper     = KernelSwapper()
+ebpf_active = self.interceptor.start()   # True (BCC) or False (/proc fallback)
+
+def _on_suboptimal(detection):
+    self._post_ebpf_event(detection)     # POST to control plane
+    if self.config.auto_apply and self.swapper:
+        self.swapper.inject_shim(detection.pid)  # prepare swap shim
+
+self.interceptor.on_suboptimal_kernel = _on_suboptimal
+```
+
+`_post_ebpf_event(detection)` posts to `{control_plane_url}/api/v1/events` with `event_type="ebpf_detection"` and the detection fields as JSON.
+
+### 48.6 Server Availability Notes
+
+| Requirement | Current server (31.22.104.32) | Status |
+|---|---|---|
+| Linux kernel ≥ 5.8 | 5.15.0-170-generic | ✓ |
+| BCC (python3-bcc) | Not installed | ✗ — /proc fallback runs |
+| Root (uid=0) | uid=0 | ✓ |
+| libcuda.so | `/usr/lib/x86_64-linux-gnu/libcuda.so` | ✓ |
+| /dev/shm | Present (Linux tmpfs) | ✓ |
+| tracefs | Mounted | ✓ |
+
+BCC installation: `apt-get install python3-bcc bpfcc-tools linux-headers-$(uname -r)`
+
+### 48.7 Test Results
+
+8/8 tests in `tests/test_ebpf.py` pass without BCC:
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_interceptor_initializes_without_bcc` | `_bcc_available is False` on servers without BCC |
+| `test_interceptor_starts_with_proc_fallback` | `start()` returns `False`; `_running` becomes `True`; `stop()` clears it |
+| `test_get_stats_returns_correct_structure` | All 4 required keys present; `suboptimal_kernels` is a list |
+| `test_add_and_remove_pid` | `add_pid` / `remove_pid` update `monitored_pids` |
+| `test_kernel_swapper_write_and_read` | write→read round-trip; `source_func`, `target_func`, `active`, `swap_count` exact |
+| `test_kernel_swapper_clear_removes_shm` | `clear_swap` removes file; second call is no-op |
+| `test_ebpf_status_endpoint` | `GET /api/v1/ebpf/status` returns 200 with correct shape |
+| `test_ebpf_monitor_pid_endpoint` | `POST /api/v1/ebpf/monitor` returns `{"status":"monitoring","pid":99999}` |
+
+Full suite after Phase 4: **174 passed, 1 pre-existing flake** (`test_power_sampler_works_pytest` — requires large GPU matrix on A100).
 

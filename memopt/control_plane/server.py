@@ -325,6 +325,27 @@ def executive_dashboard():
     return HTMLResponse("<h1>Executive Dashboard</h1><p>Dashboard not found.</p>")
 
 
+def _calculate_savings_since_install(fleet) -> float:
+    """
+    Calculate total dollars saved since memopt was first installed.
+    Uses earliest optimization_events record as install date.
+    """
+    db_path = fleet.db_path
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT MIN(timestamp) FROM optimization_events WHERE status='applied'"
+            ).fetchone()
+        earliest = row[0] if row else None
+        if not earliest:
+            return 0.0
+        hours_running = (time.time() - earliest) / 3600
+        report = fleet.calculate_savings(hours=hours_running)
+        return report.dollar_savings
+    except Exception:
+        return 0.0
+
+
 @app.get("/api/v1/executive/summary")
 def executive_summary(
     hours: float = Query(24.0, ge=1.0, le=8760.0),
@@ -332,26 +353,35 @@ def executive_summary(
 ):
     """CFO-facing ROI summary — dollar savings, GPU utilisation uplift, fleet health."""
     savings = _fleet.calculate_savings(hours=hours)
+    # 365-day run-rate for per-second calculation
+    report_365d = _fleet.calculate_savings(hours=8760.0)
     electricity_savings = _fleet.get_electricity_savings(
         hours=hours,
         kwh_cost=float(os.environ.get("ELECTRICITY_COST_PER_KWH", "0.12")),
     )
     power_reduction_pct = _fleet.get_power_reduction_pct(hours=hours)
+
+    annual = report_365d.dollar_savings
+    savings_per_second = annual / (365 * 24 * 3600)
+
     return {
-        "period_hours":            hours,
-        "period_start":            savings.period_start.isoformat() if savings.period_start else None,
-        "period_end":              savings.period_end.isoformat()   if savings.period_end   else None,
-        "total_nodes":             savings.total_nodes,
-        "total_gpus":              savings.total_gpus,
-        "optimized_gpus":          savings.optimized_gpus,
-        "throughput_multiplier":   round(savings.throughput_multiplier, 3),
-        "gpu_hours_saved":         round(savings.gpu_hours_saved, 2),
-        "dollar_savings":          round(savings.dollar_savings, 2),
-        "dollar_savings_annual":   round(savings.dollar_savings_annual, 0),
-        "gpu_cost_per_hour":       savings.gpu_cost_per_hour,
-        "electricity_savings_usd": round(electricity_savings, 2),
-        "power_reduction_pct":     round(power_reduction_pct, 1),
-        "top_savings_nodes":       savings.top_savings_nodes,
+        "period_hours":              hours,
+        "period_start":              savings.period_start.isoformat() if savings.period_start else None,
+        "period_end":                savings.period_end.isoformat()   if savings.period_end   else None,
+        "total_nodes":               savings.total_nodes,
+        "total_gpus":                savings.total_gpus,
+        "optimized_gpus":            savings.optimized_gpus,
+        "throughput_multiplier":     round(savings.throughput_multiplier, 3),
+        "gpu_hours_saved":           round(savings.gpu_hours_saved, 2),
+        "dollar_savings":            round(savings.dollar_savings, 2),
+        "dollar_savings_annual":     round(savings.dollar_savings_annual, 0),
+        "dollar_saved_annual_run_rate": round(savings.dollar_savings_annual, 0),
+        "gpu_cost_per_hour":         savings.gpu_cost_per_hour,
+        "electricity_savings_usd":   round(electricity_savings, 2),
+        "power_reduction_pct":       round(power_reduction_pct, 1),
+        "top_savings_nodes":         savings.top_savings_nodes,
+        "savings_per_second":        round(savings_per_second, 6),
+        "savings_since_epoch":       round(_calculate_savings_since_install(_fleet), 2),
     }
 
 
@@ -376,6 +406,11 @@ def executive_carbon(
     kg_co2_saved     = kwh_saved * kg_co2_per_kwh
     tonnes_co2_saved = kg_co2_saved / 1000.0
 
+    ann_kwh   = round(kwh_saved        * 8760 / max(hours, 1), 1)
+    ann_kg    = round(kg_co2_saved     * 8760 / max(hours, 1), 1)
+    ann_t     = round(tonnes_co2_saved * 8760 / max(hours, 1), 2)
+    grid_region = os.environ.get("WATTTIME_REGION", "US Average")
+
     return {
         "period_hours":        hours,
         "power_reduction_pct": round(power_reduction_pct, 1),
@@ -383,15 +418,21 @@ def executive_carbon(
         "kg_co2_saved":        round(kg_co2_saved, 2),
         "tonnes_co2_saved":    round(tonnes_co2_saved, 4),
         "carbon_source":       carbon_source,
+        "carbon_kg_per_kwh":   round(kg_co2_per_kwh, 3),
+        "grid_region":         grid_region,
+        # Top-level aliases for carbon-hero JS
+        "saved_tonnes_co2_annual":  ann_t,
+        "cars_removed_equivalent":  round(ann_t / 4.6,  2),
+        "flights_avoided":          round(ann_kg / 986,  2),
         "equivalencies": {
             "cars_removed":    round(tonnes_co2_saved / 4.6,  2),
             "trees_planted":   round(kg_co2_saved     / 21,   1),
             "flights_avoided": round(kg_co2_saved     / 986,  2),
         },
         "annual_projection": {
-            "kwh_saved":        round(kwh_saved        * 8760 / max(hours, 1), 1),
-            "kg_co2_saved":     round(kg_co2_saved     * 8760 / max(hours, 1), 1),
-            "tonnes_co2_saved": round(tonnes_co2_saved * 8760 / max(hours, 1), 2),
+            "kwh_saved":        ann_kwh,
+            "kg_co2_saved":     ann_kg,
+            "tonnes_co2_saved": ann_t,
         },
     }
 
@@ -424,6 +465,15 @@ def _carbon_intensity() -> tuple:
         except Exception as exc:
             log.warning("WattTime API unavailable (%s), using US average", exc)
     return 0.386, "us_average"
+
+
+@app.get("/api/v1/executive/hardware-health")
+def hardware_health(_: str = Security(verify_api_key)):
+    """
+    Real temperature and power reduction data from node_metrics.
+    No invented MTBF claims — only what pynvml actually measured.
+    """
+    return _fleet.get_thermal_profile()
 
 
 # ─────────────────────────────────────────────
