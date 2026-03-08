@@ -575,6 +575,50 @@ async def preflight_analysis(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─────────────────────────────────────────────
+# eBPF KERNEL INTERCEPTION
+# ─────────────────────────────────────────────
+
+from memopt.ebpf.interceptor import CUDAKernelInterceptor  # noqa: E402
+_interceptor = CUDAKernelInterceptor()
+
+
+@app.get("/api/v1/ebpf/status")
+async def ebpf_status(_: str = Security(verify_api_key)):
+    """
+    eBPF interception status and suboptimal kernel detection results.
+    ebpf_active=True means BCC probes are attached.
+    ebpf_active=False means /proc fallback is running.
+    """
+    return _interceptor.get_stats()
+
+
+@app.post("/api/v1/ebpf/monitor")
+async def ebpf_monitor_pid(
+    body: dict,
+    _: str = Security(verify_api_key),
+):
+    """
+    Start monitoring a specific PID for suboptimal CUDA kernels.
+    Body: {"pid": 1234}
+    """
+    pid = body.get("pid")
+    if not pid:
+        raise HTTPException(status_code=400, detail="pid required")
+    _interceptor.add_pid(int(pid))
+    return {"status": "monitoring", "pid": int(pid)}
+
+
+@app.delete("/api/v1/ebpf/monitor/{pid}")
+async def ebpf_stop_monitoring(
+    pid: int,
+    _: str = Security(verify_api_key),
+):
+    """Stop monitoring a specific PID."""
+    _interceptor.remove_pid(pid)
+    return {"status": "stopped", "pid": pid}
+
+
 def run_server(host: str = "0.0.0.0", port: int = 8080):
     import uvicorn
     uvicorn.run(app, host=host, port=port, log_level="info")

@@ -131,6 +131,42 @@ class ZeroTouchDaemon:
         except Exception as _pe:
             log.warning("PredictivePredictor unavailable: %s", _pe)
 
+        # eBPF CUDA kernel interceptor + shared-memory swap protocol
+        self.interceptor = None
+        self.swapper     = None
+        try:
+            from memopt.ebpf.interceptor import CUDAKernelInterceptor
+            from memopt.ebpf.kernel_swapper import KernelSwapper
+
+            self.interceptor = CUDAKernelInterceptor()
+            self.swapper     = KernelSwapper()
+
+            ebpf_active = self.interceptor.start()
+            log.info(
+                "CUDA kernel interceptor started (eBPF=%s)",
+                ebpf_active,
+            )
+
+            # Register callback for suboptimal kernel detections
+            daemon_self = self
+
+            def _on_suboptimal(detection):
+                log.warning(
+                    "Suboptimal CUDA kernel: PID %d pattern=%s "
+                    "launches=%d speedup=%.1fx fix=%s",
+                    detection.pid, detection.reason,
+                    detection.launch_count, detection.estimated_speedup,
+                    detection.recommendation,
+                )
+                daemon_self._post_ebpf_event(detection)
+                if daemon_self.config.auto_apply and daemon_self.swapper:
+                    daemon_self.swapper.inject_shim(detection.pid)
+
+            self.interceptor.on_suboptimal_kernel = _on_suboptimal
+
+        except Exception as _ee:
+            log.warning("eBPF interceptor unavailable (non-fatal): %s", _ee)
+
     def run(self) -> None:
         """
         Main daemon loop. Runs forever.
@@ -441,6 +477,28 @@ class ZeroTouchDaemon:
             )
         except Exception:
             pass  # Non-fatal — dashboard event is best-effort
+
+    def _post_ebpf_event(self, detection) -> None:
+        """Post a suboptimal-kernel detection event to the control plane."""
+        try:
+            import requests as _req
+            cp  = os.getenv("MEMOPT_CONTROL_PLANE", "http://localhost:8080")
+            key = os.getenv("MEMOPT_API_KEY", "")
+            _req.post(
+                f"{cp}/api/v1/events",
+                headers={"X-Memopt-API-Key": key},
+                json={
+                    "node":       self.config.node_name,
+                    "pid":        detection.pid,
+                    "event_type": "suboptimal_kernel_detected",
+                    "pattern":    detection.reason,
+                    "speedup":    detection.estimated_speedup,
+                    "fix":        detection.recommendation,
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass  # Best-effort — never crash the daemon over a reporting failure
 
     @staticmethod
     def _get_gpu_family(gpu_name: str) -> str:
