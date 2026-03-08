@@ -115,7 +115,7 @@ class FleetIntelligence:
 
     def __init__(
         self,
-        db_path: str = "/root/.memopt/fleet.db",
+        db_path: str = str(Path.home() / ".memopt" / "fleet.db"),
         gpu_cost_per_hour: float = 3.50,
         drift_threshold_warning_pct: float = 10.0,
         drift_threshold_critical_pct: float = 25.0,
