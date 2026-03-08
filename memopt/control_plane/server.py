@@ -514,6 +514,67 @@ def fleet_risk(_: str = Security(verify_api_key)):
     }
 
 
+# ─────────────────────────────────────────────
+# PRE-FLIGHT GRAPH ANALYSIS
+# ─────────────────────────────────────────────
+
+@app.post("/api/v1/preflight")
+async def preflight_analysis(
+    body: dict,
+    _: str = Security(verify_api_key),
+):
+    """
+    Run pre-flight static graph analysis on a model.
+    Loads model structure only (no weights, no VRAM).
+    Returns optimization opportunities before first run.
+
+    Body: {"model_name": "gpt2", "gpu_index": 0}
+    """
+    from memopt.profiler.graph_analyzer import StaticGraphAnalyzer
+
+    model_name = body.get("model_name", "")
+    gpu_index  = int(body.get("gpu_index", 0))
+
+    if not model_name:
+        raise HTTPException(status_code=400, detail="model_name required")
+
+    try:
+        from transformers import AutoConfig, AutoModelForCausalLM
+        import torch
+        from memopt.profiler.roofline import RooflineProfiler
+
+        config = AutoConfig.from_pretrained(model_name)
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(config)
+
+        profiler = RooflineProfiler()
+        hw       = profiler.profile_gpu(gpu_index)
+
+        analyzer = StaticGraphAnalyzer()
+        result   = analyzer.analyze(
+            model=model,
+            gpu_name=hw.gpu_name,
+            ridge_point=hw.ridge_point_flops_per_byte,
+        )
+
+        return {
+            "model_name":         result.model_name,
+            "gpu_name":           result.gpu_name,
+            "overall_bottleneck": result.overall_bottleneck.value,
+            "overall_intensity":  result.overall_intensity,
+            "total_params":       result.total_params,
+            "top_opportunities":  result.top_opportunities,
+            "preflight_config":   result.preflight_config,
+            "estimated_speedup":  result.estimated_speedup,
+            "analysis_time_ms":   result.analysis_time_ms,
+        }
+
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Missing dependency: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def run_server(host: str = "0.0.0.0", port: int = 8080):
     import uvicorn
     uvicorn.run(app, host=host, port=port, log_level="info")

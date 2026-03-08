@@ -196,6 +196,55 @@ def cmd_migrate(args) -> int:
         return 1
 
 
+def cmd_preflight(args) -> int:
+    """
+    Analyze model graph before running.
+    Shows optimization opportunities and estimated speedup.
+    No forward pass required.
+    """
+    from memopt.profiler.graph_analyzer import StaticGraphAnalyzer
+
+    model_path = args.model
+    gpu_index  = getattr(args, "gpu", 0)
+
+    print(f"\n  Analyzing {model_path}...")
+    print(f"  Loading model structure (no weights required)...")
+
+    try:
+        from transformers import AutoConfig, AutoModelForCausalLM
+        import torch
+
+        config = AutoConfig.from_pretrained(model_path)
+        print(f"  Config loaded. Tracing graph...")
+
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(config)
+
+        from memopt.profiler.roofline import RooflineProfiler
+        profiler = RooflineProfiler()
+        hw = profiler.profile_gpu(gpu_index)
+
+        analyzer = StaticGraphAnalyzer()
+        result = analyzer.analyze(
+            model=model,
+            gpu_name=hw.gpu_name,
+            ridge_point=hw.ridge_point_flops_per_byte,
+            dtype="float16",
+        )
+
+        print(analyzer.format_report(result))
+
+    except ImportError:
+        print("  transformers not installed. Install: pip install transformers")
+        return 1
+    except Exception as e:
+        log.error("Preflight failed", exc_info=True)
+        print(f"  Analysis failed: {e}")
+        return 1
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memopt.daemon.cli",
@@ -266,6 +315,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plan migration but do not execute",
     )
     migrate_p.set_defaults(func=cmd_migrate)
+
+    # ── preflight ─────────────────────────────────────────────────────────────
+    preflight_p = sub.add_parser(
+        "preflight",
+        help="Analyze model graph before running — shows optimization opportunities and estimated speedup",
+    )
+    preflight_p.add_argument(
+        "--model", required=True,
+        help="HuggingFace model name or local path (e.g. mistralai/Mistral-7B-Instruct-v0.2)",
+    )
+    preflight_p.add_argument(
+        "--gpu", type=int, default=0,
+        help="GPU index to target (default: 0)",
+    )
+    preflight_p.set_defaults(func=cmd_preflight)
 
     return parser
 
