@@ -18,7 +18,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -551,9 +551,12 @@ class UniversalOptimizer:
         inputs,                         # Dict[str, Any] | InputFormat
         bottleneck_type: Any,
         model: Optional[nn.Module] = None,
-    ) -> bool:
+    ) -> Tuple[bool, str]:
         """
         INT8 regime gate — three tiers based on model size.
+
+        Returns (apply: bool, reason: str) so callers can surface the reason
+        in honest_ceiling / runtime warnings without re-running the gate.
 
         inputs may be a plain dict or an InputFormat (from detect_input_format).
 
@@ -577,8 +580,9 @@ class UniversalOptimizer:
             else str(bottleneck_type)
         )
         if "compute_bound" in bottleneck_str.lower():
+            reason = "INT8 skipped: compute-bound workload (INT8 only helps memory-bound ops)"
             logger.info("INT8 gate: SKIP — compute-bound")
-            return False
+            return False, reason
 
         # Extract seq_len and batch via InputFormat helpers (or legacy dict path)
         if isinstance(inputs, InputFormat):
@@ -608,26 +612,44 @@ class UniversalOptimizer:
         # Tier 1: Very large models >=20B — always memory-bound
         if param_count >= 20e9:
             result = seq_len >= 128
+            reason = (
+                f"INT8 eligible (>=20B, {param_count/1e9:.0f}B params): seq={seq_len} >= 128"
+                if result else
+                f"INT8 skipped (>=20B, {param_count/1e9:.0f}B params): seq={seq_len} < 128"
+            )
             logger.info(
                 "INT8 gate (>=20B, %.0fB params): seq=%d >= 128 → %s",
                 param_count / 1e9, seq_len, result,
             )
-            return result
+            return result, reason
 
         # Tier 2: Large models >=7B-<20B
         elif param_count >= 7e9:
             result = seq_len >= 512
+            reason = (
+                f"INT8 eligible (7B-20B, {param_count/1e9:.0f}B params): seq={seq_len} >= 512"
+                if result else
+                f"INT8 skipped (7B-20B, {param_count/1e9:.0f}B params): seq={seq_len} < 512"
+            )
             logger.info(
                 "INT8 gate (>=7B-<20B, %.0fB params): seq=%d >= 512 → %s",
                 param_count / 1e9, seq_len, result,
             )
-            return result
+            return result, reason
 
         # Tier 3: Small models <7B — original calibrated gate
         else:
             result = (seq_len >= 1024) and (batch * seq_len <= 4096)
+            total_tokens = batch * seq_len
+            reason = (
+                f"INT8 eligible (<7B, {param_count/1e9:.1f}B params): "
+                f"seq={seq_len}>=1024 AND batch*seq={total_tokens}<=4096"
+                if result else
+                f"INT8 skipped (<7B, {param_count/1e9:.1f}B params): "
+                f"seq={seq_len} (need >=1024) AND batch*seq={total_tokens} (need <=4096)"
+            )
             logger.info(
                 "INT8 gate (<7B, %.1fB params): seq=%d>=1024 AND batch*seq=%d<=4096 → %s",
                 param_count / 1e9, seq_len, batch * seq_len, result,
             )
-            return result
+            return result, reason

@@ -82,6 +82,25 @@ def detect_input_format(
                     sample_output=result,
                 )
 
+    # Strategy 1b: encoder-decoder model — synthesize decoder_input_ids
+    # Tried when the dict was given but the forward call failed, which
+    # typically means the model needs both encoder and decoder inputs.
+    if isinstance(sample, dict) and is_encoder_decoder(model):
+        augmented = synthesize_decoder_input(model, sample, device)
+        result = _try_kwargs(model, augmented)
+        if result is not None:
+            log.info(
+                "Input format: encoder-decoder kwargs | keys=%s",
+                list(augmented.keys()),
+            )
+            return InputFormat(
+                style="kwargs",
+                inputs=augmented,
+                model_family="encoder_decoder",
+                input_keys=list(augmented.keys()),
+                sample_output=result,
+            )
+
     # Strategy 2: sample is a tensor — try all known key names then positional
     if isinstance(sample, torch.Tensor):
         KEY_NAMES = [
@@ -298,6 +317,95 @@ def get_batch_size(fmt: "InputFormat") -> Optional[int]:
         if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
             return v[0].shape[0]
     return None
+
+
+# ── Encoder-decoder helpers ───────────────────────────────────────────────────
+
+def is_encoder_decoder(model: nn.Module) -> bool:
+    """
+    Return True when *model* is an encoder-decoder (seq2seq) architecture.
+
+    Three independent structural checks — no model-name matching:
+      1. HuggingFace config: model.config.is_encoder_decoder == True
+      2. Named children: both 'encoder' and 'decoder' exist as direct children
+      3. Object __dict__: model has both 'encoder' and 'decoder' attributes
+
+    A model passes if ANY single check is True.
+    """
+    # Check 1: HuggingFace config attribute
+    try:
+        if getattr(getattr(model, 'config', None), 'is_encoder_decoder', False):
+            return True
+    except Exception:
+        pass
+
+    # Check 2: named_children() contains both 'encoder' and 'decoder'
+    try:
+        child_names = {name for name, _ in model.named_children()}
+        if 'encoder' in child_names and 'decoder' in child_names:
+            return True
+    except Exception:
+        pass
+
+    # Check 3: __dict__ has both 'encoder' and 'decoder' attributes
+    try:
+        d = model.__dict__
+        if 'encoder' in d and 'decoder' in d:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def synthesize_decoder_input(
+    model: nn.Module,
+    encoder_input: Dict,
+    device: str = "cuda",
+) -> Dict:
+    """
+    Augment *encoder_input* with a minimal ``decoder_input_ids`` tensor.
+
+    Called when detect_input_format() detects an encoder-decoder model and
+    the caller provided only encoder-side inputs. Produces the
+    ``decoder_input_ids`` key required for a full seq2seq forward pass.
+
+    The decoder start token is taken from (priority order):
+      1. model.config.decoder_start_token_id
+      2. model.config.bos_token_id
+      3. model.config.pad_token_id
+      4. 0  (final fallback)
+
+    Args:
+        model:          nn.Module with encoder-decoder architecture
+        encoder_input:  dict of encoder-side tensors (e.g. {'input_ids': ...})
+        device:         target device string
+
+    Returns:
+        New dict with all encoder_input keys plus 'decoder_input_ids'
+        (shape: batch_size × 1).
+    """
+    cfg = getattr(model, 'config', None)
+    start_token_id = int(
+        getattr(cfg, 'decoder_start_token_id', None)
+        or getattr(cfg, 'bos_token_id', None)
+        or getattr(cfg, 'pad_token_id', None)
+        or 0
+    )
+
+    batch_size = 1
+    for v in encoder_input.values():
+        if isinstance(v, torch.Tensor):
+            batch_size = v.shape[0]
+            break
+
+    decoder_input_ids = torch.full(
+        (batch_size, 1), start_token_id, dtype=torch.long, device=device
+    )
+
+    augmented = dict(encoder_input)
+    augmented['decoder_input_ids'] = decoder_input_ids
+    return augmented
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────

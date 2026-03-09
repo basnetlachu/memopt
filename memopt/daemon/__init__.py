@@ -36,8 +36,10 @@ __all__ = [
     "ApplyResult",
     # Zero-touch daemon + ROI
     "ZeroTouchDaemon",
+    "ZeroTouchConfig",
     "ZeroDaemonConfig",
     "OptimizationEvent",
+    "ClusterROICalculator",
     "ROICalculator",
     "ROIEstimate",
     # Control plane reporter
@@ -45,8 +47,9 @@ __all__ = [
 ]
 
 # Zero-touch daemon + ROI
-from .zero_touch import ZeroTouchDaemon, OptimizationEvent
-from .zero_touch import DaemonConfig as ZeroDaemonConfig
-from .roi_calculator import ROICalculator, ROIEstimate
+from .zero_touch import ZeroTouchDaemon, ZeroTouchConfig, DaemonConfig, OptimizationEvent
+
+ZeroDaemonConfig = ZeroTouchConfig  # backward-compat alias
+from .roi_calculator import ClusterROICalculator, ROICalculator, ROIEstimate
 # Control plane reporter
 from .reporter import ControlPlaneReporter

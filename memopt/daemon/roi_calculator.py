@@ -30,7 +30,7 @@ class ROIEstimate:
     dollar_saved_per_year_max: float
 
 
-class ROICalculator:
+class ClusterROICalculator:
     """
     Calculates dollar savings from optimization speedup.
 
@@ -114,3 +114,6 @@ class ROICalculator:
             "dollar_saved_per_year": round(per_hour * 24 * 365, 2),
             "gpu_cost_per_hour": self.gpu_cost_per_hour,
         }
+
+
+ROICalculator = ClusterROICalculator  # backward-compat alias

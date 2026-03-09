@@ -12,6 +12,7 @@ Usage:
     daemon.run_once()  # single scan cycle (for testing)
 """
 import os
+import signal
 import time
 import logging
 import threading
@@ -31,7 +32,7 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
-class DaemonConfig:
+class ZeroTouchConfig:
     scan_interval_seconds: int = 60
     sample_seconds: int = 5
     auto_apply: bool = False
@@ -41,6 +42,9 @@ class DaemonConfig:
     # Min expected speedup to trigger auto-apply
     min_speedup_threshold: float = 1.3
     node_name: str = ""
+
+
+DaemonConfig = ZeroTouchConfig  # backward-compat alias
 
 
 @dataclass
@@ -72,12 +76,8 @@ class ZeroTouchDaemon:
     Never auto-applies to training processes.
     """
 
-    def __init__(self, config: "DaemonConfig" = None):
+    def __init__(self, config: "ZeroTouchConfig" = None):
         self.config = config or self._config_from_env()
-        self.scanner = GPUScanner()
-        self.inspector = ProcessInspector()
-        self.apply_engine = ApplyEngine()
-        self.roi_calc = ROICalculator(self.config.gpu_cost_per_hour)
 
         # pid → timestamp of last optimization attempt
         self._optimized_pids: Dict[int, float] = {}
@@ -91,87 +91,194 @@ class ZeroTouchDaemon:
         self.total_optimizations = 0
         self.total_dollar_saved = 0.0
 
-        # Control plane reporter (no-op if MEMOPT_CONTROL_PLANE not set)
-        from memopt.daemon.reporter import ControlPlaneReporter
-        self.reporter = ControlPlaneReporter()
-
-        # Fleet intelligence — unified drift detection and metrics
-        self.fleet = FleetIntelligence(
-            db_path=str(Path.home() / ".memopt" / "fleet.db"),
-            gpu_cost_per_hour=self.config.gpu_cost_per_hour,
-            auto_remediate=False,
-        )
-        # Zero-downtime migration engine
-        self.migration_engine = AutoMigrationEngine()
-        self.roofline_profiler = RooflineProfiler()
         self._migrated_pids: set = set()
 
+        # Graceful shutdown state
+        self._shutdown_requested: bool = False
+        # PID currently being optimised by ApplyEngine (for cleanup on SIGTERM)
+        self._current_apply_pid: Optional[int] = None
+        # Wrapper scripts/files created for cleanup
+        self._created_wrappers: List[str] = []
+
+        # Build all collaborators from a single factory method so that
+        # each optional dependency is isolated and testable.
+        collab = self._build_collaborators(self.config)
+        self.scanner          = collab["scanner"]
+        self.inspector        = collab["inspector"]
+        self.apply_engine     = collab["apply_engine"]
+        self.roi_calc         = collab["roi_calc"]
+        self.reporter         = collab["reporter"]
+        self.fleet            = collab["fleet"]
+        self.migration_engine = collab["migration_engine"]
+        self.roofline_profiler = collab["roofline_profiler"]
+        self.gossip           = collab["gossip"]
+        self.predictor        = collab["predictor"]
+        self.interceptor      = collab["interceptor"]
+        self.swapper          = collab["swapper"]
+
+        # eBPF callback must be registered after self is fully initialised
+        # because the closure captures self.
+        if self.interceptor is not None:
+            self._setup_ebpf_callback()
+
+    # ── Collaborator factory ───────────────────────────────────────────────
+
+    def _build_collaborators(self, config: "ZeroTouchConfig") -> Dict:
+        """
+        Initialise all daemon collaborators and return them as a dict.
+
+        Each optional collaborator is wrapped in try/except so that a single
+        unavailable dependency does not prevent the daemon from starting.
+        Core collaborators (scanner, inspector, apply_engine, roi_calc) are
+        required; all others default to None on failure.
+        """
+        collab: Dict = {}
+
+        # Core — required for basic scan-and-report operation
+        collab["scanner"]     = GPUScanner()
+        collab["inspector"]   = ProcessInspector()
+        collab["apply_engine"] = ApplyEngine()
+        collab["roi_calc"]    = ROICalculator(config.gpu_cost_per_hour)
+
+        # Control plane reporter (no-op if MEMOPT_CONTROL_PLANE not set)
+        try:
+            from memopt.daemon.reporter import ControlPlaneReporter
+            collab["reporter"] = ControlPlaneReporter()
+        except Exception as exc:
+            log.warning("ControlPlaneReporter unavailable: %s", exc)
+            collab["reporter"] = None
+
+        # Fleet intelligence — unified drift detection and metrics
+        try:
+            collab["fleet"] = FleetIntelligence(
+                db_path=str(Path.home() / ".memopt" / "fleet.db"),
+                gpu_cost_per_hour=config.gpu_cost_per_hour,
+                auto_remediate=False,
+            )
+        except Exception as exc:
+            log.warning("FleetIntelligence unavailable: %s", exc)
+            collab["fleet"] = None
+
+        # Zero-downtime migration engine
+        try:
+            collab["migration_engine"] = AutoMigrationEngine()
+        except Exception as exc:
+            log.warning("AutoMigrationEngine unavailable: %s", exc)
+            collab["migration_engine"] = None
+
+        # Roofline profiler
+        try:
+            collab["roofline_profiler"] = RooflineProfiler()
+        except Exception as exc:
+            log.warning("RooflineProfiler unavailable: %s", exc)
+            collab["roofline_profiler"] = None
+
         # Gossip client — check fleet knowledge base before test-measure-commit
-        self.gossip = None
         try:
             from memopt.fleet.gossip import GossipClient
             _cp  = os.getenv("MEMOPT_CONTROL_PLANE", "http://localhost:8080")
             _key = os.getenv("MEMOPT_API_KEY", "")
-            self.gossip = GossipClient(
-                node_name=self.config.node_name,
+            gossip = GossipClient(
+                node_name=config.node_name,
                 control_plane_url=_cp,
                 api_key=_key,
             )
-            self.gossip.sync_all_recipes()
+            gossip.sync_all_recipes()
             log.info("Gossip client initialized and knowledge base synced")
-        except Exception as _ge:
-            log.warning("Gossip client unavailable (proceeding without it): %s", _ge)
+            collab["gossip"] = gossip
+        except Exception as exc:
+            log.warning("Gossip client unavailable (proceeding without it): %s", exc)
+            collab["gossip"] = None
 
         # Predictive predictor — migrate before performance degrades
-        self.predictor = None
         try:
             from memopt.fleet.predictor import PredictivePredictor
-            self.predictor = PredictivePredictor()
+            collab["predictor"] = PredictivePredictor()
             log.info("PredictivePredictor initialized")
-        except Exception as _pe:
-            log.warning("PredictivePredictor unavailable: %s", _pe)
+        except Exception as exc:
+            log.warning("PredictivePredictor unavailable: %s", exc)
+            collab["predictor"] = None
 
         # eBPF CUDA kernel interceptor + shared-memory swap protocol
-        self.interceptor = None
-        self.swapper     = None
         try:
             from memopt.ebpf.interceptor import CUDAKernelInterceptor
             from memopt.ebpf.kernel_swapper import KernelSwapper
+            interceptor = CUDAKernelInterceptor()
+            swapper     = KernelSwapper()
+            ebpf_active = interceptor.start()
+            log.info("CUDA kernel interceptor started (eBPF=%s)", ebpf_active)
+            collab["interceptor"] = interceptor
+            collab["swapper"]     = swapper
+        except Exception as exc:
+            log.warning("eBPF interceptor unavailable (non-fatal): %s", exc)
+            collab["interceptor"] = None
+            collab["swapper"]     = None
 
-            self.interceptor = CUDAKernelInterceptor()
-            self.swapper     = KernelSwapper()
+        return collab
 
-            ebpf_active = self.interceptor.start()
-            log.info(
-                "CUDA kernel interceptor started (eBPF=%s)",
-                ebpf_active,
+    def _setup_ebpf_callback(self) -> None:
+        """Register the suboptimal-kernel callback on self.interceptor."""
+        def _on_suboptimal(detection) -> None:
+            log.warning(
+                "Suboptimal CUDA kernel: PID %d pattern=%s "
+                "launches=%d speedup=%.1fx fix=%s",
+                detection.pid, detection.reason,
+                detection.launch_count, detection.estimated_speedup,
+                detection.recommendation,
             )
+            self._post_ebpf_event(detection)
+            if self.config.auto_apply and self.swapper is not None:
+                self.swapper.inject_shim(detection.pid)
 
-            # Register callback for suboptimal kernel detections
-            daemon_self = self
+        self.interceptor.on_suboptimal_kernel = _on_suboptimal
 
-            def _on_suboptimal(detection):
-                log.warning(
-                    "Suboptimal CUDA kernel: PID %d pattern=%s "
-                    "launches=%d speedup=%.1fx fix=%s",
-                    detection.pid, detection.reason,
-                    detection.launch_count, detection.estimated_speedup,
-                    detection.recommendation,
-                )
-                daemon_self._post_ebpf_event(detection)
-                if daemon_self.config.auto_apply and daemon_self.swapper:
-                    daemon_self.swapper.inject_shim(detection.pid)
-
-            self.interceptor.on_suboptimal_kernel = _on_suboptimal
-
-        except Exception as _ee:
-            log.warning("eBPF interceptor unavailable (non-fatal): %s", _ee)
+    def health_check(self) -> Dict[str, bool]:
+        """Return availability of each collaborator (True = initialised)."""
+        return {
+            "scanner":          self.scanner is not None,
+            "inspector":        self.inspector is not None,
+            "apply_engine":     self.apply_engine is not None,
+            "reporter":         self.reporter is not None,
+            "fleet":            self.fleet is not None,
+            "migration_engine": self.migration_engine is not None,
+            "roofline_profiler": self.roofline_profiler is not None,
+            "gossip":           self.gossip is not None,
+            "predictor":        self.predictor is not None,
+            "interceptor":      self.interceptor is not None,
+            "swapper":          self.swapper is not None,
+        }
 
     def run(self) -> None:
         """
         Main daemon loop. Runs forever.
         Call from systemd service or Kubernetes container entrypoint.
+
+        Handles SIGTERM and SIGINT gracefully: finishes the current scan cycle
+        (not the current apply — that gets interrupted), then calls
+        _cleanup_on_shutdown() before returning.
         """
+        def _request_shutdown(signum, _frame) -> None:
+            log.info(
+                "Signal %d received — requesting graceful shutdown "
+                "(current apply PID: %s)",
+                signum, self._current_apply_pid,
+            )
+            self._shutdown_requested = True
+
+        # signal.signal() only works from the main thread.  In unit tests (or
+        # when run() is called from a background thread) skip handler registration
+        # rather than crashing.
+        import threading as _threading
+        if _threading.current_thread() is _threading.main_thread():
+            signal.signal(signal.SIGTERM, _request_shutdown)
+            signal.signal(signal.SIGINT,  _request_shutdown)
+        else:
+            log.warning(
+                "run() called from non-main thread — "
+                "SIGTERM/SIGINT handlers not registered. "
+                "Set _shutdown_requested=True to stop the loop."
+            )
+
         log.info(
             "ZeroTouchDaemon starting | "
             f"node={self.config.node_name} | "
@@ -179,13 +286,55 @@ class ZeroTouchDaemon:
             f"auto_apply={self.config.auto_apply}"
         )
 
-        while True:
-            try:
-                self.run_once()
-            except Exception as e:
-                log.error(f"Scan cycle failed: {e}", exc_info=True)
+        try:
+            while not self._shutdown_requested:
+                try:
+                    self.run_once()
+                except Exception as e:
+                    log.error(f"Scan cycle failed: {e}", exc_info=True)
 
-            time.sleep(self.config.scan_interval_seconds)
+                # Sleep in small increments so a shutdown request is noticed
+                # quickly rather than waiting for the full interval.
+                elapsed = 0.0
+                interval = self.config.scan_interval_seconds
+                while elapsed < interval and not self._shutdown_requested:
+                    time.sleep(min(1.0, interval - elapsed))
+                    elapsed += 1.0
+        finally:
+            self._cleanup_on_shutdown()
+
+    def _cleanup_on_shutdown(self) -> None:
+        """
+        Best-effort cleanup after SIGTERM / SIGINT.
+
+        Tries to:
+        - Stop the eBPF interceptor if running
+        - Remove any wrapper scripts created by _created_wrappers
+        - Log the PID that was mid-apply so operators can check process state
+        """
+        log.info("ZeroTouchDaemon shutting down cleanly")
+
+        if self._current_apply_pid is not None:
+            log.warning(
+                "PID %d was being optimised when shutdown was requested — "
+                "verify the process is still running correctly.",
+                self._current_apply_pid,
+            )
+
+        for path in self._created_wrappers:
+            try:
+                os.remove(path)
+                log.debug("Removed wrapper: %s", path)
+            except OSError as exc:
+                log.debug("Could not remove wrapper %s: %s", path, exc)
+
+        if self.interceptor is not None:
+            try:
+                self.interceptor.stop()
+            except Exception as exc:
+                log.debug("eBPF interceptor stop error: %s", exc)
+
+        log.info("ZeroTouchDaemon shutdown complete")
 
     def run_once(self) -> List[OptimizationEvent]:
         """
@@ -221,26 +370,28 @@ class ZeroTouchDaemon:
 
         self._export_metrics(cycle_events)
         # Report to control plane (no-op if not configured)
-        self.reporter.add_events(cycle_events)
-        self.reporter.report(self)
+        if self.reporter is not None:
+            self.reporter.add_events(cycle_events)
+            self.reporter.report(self)
 
         # Push metrics to fleet intelligence layer for unified drift detection
-        for proc in processes:
-            self.fleet.ingest_metrics(NodeMetrics(
-                node_name=self.config.node_name,
-                timestamp=time.time(),
-                gpu_index=proc.gpu_ids[0] if proc.gpu_ids else 0,
-                gpu_name="",
-                vram_used_mb=proc.gpu_memory_mb or 0,
-                vram_total_mb=0,
-                gpu_util_pct=proc.gpu_utilization_pct or 0.0,
-                power_watts=0.0,
-                temperature_c=0.0,
-                active_pid=proc.pid,
-                tokens_per_second=proc.gpu_utilization_pct,
-                optimization_applied=proc.pid in self._optimized_pids,
-                backend=proc.mode or "unknown",
-            ))
+        if self.fleet is not None:
+            for proc in processes:
+                self.fleet.ingest_metrics(NodeMetrics(
+                    node_name=self.config.node_name,
+                    timestamp=time.time(),
+                    gpu_index=proc.gpu_ids[0] if proc.gpu_ids else 0,
+                    gpu_name="",
+                    vram_used_mb=proc.gpu_memory_mb or 0,
+                    vram_total_mb=0,
+                    gpu_util_pct=proc.gpu_utilization_pct or 0.0,
+                    power_watts=0.0,
+                    temperature_c=0.0,
+                    active_pid=proc.pid,
+                    tokens_per_second=proc.gpu_utilization_pct,
+                    optimization_applied=proc.pid in self._optimized_pids,
+                    backend=proc.mode or "unknown",
+                ))
 
         return cycle_events
 
@@ -308,19 +459,20 @@ class ZeroTouchDaemon:
                 with self._lock:
                     self._optimized_pids[proc.pid] = time.time()
                 # Record fleet baseline and optimization for unified drift tracking
-                _node_key = f"{self.config.node_name}:gpu{proc.gpu_ids[0] if proc.gpu_ids else 0}"
-                self.fleet.set_baseline(_node_key, proc.gpu_utilization_pct or 1.0)
-                self.fleet.record_optimization(
-                    node_name=self.config.node_name,
-                    pid=proc.pid,
-                    model_name=proc.model_family or "unknown",
-                    backend_before="unoptimized",
-                    backend_after="optimized",
-                    tps_before=None,
-                    tps_after=None,
-                    optimizations=profile.recommended_optimizations,
-                    status="applied",
-                )
+                if self.fleet is not None:
+                    _node_key = f"{self.config.node_name}:gpu{proc.gpu_ids[0] if proc.gpu_ids else 0}"
+                    self.fleet.set_baseline(_node_key, proc.gpu_utilization_pct or 1.0)
+                    self.fleet.record_optimization(
+                        node_name=self.config.node_name,
+                        pid=proc.pid,
+                        model_name=proc.model_family or "unknown",
+                        backend_before="unoptimized",
+                        backend_after="optimized",
+                        tps_before=None,
+                        tps_after=None,
+                        optimizations=profile.recommended_optimizations,
+                        status="applied",
+                    )
                 self._maybe_migrate(proc)
             else:
                 status = "failed"
@@ -343,6 +495,8 @@ class ZeroTouchDaemon:
         if proc.pid in self._migrated_pids:
             return
         if proc.mode != "inference":
+            return
+        if self.roofline_profiler is None or self.migration_engine is None:
             return
         try:
             gpu_id = proc.gpu_ids[0] if proc.gpu_ids else 0
@@ -435,6 +589,8 @@ class ZeroTouchDaemon:
                 gpu_index, active_pid, signal.migration_risk_score, signal.reason,
             )
             self._post_prediction_event(gpu_index, active_pid, signal)
+            if self.roofline_profiler is None or self.migration_engine is None:
+                return
             try:
                 hw = self.roofline_profiler.profile_gpu(gpu_index)
                 hw_dict = {
@@ -627,9 +783,9 @@ class ZeroTouchDaemon:
         }
 
     @classmethod
-    def _config_from_env(cls) -> DaemonConfig:
+    def _config_from_env(cls) -> ZeroTouchConfig:
         """Read config from environment variables (set by Helm daemonset.yaml)."""
-        return DaemonConfig(
+        return ZeroTouchConfig(
             scan_interval_seconds=int(os.getenv("MEMOPT_SCAN_INTERVAL", "60")),
             sample_seconds=int(os.getenv("MEMOPT_SAMPLE_SECONDS", "5")),
             auto_apply=os.getenv("MEMOPT_AUTO_APPLY", "false").lower() == "true",

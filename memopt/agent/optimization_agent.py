@@ -222,6 +222,8 @@ class MemoptAgent:
         self.min_improvement   = min_improvement
         self.no_progress_limit = no_progress_limit
         self.multi_gpu         = multi_gpu
+        # Last INT8 gate rejection reason — set by _apply_int8, read by _explain_ceiling
+        self._last_int8_skip_reason: Optional[str] = None
 
         # Detect hardware once at construction — shared across all run() calls
         self.hw: HardwareProfile = detect_hardware()
@@ -745,7 +747,7 @@ class MemoptAgent:
         # Delegate to 3-tier UniversalOptimizer gate
         # (<7B: seq>=1024 AND batch*seq<=4096; 7B-20B: seq>=512; >20B: seq>=128)
         from memopt.profiler.bottleneck_classifier import BottleneckType
-        in_regime = UniversalOptimizer()._should_apply_int8(
+        in_regime, _int8_reason = UniversalOptimizer()._should_apply_int8(
             fmt,
             BottleneckType.MEMORY_BOUND_DRAM,
             model,
@@ -753,9 +755,10 @@ class MemoptAgent:
 
         if not in_regime:
             log.info(
-                "    int8: regime gate REJECTED (seq=%d, batch×seq=%d)",
-                seq_len, batch * seq_len,
+                "    int8: regime gate REJECTED — %s (seq=%d, batch×seq=%d)",
+                _int8_reason, seq_len, batch * seq_len,
             )
+            self._last_int8_skip_reason = _int8_reason
             return model  # unchanged → speedup ~1.0 → ROLLBACK
 
         # Tier 1: dynamic activation + weight INT8
@@ -1134,6 +1137,11 @@ class MemoptAgent:
 
         if "EXHAUSTED" in stop:
             ai = state.last_arithmetic_intensity
+            int8_note = (
+                f" INT8 gate: {self._last_int8_skip_reason}."
+                if self._last_int8_skip_reason
+                else " Increase seq>=1024 AND batch×seq<=4096 to unlock INT8 regime."
+            )
             if ai and ai != float("inf"):
                 return (
                     f"All available optimizations applied for bottleneck type "
@@ -1141,13 +1149,13 @@ class MemoptAgent:
                     f"(arithmetic intensity={ai:.0f} FLOPS/byte). "
                     f"To go further: (1) install flash-attn for full Flash Attention "
                     f"(pip install flash-attn); "
-                    f"(2) increase batch size or sequence length to seq>=1024 "
-                    f"to unlock INT8 regime; "
+                    f"(2){int8_note} "
                     f"(3) use bfloat16 mixed precision to halve memory traffic."
                 )
             return (
                 f"All available optimizations applied for bottleneck type "
-                f"'{state.current_bottleneck}'. No further candidates in priority table."
+                f"'{state.current_bottleneck}'."
+                f"{int8_note}"
             )
 
         if "NO_PROGRESS" in stop:

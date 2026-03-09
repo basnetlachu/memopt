@@ -101,13 +101,13 @@ from .optimization_synthesis import (
 # Legacy imports for backward compatibility
 from .continuous_profiler import (
     ContinuousProfiler,
-    BottleneckClassifier as LegacyBottleneckClassifier,
     BottleneckType as LegacyBottleneckType,
     BottleneckAnalysis,
     KernelMetrics,
     ProfilerSnapshot,
     profile_model_bottlenecks as legacy_profile_model_bottlenecks,
 )
+from .bottleneck_classifier import BottleneckClassifier as LegacyBottleneckClassifier
 
 # Aliases for Phase 1 enhanced classes
 EnhancedBottleneckClassifier = BottleneckClassifier
@@ -122,19 +122,6 @@ from .traffic_attribution import (
     OptimizationType,
     TensorAccessPattern,
     TensorTracker,
-)
-
-# Step 3: Adaptive Optimization
-from .adaptive_optimizer import (
-    AdaptiveOptimizer,
-    OptimizationResult,
-    OptimizationSession,
-    OptimizationStatus,
-    SemanticVerifier,
-    LayoutTransformer,
-    KernelFuser,
-    CacheOptimizer,
-    optimize_model_memory,
 )
 
 __all__ = [
@@ -199,14 +186,4 @@ __all__ = [
     "OptimizationType",
     "TensorAccessPattern",
     "TensorTracker",
-    # Step 3: Adaptive Optimization
-    "AdaptiveOptimizer",
-    "OptimizationResult",
-    "OptimizationSession",
-    "OptimizationStatus",
-    "SemanticVerifier",
-    "LayoutTransformer",
-    "KernelFuser",
-    "CacheOptimizer",
-    "optimize_model_memory",
 ]

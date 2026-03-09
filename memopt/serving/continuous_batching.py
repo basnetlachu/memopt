@@ -32,6 +32,8 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .paged_attention import PagedKVCache
+
 log = logging.getLogger(__name__)
 
 
@@ -106,6 +108,7 @@ class ContinuousBatchingEngine:
         tokenizer=None,
         pad_token_id: int = 0,
         eos_token_ids: Optional[List[int]] = None,
+        use_paged_attention: bool = False,
     ):
         self.model = model
         self.config = config or BatchingConfig()
@@ -116,6 +119,21 @@ class ContinuousBatchingEngine:
             self.eos_token_ids = [tokenizer.eos_token_id]
         else:
             self.eos_token_ids = eos_token_ids or [2, 1, 50256, 32000]
+        model_cfg = getattr(model, "config", None)
+        if use_paged_attention:
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            _dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            _n_heads = getattr(model_cfg, "num_attention_heads", 12)
+            self.paged_kv_cache: Optional[PagedKVCache] = PagedKVCache(
+                num_blocks=self.config.max_batch_size * 64,
+                num_layers=getattr(model_cfg, "num_hidden_layers", 12),
+                num_heads=_n_heads,
+                head_dim=getattr(model_cfg, "hidden_size", 768) // _n_heads,
+                dtype=_dtype,
+                device=_device,
+            )
+        else:
+            self.paged_kv_cache: Optional[PagedKVCache] = None
 
         self._queue: asyncio.Queue = None
         self._active: Dict[str, Request] = {}

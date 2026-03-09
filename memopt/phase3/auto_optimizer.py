@@ -8,6 +8,7 @@ Integrates Phase 1 + Phase 2 analysis with automatic optimization application.
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -95,6 +96,11 @@ class AutoOptimizer:
             max_optimizations: Maximum number of optimizations to try
             stop_on_first_failure: Stop after first failed optimization
         """
+        warnings.warn(
+            "AutoOptimizer is deprecated. Use memopt.agent.MemoptAgent instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.tolerance_pct = tolerance_pct
         self.max_optimizations = max_optimizations
         self.stop_on_first_failure = stop_on_first_failure

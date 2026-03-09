@@ -545,6 +545,271 @@ def apply_int8_with_fallback(
     return model, "none"
 
 
+# =============================================================================
+# Universal attention detection (three-layer) and SDPA patching
+# =============================================================================
+
+def _is_attention_by_structure(module: Any) -> bool:
+    """
+    Return True when *module* looks like an attention block by structure.
+
+    Checks whether the module has ≥3 *direct* Linear children whose
+    out_features are within 30% of the median — the classic Q/K/V pattern.
+    Uses direct children only (.children()) to avoid matching outer wrappers
+    (e.g. a TransformerBlock that contains both attention + FFN linears).
+    Intentionally no class-name checks.
+    """
+    if not HAS_TORCH:
+        return False
+    try:
+        direct_linears = [m for m in module.children() if isinstance(m, nn.Linear)]
+        if len(direct_linears) < 3:
+            return False
+        out_features = [l.out_features for l in direct_linears]
+        median = sorted(out_features)[len(out_features) // 2]
+        if median == 0:
+            return False
+        # ≥3 linears with output size in [70%, 150%] of the median
+        in_range = sum(1 for f in out_features if 0.7 * median <= f <= 1.5 * median)
+        return in_range >= 3
+    except Exception:
+        return False
+
+
+def _find_attention_by_structure(model: Any) -> List[Tuple[str, Any]]:
+    """
+    Layer 1 attention detection: structural walk of named_modules.
+
+    Returns (name, module) pairs for modules that pass _is_attention_by_structure.
+    The matched_prefixes guard prevents parent modules from being returned once
+    a child attention module has already been found.
+    """
+    if not HAS_TORCH:
+        return []
+
+    found: List[Tuple[str, Any]] = []
+    matched_prefixes: set = set()
+
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        if any(name == p or name.startswith(p + '.') for p in matched_prefixes):
+            continue
+        if _is_attention_by_structure(module):
+            found.append((name, module))
+            matched_prefixes.add(name)
+
+    return found
+
+
+def _find_attention_by_fx(model: Any) -> List[Tuple[str, Any]]:
+    """
+    Layer 2 attention detection: FX symbolic trace.
+
+    Traces the model and searches for softmax nodes in the graph. If found,
+    confirms that attention operations exist and returns direct children that
+    contain at least one Linear submodule. Returns [] if tracing fails
+    (e.g. dynamic control flow, data-dependent shapes).
+    """
+    if not HAS_TORCH:
+        return []
+    try:
+        import torch.fx as fx
+        traced = fx.symbolic_trace(model)
+    except Exception:
+        return []
+
+    has_softmax = False
+    for node in traced.graph.nodes:
+        try:
+            target_str = str(getattr(node, 'target', ''))
+            op_str = str(getattr(node, 'op', ''))
+            if 'softmax' in target_str.lower() or (
+                op_str == 'call_method' and getattr(node, 'target', '') == 'softmax'
+            ):
+                has_softmax = True
+                break
+        except Exception:
+            continue
+
+    if not has_softmax:
+        return []
+
+    # Attention confirmed in graph: return direct children with ≥1 Linear
+    return [
+        (name, child)
+        for name, child in model.named_children()
+        if not isinstance(child, nn.Linear)
+        and any(isinstance(m, nn.Linear) for m in child.modules())
+    ]
+
+
+def _find_attention_by_hooks(
+    model: Any,
+    inputs: Dict[str, Any],
+) -> List[Tuple[str, Any]]:
+    """
+    Layer 3 attention detection: activation-shape forward hooks.
+
+    Registers hooks on every named submodule, runs one forward pass, and
+    identifies modules that produce a 4-D output with shape consistent with
+    attention weights or multi-head values: (batch, heads, seq, head_dim)
+    where heads > 1 and head_dim ≤ seq_len.
+    """
+    if not HAS_TORCH:
+        return []
+
+    output_shapes: Dict[str, tuple] = {}
+    hooks: list = []
+
+    def make_hook(n: str):
+        def _hook(_module, _input, output):
+            try:
+                if isinstance(output, torch.Tensor):
+                    output_shapes[n] = tuple(output.shape)
+                elif isinstance(output, (tuple, list)) and output:
+                    first = output[0]
+                    if isinstance(first, torch.Tensor):
+                        output_shapes[n] = tuple(first.shape)
+            except Exception:
+                pass
+        return _hook
+
+    for name, module in model.named_modules():
+        if name:
+            hooks.append(module.register_forward_hook(make_hook(name)))
+
+    try:
+        with torch.no_grad():
+            model(**inputs)
+    except Exception as e:
+        logger.debug("_find_attention_by_hooks: forward failed (%s)", e)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    found: List[Tuple[str, Any]] = []
+    matched_prefixes: set = set()
+    module_dict = {name: mod for name, mod in model.named_modules() if name}
+
+    # Shallow paths first so parent matches before children
+    for name in sorted(output_shapes.keys(), key=lambda x: len(x.split('.'))):
+        if any(name == p or name.startswith(p + '.') for p in matched_prefixes):
+            continue
+        shape = output_shapes[name]
+        if len(shape) == 4:
+            B, H, S, D = shape
+            # (batch, heads, seq, head_dim): multiple heads, head_dim < seq_len
+            # Require D < S (strict) to exclude square CNN feature maps where H=W.
+            # Also require the module has ≥1 Linear child to exclude Conv blocks.
+            if H > 1 and D > 0 and D < S:
+                mod = module_dict.get(name)
+                if mod is not None and any(
+                    isinstance(m, nn.Linear) for m in mod.modules()
+                ):
+                    found.append((name, mod))
+                    matched_prefixes.add(name)
+
+    return found
+
+
+def _find_all_attention_modules(
+    model: Any,
+    inputs: Dict[str, Any],
+) -> List[Tuple[str, Any]]:
+    """
+    Orchestrator: three-layer attention detection.
+
+    Tries structural → FX graph → forward hooks in order.
+    Stops at the first layer that returns a non-empty result.
+    Returns [] if all three layers find nothing (caller uses legacy fallback).
+    """
+    if not HAS_TORCH:
+        return []
+
+    result = _find_attention_by_structure(model)
+    if result:
+        logger.debug("Attention: structural layer found %d module(s)", len(result))
+        return result
+
+    result = _find_attention_by_fx(model)
+    if result:
+        logger.debug("Attention: FX layer found %d module(s)", len(result))
+        return result
+
+    result = _find_attention_by_hooks(model, inputs)
+    if result:
+        logger.debug("Attention: hooks layer found %d module(s)", len(result))
+        return result
+
+    logger.debug("Attention: all three layers empty")
+    return []
+
+
+def _detect_qkv_layout(linears: List[Tuple[str, Any]]) -> str:
+    """
+    Infer QKV projection layout from the out_features of Linear children.
+
+    Returns:
+        "separate" — ≥3 linears of approximately equal size (Q, K, V + optional O)
+        "fused"    — one linear whose out_features ≥ 2.5× the minimum (c_attn style)
+        "gqa"      — multiple linears where max ≥ 2× min (GQA / MQA)
+        "unknown"  — fewer than 2 linears
+    """
+    if len(linears) < 2:
+        return "unknown"
+    out_features = [m.out_features for _, m in linears]
+    positive = [f for f in out_features if f > 0]
+    if not positive:
+        return "unknown"
+    mn, mx = min(positive), max(positive)
+    if mx >= 2.5 * mn:
+        return "fused"
+    if mx >= 2.0 * mn:
+        return "gqa"
+    return "separate"
+
+
+def _patch_module_with_sdpa(model: Any, name: str, module: Any) -> None:
+    """
+    Wrap the attention module at *name* with torch.compile (SDPA backend).
+
+    Detects the QKV layout for informational logging, then replaces the
+    module in the parent with a torch.compile-wrapped version so that
+    inductor selects the best available SDPA kernel (FlashAttention, xFormers,
+    or the math fallback). Falls back silently if compile fails.
+    """
+    if not HAS_TORCH:
+        return
+
+    try:
+        direct_linears = [
+            (n, m) for n, m in module.named_children() if isinstance(m, nn.Linear)
+        ]
+        layout = _detect_qkv_layout(direct_linears)
+    except Exception:
+        layout = "unknown"
+
+    try:
+        compiled = torch.compile(
+            module,
+            mode="reduce-overhead",
+            backend="inductor",
+            fullgraph=False,
+        )
+        parts = name.split('.')
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], compiled)
+        logger.info(
+            "SDPA patch: compiled '%s' (layout=%s, mode=reduce-overhead)",
+            name, layout,
+        )
+    except Exception as e:
+        logger.debug("_patch_module_with_sdpa '%s' compile failed: %s", name, e)
+
+
 class TransformationEngine:
     """
     Applies optimization transformations to models and operations.
@@ -622,91 +887,48 @@ class TransformationEngine:
         inputs: Dict[str, Any]
     ) -> Tuple[Callable, Any]:
         """
-        Replace naive attention with Flash Attention.
+        Replace naive attention with Flash Attention / SDPA.
 
-        Fixes: redundant_fetch bottleneck
-        Impact: 60% bandwidth savings
+        Uses three-layer detection (_find_all_attention_modules) to locate
+        attention submodules, then patches each with torch.compile so inductor
+        selects the best available SDPA kernel. Falls back to legacy
+        name/type matching when all three detection layers return empty.
+        No model-specific code paths.
         """
-
         if not HAS_TORCH:
             raise RuntimeError("PyTorch not available")
 
-        # Check for PyTorch's scaled_dot_product_attention
-        has_sdpa = hasattr(F, 'scaled_dot_product_attention')
-
-        # Check for flash_attn library
-        has_flash_attn = False
-        try:
-            import flash_attn
-            has_flash_attn = True
-        except ImportError:
-            pass
-
-        # Check for xformers
-        has_xformers = False
-        try:
-            import xformers.ops as xops
-            has_xformers = True
-        except ImportError:
-            pass
-
-        if not (has_sdpa or has_flash_attn or has_xformers):
+        if not hasattr(F, 'scaled_dot_product_attention'):
             raise RuntimeError(
-                "No Flash Attention implementation available. "
-                "Install flash-attn, xformers, or use PyTorch 2.0+"
+                "scaled_dot_product_attention unavailable — upgrade to PyTorch 2.0+"
             )
 
-        # Find and replace attention modules
-        attention_modules = self._find_attention_modules(model)
+        # Three-layer detection: structural → FX → hooks
+        attention_modules = _find_all_attention_modules(model, inputs)
+        if not attention_modules:
+            # Legacy name/type matching as final fallback
+            attention_modules = self._find_attention_modules_legacy(model)
 
         if not attention_modules:
-            # Model doesn't have standard attention modules
-            # Try to wrap the operation directly
-            logger.info("No standard attention modules found, wrapping operation")
+            logger.info("No attention modules detected — wrapping operation only")
 
             def optimized_operation(**kwargs):
-                # Check if inputs look like Q, K, V
-                if 'query' in kwargs and 'key' in kwargs and 'value' in kwargs:
-                    q, k, v = kwargs['query'], kwargs['key'], kwargs['value']
-
-                    if has_sdpa:
-                        return F.scaled_dot_product_attention(
-                            q, k, v,
-                            attn_mask=kwargs.get('attn_mask', None),
-                            dropout_p=kwargs.get('dropout_p', 0.0)
-                        )
-                    elif has_flash_attn:
-                        from flash_attn import flash_attn_func
-                        # Flash attention expects (batch, seqlen, nheads, headdim)
-                        # Reshape if needed
-                        return flash_attn_func(q, k, v, dropout_p=kwargs.get('dropout_p', 0.0))
-                    elif has_xformers:
-                        import xformers.ops as xops
-                        return xops.memory_efficient_attention(q, k, v)
-
-                # Fall back to original
                 return operation(**kwargs)
 
             return optimized_operation, model
 
-        # Replace attention modules
+        # Patch each detected attention module with SDPA via torch.compile
         for module_name, module in attention_modules:
-            logger.info(f"Replacing {module_name} with Flash Attention")
-
-            if has_sdpa:
-                self._wrap_attention_with_sdpa(model, module_name, module)
-            elif has_flash_attn:
-                self._wrap_attention_with_flash_attn(model, module_name, module)
-            elif has_xformers:
-                self._wrap_attention_with_xformers(model, module_name, module)
+            logger.info("Patching attention: '%s'", module_name)
+            _patch_module_with_sdpa(model, module_name, module)
 
         def optimized_operation(**kwargs):
             return model(**kwargs)
 
         return optimized_operation, model
 
-    def _find_attention_modules(self, model: Any) -> List[Tuple[str, Any]]:
-        """Find attention modules in model."""
+    def _find_attention_modules_legacy(self, model: Any) -> List[Tuple[str, Any]]:
+        """Find attention modules by name/type matching (legacy fallback)."""
 
         if not HAS_TORCH:
             return []

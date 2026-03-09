@@ -114,84 +114,71 @@ class BottleneckAnalysis:
                 f"impact={self.impact_score:.2f}, recoverable={self.recoverable_compute_pct:.1f}%)")
 
 
-class BottleneckClassifier:
-    """Classifies kernel bottlenecks based on hardware metrics."""
+from memopt.profiler.bottleneck_classifier import BottleneckClassifier  # noqa: F401
+# Retained for import compatibility — do not add new code here
 
-    # Thresholds for classification
-    MEMORY_BOUND_THRESHOLD = 0.70   # >70% stalled on memory
-    CACHE_BOUND_L2_MISS = 0.40      # >40% L2 cache miss
-    COMPUTE_BOUND_INTENSITY = 50.0  # >50 FLOPS per byte
-    PIPELINE_BOUND_UTILIZATION = 0.30  # <30% SM utilization
 
-    def classify(self, metrics: KernelMetrics) -> BottleneckAnalysis:
-        """Classify a kernel's bottleneck type."""
+def _classify_kernel_metrics(metrics: KernelMetrics) -> BottleneckAnalysis:
+    """Classify a KernelMetrics object into a BottleneckAnalysis. Used by ContinuousProfiler."""
+    _MEMORY_BOUND_THRESHOLD = 0.70
+    _CACHE_BOUND_L2_MISS = 0.40
+    _COMPUTE_BOUND_INTENSITY = 50.0
+    _PIPELINE_BOUND_UTILIZATION = 0.30
 
-        # Calculate base metrics
-        stall_ratio = metrics.memory_stall_ratio
-        sm_util = metrics.sm_utilization
-        arith_intensity = metrics.arithmetic_intensity
-        l2_hit = metrics.l2_hit_rate
+    stall_ratio = metrics.memory_stall_ratio
+    sm_util = metrics.sm_utilization
+    arith_intensity = metrics.arithmetic_intensity
+    l2_hit = metrics.l2_hit_rate
 
-        # Classification logic
-        bottleneck_type = BottleneckType.UNKNOWN
-        confidence = 0.5
-        recommendations = []
+    bottleneck_type = BottleneckType.UNKNOWN
+    confidence = 0.5
+    recommendations = []
 
-        # Check compute-bound first (this is GOOD - leave it alone)
-        if arith_intensity > self.COMPUTE_BOUND_INTENSITY and sm_util > 0.6:
-            bottleneck_type = BottleneckType.COMPUTE_BOUND
-            confidence = min(1.0, arith_intensity / 100.0)
-            recommendations.append("Kernel is compute-bound - no memory optimization needed")
+    if arith_intensity > _COMPUTE_BOUND_INTENSITY and sm_util > 0.6:
+        bottleneck_type = BottleneckType.COMPUTE_BOUND
+        confidence = min(1.0, arith_intensity / 100.0)
+        recommendations.append("Kernel is compute-bound - no memory optimization needed")
+    elif stall_ratio > _MEMORY_BOUND_THRESHOLD:
+        bottleneck_type = BottleneckType.MEMORY_BOUND
+        confidence = stall_ratio
+        recommendations.extend([
+            "Reduce DRAM traffic through caching",
+            "Consider data layout transformation",
+            "Investigate redundant memory accesses",
+        ])
+    elif l2_hit < (1 - _CACHE_BOUND_L2_MISS) and stall_ratio > 0.3:
+        bottleneck_type = BottleneckType.CACHE_BOUND
+        confidence = 1 - l2_hit
+        recommendations.extend([
+            "Improve L2 cache utilization",
+            "Reduce working set size",
+            "Consider tiling/blocking",
+        ])
+    elif sm_util < _PIPELINE_BOUND_UTILIZATION:
+        bottleneck_type = BottleneckType.PIPELINE_BOUND
+        confidence = 1 - sm_util
+        recommendations.extend([
+            "Increase kernel occupancy",
+            "Consider kernel fusion",
+            "Check for serialization",
+        ])
 
-        # Check memory-bound
-        elif stall_ratio > self.MEMORY_BOUND_THRESHOLD:
-            bottleneck_type = BottleneckType.MEMORY_BOUND
-            confidence = stall_ratio
-            recommendations.extend([
-                "Reduce DRAM traffic through caching",
-                "Consider data layout transformation",
-                "Investigate redundant memory accesses"
-            ])
+    gpu_time_pct = metrics.duration_us / 1000.0
+    dram_traffic_gb = metrics.dram_total_bytes / (1024 ** 3)
+    impact_score = gpu_time_pct * stall_ratio * max(dram_traffic_gb, 0.001)
+    recoverable = stall_ratio * 100 if bottleneck_type == BottleneckType.MEMORY_BOUND else 0
 
-        # Check cache-bound
-        elif l2_hit < (1 - self.CACHE_BOUND_L2_MISS) and stall_ratio > 0.3:
-            bottleneck_type = BottleneckType.CACHE_BOUND
-            confidence = 1 - l2_hit
-            recommendations.extend([
-                "Improve L2 cache utilization",
-                "Reduce working set size",
-                "Consider tiling/blocking"
-            ])
-
-        # Check pipeline-bound
-        elif sm_util < self.PIPELINE_BOUND_UTILIZATION:
-            bottleneck_type = BottleneckType.PIPELINE_BOUND
-            confidence = 1 - sm_util
-            recommendations.extend([
-                "Increase kernel occupancy",
-                "Consider kernel fusion",
-                "Check for serialization"
-            ])
-
-        # Calculate impact score
-        gpu_time_pct = metrics.duration_us / 1000.0  # Convert to ms for impact
-        dram_traffic_gb = metrics.dram_total_bytes / (1024**3)
-        impact_score = gpu_time_pct * stall_ratio * max(dram_traffic_gb, 0.001)
-
-        # Estimate recoverable compute
-        recoverable = stall_ratio * 100 if bottleneck_type == BottleneckType.MEMORY_BOUND else 0
-
-        return BottleneckAnalysis(
-            kernel_name=metrics.name,
-            bottleneck_type=bottleneck_type,
-            confidence=confidence,
-            gpu_time_pct=gpu_time_pct,
-            memory_stall_pct=stall_ratio * 100,
-            dram_traffic_gb=dram_traffic_gb,
-            impact_score=impact_score,
-            recoverable_compute_pct=recoverable,
-            recommendations=recommendations
-        )
+    return BottleneckAnalysis(
+        kernel_name=metrics.name,
+        bottleneck_type=bottleneck_type,
+        confidence=confidence,
+        gpu_time_pct=gpu_time_pct,
+        memory_stall_pct=stall_ratio * 100,
+        dram_traffic_gb=dram_traffic_gb,
+        impact_score=impact_score,
+        recoverable_compute_pct=recoverable,
+        recommendations=recommendations,
+    )
 
 
 @dataclass
@@ -263,7 +250,6 @@ class ContinuousProfiler:
         self.sample_interval_ms = sample_interval_ms
         self.use_hardware_profiler = use_hardware_profiler
 
-        self.classifier = BottleneckClassifier()
         self._kernel_history: Deque[KernelMetrics] = deque(maxlen=history_size)
         self._analysis_history: Deque[BottleneckAnalysis] = deque(maxlen=history_size)
 
@@ -389,7 +375,7 @@ class ContinuousProfiler:
         self._kernel_history.append(metrics)
         self._total_dram_bytes += metrics.dram_total_bytes
 
-        analysis = self.classifier.classify(metrics)
+        analysis = _classify_kernel_metrics(metrics)
         self._analysis_history.append(analysis)
 
     def _profile_region_simple(self, name: str):
@@ -424,7 +410,7 @@ class ContinuousProfiler:
         self._kernel_history.append(metrics)
         self._total_dram_bytes += metrics.dram_total_bytes
 
-        analysis = self.classifier.classify(metrics)
+        analysis = _classify_kernel_metrics(metrics)
         self._analysis_history.append(analysis)
 
     def record_kernel(self,
@@ -453,7 +439,7 @@ class ContinuousProfiler:
         self._kernel_history.append(metrics)
         self._total_dram_bytes += metrics.dram_total_bytes
 
-        analysis = self.classifier.classify(metrics)
+        analysis = _classify_kernel_metrics(metrics)
         self._analysis_history.append(analysis)
 
         return analysis

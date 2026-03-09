@@ -5,6 +5,7 @@ This module handles communication between the memopt daemon
 and the centralized dashboard.
 """
 
+import collections
 import json
 import logging
 import os
@@ -376,6 +377,12 @@ import urllib.request
 import urllib.error
 from memopt.auth.api_key import load_key, mask_key
 
+# Maximum events buffered while the control plane is unreachable.
+# Oldest events are silently dropped when the deque is full.
+# Override via MEMOPT_MAX_PENDING_EVENTS env var.
+_DEFAULT_MAX_PENDING = 500
+MAX_PENDING_EVENTS: int = int(os.environ.get("MEMOPT_MAX_PENDING_EVENTS", _DEFAULT_MAX_PENDING))
+
 
 class ControlPlaneReporter:
     """
@@ -398,7 +405,10 @@ class ControlPlaneReporter:
             os.getenv("MEMOPT_CONTROL_PLANE", "")
         ).rstrip("/")
         self.enabled = bool(self.url)
-        self._pending_events: list = []
+        # Bounded deque prevents unbounded memory growth during control-plane
+        # outages.  Oldest events are dropped when maxlen is exceeded.
+        self._pending_events: collections.deque = collections.deque(maxlen=MAX_PENDING_EVENTS)
+        self._buffer_full_warned: bool = False
         self._lock = threading.Lock()
         self._api_key: str = load_key() or ""
 
@@ -413,7 +423,27 @@ class ControlPlaneReporter:
     def add_events(self, events: list):
         """Buffer events to be sent on next report."""
         with self._lock:
+            before = len(self._pending_events)
             self._pending_events.extend(events)
+            after = len(self._pending_events)
+            # Warn once when the buffer reaches capacity so operators know
+            # events are being dropped.
+            if after == MAX_PENDING_EVENTS and before < MAX_PENDING_EVENTS and not self._buffer_full_warned:
+                logger.warning(
+                    "ControlPlaneReporter event buffer full (%d events). "
+                    "Oldest events will be dropped until the control plane is reachable. "
+                    "Increase MEMOPT_MAX_PENDING_EVENTS to raise the limit.",
+                    MAX_PENDING_EVENTS,
+                )
+                self._buffer_full_warned = True
+
+    def get_buffer_stats(self) -> Dict[str, int]:
+        """Return current buffer utilisation stats."""
+        with self._lock:
+            return {
+                "pending": len(self._pending_events),
+                "capacity": MAX_PENDING_EVENTS,
+            }
 
     def report(self, daemon) -> bool:
         """
@@ -481,14 +511,21 @@ class ControlPlaneReporter:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status == 200:
                     logger.debug(f"Reported to control plane: {resp.status}")
+                    # Successful POST — reset the full-buffer warning so the
+                    # next outage triggers a fresh warning.
+                    with self._lock:
+                        self._buffer_full_warned = False
                     return True
         except urllib.error.URLError as e:
             logger.warning(f"Control plane unreachable: {e} — continuing standalone")
         except Exception as e:
             logger.warning(f"Control plane report failed: {e}")
 
-        # Re-queue events that failed to send
+        # Re-queue events that failed to send.  Prepend so they are sent
+        # before newer events; deque.extendleft reverses order so we reverse
+        # the list first.
         with self._lock:
-            self._pending_events = events_to_send + self._pending_events
+            for event in reversed(events_to_send):
+                self._pending_events.appendleft(event)
 
         return False

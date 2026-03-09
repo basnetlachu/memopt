@@ -322,9 +322,20 @@ def _plan_tier(plan: Any) -> str:
     return "+".join(parts) if parts else "none"
 
 
+import os as _os
+
+_ALLOW_UNSAFE_LOAD: bool = _os.environ.get("MEMOPT_ALLOW_UNSAFE_LOAD") == "1"
+
+
 def load_model_safe(model_path: str, device: Any) -> Any:
     """
     Load a model from disk with actionable error messages on failure.
+
+    Uses weights_only=True by default to prevent arbitrary code execution from
+    pickle deserialization.  To load models with custom architectures that
+    require weights_only=False, set MEMOPT_ALLOW_UNSAFE_LOAD=1 in the
+    environment — a CRITICAL warning is logged at server startup if that flag
+    is set.
 
     Detects three common mistakes and raises ValueError with fix instructions
     instead of letting raw pickle/type errors reach the client:
@@ -334,8 +345,30 @@ def load_model_safe(model_path: str, device: Any) -> Any:
     """
     import torch
 
+    def _load(weights_only: bool) -> Any:
+        return torch.load(model_path, map_location=device, weights_only=weights_only)
+
     try:
-        obj = torch.load(model_path, map_location=device, weights_only=False)
+        try:
+            obj = _load(weights_only=True)
+        except Exception as _exc:
+            # weights_only=True raises TypeError/pickle.UnpicklingError for custom
+            # class pickles or anything that needs arbitrary Python execution.
+            if _ALLOW_UNSAFE_LOAD:
+                log.warning(
+                    "weights_only=True failed for %s (%s). "
+                    "Retrying with weights_only=False because "
+                    "MEMOPT_ALLOW_UNSAFE_LOAD=1 is set — "
+                    "only load files you trust.",
+                    model_path, _exc,
+                )
+                obj = _load(weights_only=False)
+            else:
+                raise ValueError(
+                    f"Model file requires weights_only=False (custom architecture): {_exc}\n"
+                    "To allow unsafe loading set MEMOPT_ALLOW_UNSAFE_LOAD=1 in the "
+                    "server environment.  Only do this for files you trust."
+                ) from _exc
 
         # Detect state_dict: an OrderedDict/dict whose values are all tensors.
         if isinstance(obj, dict) and all(
@@ -646,6 +679,11 @@ app = FastAPI(
 _API_KEY: str = get_or_create_key()
 _api_key_header = APIKeyHeader(name="X-Memopt-API-Key", auto_error=False)
 log.info("memopt API server: key loaded (%s)", mask_key(_API_KEY))
+if _ALLOW_UNSAFE_LOAD:
+    log.critical(
+        "MEMOPT_ALLOW_UNSAFE_LOAD=1 is set — torch.load will deserialize arbitrary "
+        "pickle payloads.  Only load model files you trust."
+    )
 
 
 def verify_api_key(key: str = Security(_api_key_header)) -> str:
