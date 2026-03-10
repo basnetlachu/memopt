@@ -6181,16 +6181,16 @@ self.interceptor.on_suboptimal_kernel = _on_suboptimal
 
 `_post_ebpf_event(detection)` posts to `{control_plane_url}/api/v1/events` with `event_type="ebpf_detection"` and the detection fields as JSON.
 
-### 48.6 Server Availability Notes
+### 48.6 Deployment Requirements
 
-| Requirement | Current server (31.22.104.32) | Status |
-|---|---|---|
-| Linux kernel ≥ 5.8 | 5.15.0-170-generic | ✓ |
-| BCC (python3-bcc) | Not installed | ✗ — /proc fallback runs |
-| Root (uid=0) | uid=0 | ✓ |
-| libcuda.so | `/usr/lib/x86_64-linux-gnu/libcuda.so` | ✓ |
-| /dev/shm | Present (Linux tmpfs) | ✓ |
-| tracefs | Mounted | ✓ |
+| Requirement | Notes |
+|---|---|
+| Linux kernel ≥ 5.8 | Required for eBPF uprobes on CUDA functions |
+| BCC (`python3-bcc`) | Optional — `/proc` + `nvidia-smi` fallback runs without it |
+| Root (`uid=0`) | Required for eBPF path; fallback works as non-root |
+| `libcuda.so` | Must be present (standard on any CUDA-capable node) |
+| `/dev/shm` | Linux tmpfs — used by KernelSwapper for shared memory |
+| `tracefs` | Must be mounted for BCC path |
 
 BCC installation: `apt-get install python3-bcc bpfcc-tools linux-headers-$(uname -r)`
 

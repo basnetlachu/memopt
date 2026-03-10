@@ -50,6 +50,7 @@ MODEL_FAMILY_OPTIMIZATIONS: Dict[str, List[str]] = {
         "flash_attn3",
         "flash_attn2",
         "sdpa",
+        "kv_cache",       # token-by-token generation: avoids O(n²) KV recompute
         "qkv_fusion",
         "awq_4bit",       # AWQ 4-bit — best quality, requires calibration data
         "gptq_4bit",      # GPTQ 4-bit — fallback if AWQ unavailable

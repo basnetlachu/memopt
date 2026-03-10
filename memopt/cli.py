@@ -279,6 +279,59 @@ def _agent_build_sample(model, shape, device):
     return {"input": t}
 
 
+def cmd_certificates(args):
+    """List or inspect optimization certificates."""
+    from memopt.certificates import CertificateStore
+    import time as _time
+
+    store = CertificateStore()
+
+    if args.cert_command == "list":
+        certs = store.list_certs(
+            limit=args.limit,
+            model_name=getattr(args, "model_name", None),
+        )
+        if not certs:
+            print("No certificates found.")
+            return
+        print(f"{'ID':10}  {'Issued':20}  {'Model':20}  {'Type':20}  {'Speedup':>8}  {'Valid':5}")
+        print("-" * 90)
+        for c in certs:
+            ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(c.issued_at))
+            valid = "OK" if store.verify(c) else "FAIL"
+            print(f"{c.certificate_id[:8]:10}  {ts:20}  {c.model_name[:20]:20}  "
+                  f"{c.optimization_type[:20]:20}  {c.speedup_pct:>7.1f}%  {valid:5}")
+
+    elif args.cert_command == "show":
+        cert = store.get(args.id)
+        if cert is None:
+            print(f"Certificate not found: {args.id}")
+            return
+        import json
+        d = cert.as_dict()
+        d["signature_valid"] = store.verify(cert)
+        print(json.dumps(d, indent=2))
+
+    else:
+        print("Usage: memopt certificates list|show")
+
+
+def cmd_serve(args):
+    """Start the memopt serving server (OpenAI-compatible HTTP interface)."""
+    from memopt.serving.server import main as _serve_main
+    import sys
+    # Rebuild sys.argv so argparse inside server.main() sees the right flags
+    argv = ["memopt-serve", "--model", args.model]
+    if args.tokenizer:
+        argv += ["--tokenizer", args.tokenizer]
+    argv += ["--port", str(args.port), "--host", args.host]
+    if args.device:
+        argv += ["--device", args.device]
+    argv += ["--max-batch", str(args.max_batch), "--max-seq", str(args.max_seq)]
+    sys.argv = argv
+    _serve_main()
+
+
 def cmd_control_plane(args):
     """Control plane management."""
     from memopt.control_plane.cli import cmd_start
@@ -495,6 +548,35 @@ def main():
         "--output", "-o", help="Output path for optimized model (default: <model>_optimized.pt)"
     )
     agent_parser.set_defaults(func=cmd_agent)
+
+    # certificates command
+    cert_parser = subparsers.add_parser(
+        "certificates", help="List and inspect optimization certificates"
+    )
+    cert_sub = cert_parser.add_subparsers(dest="cert_command")
+    cert_list = cert_sub.add_parser("list", help="List recent certificates")
+    cert_list.add_argument("--limit", type=int, default=50,
+                           help="Max records to show (default: 50)")
+    cert_list.add_argument("--model", dest="model_name", default=None,
+                           help="Filter by model name")
+    cert_show = cert_sub.add_parser("show", help="Show a single certificate by ID")
+    cert_show.add_argument("id", help="Certificate ID or prefix")
+    cert_parser.set_defaults(func=cmd_certificates, cert_command="list")
+
+    # serve command
+    serve_parser = subparsers.add_parser(
+        "serve", help="Start OpenAI-compatible HTTP serving server"
+    )
+    serve_parser.add_argument("--model",     required=True, help="Path to model file")
+    serve_parser.add_argument("--tokenizer", default=None,  help="HuggingFace tokenizer name/path")
+    serve_parser.add_argument("--port",      type=int, default=8001, help="Port (default: 8001)")
+    serve_parser.add_argument("--host",      default="0.0.0.0", help="Host (default: 0.0.0.0)")
+    serve_parser.add_argument("--device",    default=None, help="Device: cuda or cpu")
+    serve_parser.add_argument("--max-batch", type=int, default=8,    dest="max_batch",
+                              help="Max batch size (default: 8)")
+    serve_parser.add_argument("--max-seq",   type=int, default=2048, dest="max_seq",
+                              help="Max sequence length (default: 2048)")
+    serve_parser.set_defaults(func=cmd_serve)
 
     # control-plane command
     cp_parser = subparsers.add_parser("control-plane", help="Start the memopt control plane server")

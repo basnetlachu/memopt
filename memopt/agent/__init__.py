@@ -10,7 +10,7 @@ Usage:
     # use report.optimized_model for inference
 """
 
-from .optimization_agent import MemoptAgent, AgentReport, AgentRound
+from .optimization_agent import MemoptAgent, AgentReport, AgentRound, Phase2Report
 from .training_agent import (
     TrainingAgent,
     TrainingAgentReport,
@@ -24,6 +24,7 @@ __all__ = [
     "MemoptAgent",
     "AgentReport",
     "AgentRound",
+    "Phase2Report",
     "TrainingAgent",
     "TrainingAgentReport",
     "apply_gradient_checkpointing",

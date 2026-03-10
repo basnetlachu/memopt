@@ -121,6 +121,18 @@ class ZeroTouchDaemon:
         if self.interceptor is not None:
             self._setup_ebpf_callback()
 
+        # Verify Prometheus / node_exporter metrics setup at startup.
+        self._metrics_setup: dict = self._verify_metrics_setup()
+        if not self._metrics_setup["metrics_dir_writable"]:
+            log.warning("Metrics dir not writable — Prometheus export will fail")
+        if not self._metrics_setup["node_exporter_reachable"]:
+            log.info(
+                "node_exporter not reachable on port 9100 — "
+                "Grafana dashboards won't update until node_exporter is running "
+                "with --collector.textfile.directory=%s",
+                self._metrics_setup.get("metrics_dir", "~/.memopt/metrics"),
+            )
+
     # ── Collaborator factory ───────────────────────────────────────────────
 
     def _build_collaborators(self, config: "ZeroTouchConfig") -> Dict:
@@ -232,8 +244,91 @@ class ZeroTouchDaemon:
 
         self.interceptor.on_suboptimal_kernel = _on_suboptimal
 
+    def _verify_metrics_setup(self) -> dict:
+        """
+        Verify that the Prometheus / Grafana metrics pipeline is configured.
+
+        Checks:
+          1. ~/.memopt/metrics/ exists and is writable
+          2. node_exporter is reachable on localhost:9100
+          3. The metrics file is inside a known textfile_collector directory
+             (or in the memopt default path which node_exporter should be
+             configured to read)
+
+        Returns a dict with boolean flags and diagnostic strings so callers
+        can log actionable warnings without raising exceptions.
+        """
+        import socket
+
+        metrics_dir = Path.home() / ".memopt" / "metrics"
+        metrics_file = metrics_dir / "daemon_metrics.prom"
+
+        # 1. Directory writable
+        dir_writable = False
+        try:
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            test_file = metrics_dir / ".write_test"
+            test_file.write_text("ok")
+            test_file.unlink()
+            dir_writable = True
+        except Exception:
+            pass
+
+        # 2. node_exporter reachable on port 9100
+        exporter_reachable = False
+        try:
+            with socket.create_connection(("127.0.0.1", 9100), timeout=1):
+                exporter_reachable = True
+        except (ConnectionRefusedError, OSError):
+            pass
+
+        # 3. Known textfile_collector paths on Linux
+        known_tc_dirs = [
+            Path("/var/lib/node_exporter/textfile_collector"),
+            Path("/etc/node_exporter/textfile"),
+            Path("/run/prometheus"),
+        ]
+        symlinked_or_in_tc = False
+        textfile_collector_path = ""
+        for tc_dir in known_tc_dirs:
+            if tc_dir.exists():
+                textfile_collector_path = str(tc_dir)
+                # Check if metrics file is in (or symlinked from) that dir
+                candidate = tc_dir / "daemon_metrics.prom"
+                if candidate.exists() or (metrics_file.exists() and str(metrics_dir) == str(tc_dir)):
+                    symlinked_or_in_tc = True
+                break
+
+        # Build warning list for log messages
+        warnings: list = []
+        if not dir_writable:
+            warnings.append(f"Metrics dir not writable: {metrics_dir}")
+        if not exporter_reachable:
+            warnings.append(
+                "node_exporter not reachable on 127.0.0.1:9100. "
+                "Start it with: node_exporter "
+                f"--collector.textfile.directory={metrics_dir}"
+            )
+        if exporter_reachable and not symlinked_or_in_tc:
+            warnings.append(
+                f"node_exporter is running but textfile collector may not "
+                f"be reading {metrics_dir}. Configure it with: "
+                f"--collector.textfile.directory={metrics_dir}"
+            )
+
+        return {
+            "metrics_dir":               str(metrics_dir),
+            "metrics_dir_writable":      dir_writable,
+            "node_exporter_reachable":   exporter_reachable,
+            "textfile_collector_path":   textfile_collector_path,
+            "prom_file_visible_to_exporter": symlinked_or_in_tc,
+            "warnings":                  warnings,
+        }
+
     def health_check(self) -> Dict[str, bool]:
         """Return availability of each collaborator (True = initialised)."""
+        # Re-verify metrics setup so health_check reflects current state
+        metrics = self._verify_metrics_setup()
         return {
             "scanner":          self.scanner is not None,
             "inspector":        self.inspector is not None,
@@ -246,6 +341,7 @@ class ZeroTouchDaemon:
             "predictor":        self.predictor is not None,
             "interceptor":      self.interceptor is not None,
             "swapper":          self.swapper is not None,
+            "metrics_export":   metrics["metrics_dir_writable"],
         }
 
     def run(self) -> None:
@@ -770,6 +866,7 @@ class ZeroTouchDaemon:
             "total_optimizations": self.total_optimizations,
             "total_dollar_saved": round(self.total_dollar_saved, 2),
             "auto_apply": self.config.auto_apply,
+            "metrics_setup": self._metrics_setup,
             "recent_events": [
                 {
                     "pid": e.pid,

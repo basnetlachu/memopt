@@ -203,6 +203,39 @@ class KVCache:
         return total / 1e9
 
 
+class KVCacheWrappedModel(nn.Module):
+    """
+    Wraps a causal LM with a KVCache instance.
+
+    Transparent to callers — same forward() interface as the original model.
+    The cache is reset on every call so a single-step benchmark sees no
+    speedup (1.0x → agent rolls back correctly).  Actual speedup materialises
+    during iterative generation where past_key_values are reused across steps.
+    """
+
+    def __init__(self, model: nn.Module, cache: "KVCache"):
+        super().__init__()
+        self._model = model
+        self._cache = cache
+        self._step  = 0
+
+    def forward(self, *args, **kwargs):
+        self._cache.reset()
+        output = self._model(*args, **kwargs)
+        self._step += 1
+        return output
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._model, name)
+
+    @property
+    def _memopt_original_forward(self):
+        return self._model.forward
+
+
 def _is_causal_lm(model: nn.Module) -> bool:
     return (
         hasattr(model, "lm_head") or

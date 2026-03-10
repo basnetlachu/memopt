@@ -244,6 +244,76 @@ def record_event(
     return {"ok": True}
 
 
+def _merge_and_deduplicate_alerts(
+    fleet_drifts: list,
+    legacy: list,
+    window_seconds: float = 60.0,
+) -> list:
+    """
+    Merge FleetIntelligence drift events and AlertStore legacy alerts into a
+    single deduplicated list, newest first.
+
+    Deduplication key: (node_name, pid, severity) where timestamps are within
+    `window_seconds` of each other.  When a duplicate is found the AlertStore
+    record is preferred (it carries more fields: model_family, recommended_action,
+    resolved status, row id for the resolve endpoint).
+
+    Source tagging: each record gets an "_source" field:
+        "fleet"   — from FleetIntelligence drift_events
+        "legacy"  — from AlertStore drift_alerts
+        "merged"  — AlertStore record that superseded a fleet record
+    """
+    # Normalise field names for deduplication
+    def _node(r: dict) -> str:
+        return r.get("node_name", "")
+
+    def _pid(r: dict) -> int:
+        return int(r.get("pid") or 0)
+
+    def _sev(r: dict) -> str:
+        return r.get("severity", "")
+
+    def _ts(r: dict) -> float:
+        # FleetIntelligence uses "detected_at"; AlertStore uses "detection_timestamp"
+        return float(r.get("detected_at") or r.get("detection_timestamp") or 0.0)
+
+    # Tag sources before merging
+    for r in fleet_drifts:
+        r.setdefault("_source", "fleet")
+    for r in legacy:
+        r.setdefault("_source", "legacy")
+
+    # Build dedup map keyed by (node, pid, severity)
+    # For each key keep only one record (prefer legacy over fleet).
+    seen: dict = {}  # key → (timestamp, record)
+
+    def _add(record: dict, prefer_over_fleet: bool = False):
+        key = (_node(record), _pid(record), _sev(record))
+        ts  = _ts(record)
+        if key not in seen:
+            seen[key] = (ts, record)
+            return
+        existing_ts, existing = seen[key]
+        # Consider it the same event if timestamps are within the window
+        if abs(ts - existing_ts) > window_seconds:
+            # Different time → not a duplicate; use a unique key
+            seen[(_node(record), _pid(record), _sev(record), ts)] = (ts, record)
+            return
+        # Same event: prefer legacy (has more fields) over fleet
+        if prefer_over_fleet or existing.get("_source") == "fleet":
+            record["_source"] = "merged"
+            seen[key] = (ts, record)
+
+    for r in fleet_drifts:
+        _add(r, prefer_over_fleet=False)
+    for r in legacy:
+        _add(r, prefer_over_fleet=True)
+
+    merged = [rec for _, rec in seen.values()]
+    merged.sort(key=_ts, reverse=True)
+    return merged
+
+
 @app.get("/api/v1/alerts")
 def list_alerts(
     node_name: Optional[str] = None,
@@ -252,7 +322,8 @@ def list_alerts(
     _: str = Security(verify_api_key),
 ):
     """
-    Return drift alerts from both FleetIntelligence and legacy AlertStore.
+    Return drift alerts from both FleetIntelligence and legacy AlertStore,
+    deduplicated so the same event does not appear twice.
 
     By default returns only unresolved alerts, newest first.
     Pass include_resolved=true to see full history.
@@ -270,31 +341,55 @@ def list_alerts(
     else:
         legacy = alert_store.get_active_alerts(node_name=node_name, severity=severity)
 
-    all_alerts = fleet_drifts + legacy
-    fleet_counts = alert_store.count_active_by_severity()
-    for d in fleet_drifts:
-        sev = d.get("severity", "info")
-        fleet_counts[sev] = fleet_counts.get(sev, 0) + 1
+    all_alerts = _merge_and_deduplicate_alerts(fleet_drifts, legacy)
+
+    # Count active alerts from the deduplicated list
+    active_counts: dict = {"critical": 0, "warning": 0, "info": 0}
+    for a in all_alerts:
+        if not a.get("resolved", False):
+            sev = a.get("severity", "info")
+            active_counts[sev] = active_counts.get(sev, 0) + 1
 
     return {
         "alerts": all_alerts,
         "total": len(all_alerts),
-        "active_counts": {
-            "critical": fleet_counts.get("critical", 0),
-            "warning":  fleet_counts.get("warning", 0),
-            "info":     fleet_counts.get("info", 0),
-        },
+        "active_counts": active_counts,
     }
 
 
 @app.post("/api/v1/alerts/{alert_id}/resolve")
 def resolve_alert(alert_id: int, _: str = Security(verify_api_key)):
     """
-    Mark a drift alert as resolved.
+    Mark a drift alert as resolved in both AlertStore and FleetIntelligence.
 
-    Call after verifying the issue and re-optimizing (or confirming false positive).
+    Clears the matching entry from _fleet.active_drift so that the in-memory
+    drift state is consistent with the persisted resolved flag.
     """
+    # Resolve in AlertStore (persisted)
     alert_store.resolve_alert(alert_id)
+
+    # Also clear from FleetIntelligence in-memory active_drift.
+    # Match by alert_id: fetch the row to get (node_name, pid).
+    try:
+        rows = alert_store.get_all_alerts(limit=500)
+        resolved_row = next((r for r in rows if r.get("id") == alert_id), None)
+        if resolved_row:
+            node = resolved_row.get("node_name", "")
+            pid  = int(resolved_row.get("pid") or 0)
+            # FleetIntelligence keys active_drift by "{node_name}:{gpu_index}"
+            # or just node_name depending on version — clear all matching keys.
+            to_remove = [
+                k for k, v in _fleet.active_drift.items()
+                if (getattr(v, "node_name", None) == node
+                    and getattr(v, "pid", None) == pid)
+                or k.startswith(node + ":")
+            ]
+            for k in to_remove:
+                del _fleet.active_drift[k]
+                log.info("Cleared active_drift key %s after resolve(alert_id=%d)", k, alert_id)
+    except Exception as exc:
+        log.debug("active_drift cleanup failed (non-fatal): %s", exc)
+
     return {"ok": True, "resolved_id": alert_id}
 
 
@@ -667,6 +762,85 @@ async def ebpf_stop_monitoring(
     """Stop monitoring a specific PID."""
     _interceptor.remove_pid(pid)
     return {"status": "stopped", "pid": pid}
+
+
+# ─────────────────────────────────────────────
+# OPTIMIZATION CERTIFICATES
+# ─────────────────────────────────────────────
+
+@app.get("/api/v1/certificates")
+def list_certificates(
+    limit: int = Query(50, le=500),
+    model_name: Optional[str] = None,
+    optimization_type: Optional[str] = None,
+    _: str = Security(verify_api_key),
+):
+    """
+    Return optimization certificates issued by this node (or a shared store).
+
+    Each certificate is a signed audit record for a committed speedup.
+    """
+    from memopt.certificates import CertificateStore
+    store = CertificateStore()
+    certs = store.list_certs(
+        limit=limit,
+        model_name=model_name,
+        optimization_type=optimization_type,
+    )
+    return {
+        "certificates": [c.as_dict() for c in certs],
+        "total": len(certs),
+    }
+
+
+# ─────────────────────────────────────────────
+# SERVING ENGINE REGISTRY
+# ─────────────────────────────────────────────
+
+# In-memory registry: {"{host}:{port}": {host, port, model_path, engine_type, pid, registered_at}}
+_serving_registry: dict = {}
+
+
+class ServingEngineRegistration(BaseModel):
+    host: str
+    port: int
+    model_path: str
+    engine_type: str = "continuous_batching"
+    pid: int = 0
+
+
+@app.get("/api/v1/serving/status")
+def serving_status(_: str = Security(verify_api_key)):
+    """
+    Return all registered serving engines.
+    Engines self-register on startup via POST /api/v1/serving/register.
+    """
+    engines = list(_serving_registry.values())
+    return {
+        "engines": engines,
+        "total": len(engines),
+        "timestamp": time.time(),
+    }
+
+
+@app.post("/api/v1/serving/register", status_code=201)
+def serving_register(body: ServingEngineRegistration):
+    """
+    Register a serving engine.
+    Called by memopt-serve on startup when MEMOPT_CONTROL_PLANE env var is set.
+    No auth required so engines can self-register without pre-sharing keys.
+    """
+    key = f"{body.host}:{body.port}"
+    _serving_registry[key] = {
+        "host":         body.host,
+        "port":         body.port,
+        "model_path":   body.model_path,
+        "engine_type":  body.engine_type,
+        "pid":          body.pid,
+        "registered_at": time.time(),
+    }
+    log.info("Serving engine registered: %s (model=%s)", key, body.model_path)
+    return {"ok": True, "key": key}
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080):

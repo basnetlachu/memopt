@@ -231,7 +231,9 @@ class OptimizationExecutor:
         correctness_rtol: float = 1e-3,
         correctness_atol: float = 1e-5,
         num_warmup: int = 5,
-        num_iterations: int = 10
+        num_iterations: int = 10,
+        model_name: str = "unknown",
+        issue_certificates: bool = True,
     ):
         """
         Args:
@@ -240,12 +242,19 @@ class OptimizationExecutor:
             correctness_atol: Absolute tolerance for correctness check
             num_warmup: Number of warmup iterations
             num_iterations: Number of measurement iterations
+            model_name: Label for issued certificates
+            issue_certificates: If True, persist a certificate for each COMMIT
         """
         self.tolerance_pct = tolerance_pct
         self.correctness_rtol = correctness_rtol
         self.correctness_atol = correctness_atol
         self.num_warmup = num_warmup
         self.num_iterations = num_iterations
+        self.model_name = model_name
+        self.issue_certificates = issue_certificates
+
+        # Lazy certificate store — created on first COMMIT
+        self._cert_store = None
 
         # Lazy import transformation engine
         self._transformation_engine = None
@@ -456,6 +465,25 @@ class OptimizationExecutor:
             success = True
             logger.info(f"{decision}: {speedup_pct:.1f}% speedup achieved")
             # Model stays in optimized state; snapshot not needed.
+            # Issue a signed audit certificate for this committed optimization.
+            if self.issue_certificates:
+                try:
+                    from memopt.certificates import CertificateStore
+                    if self._cert_store is None:
+                        self._cert_store = CertificateStore()
+                    # Build a minimal result-like object for issue()
+                    class _R:
+                        pass
+                    _r = _R()
+                    _r.success = True
+                    _r.optimization_type = opt_type
+                    _r.baseline_time_ms = baseline_time
+                    _r.optimized_time_ms = optimized_time
+                    _r.speedup_pct = speedup_pct
+                    _r.correctness_validated = is_correct
+                    self._cert_store.issue(_r, model_name=self.model_name)
+                except Exception as _cert_exc:
+                    logger.debug("Certificate issuance failed (non-fatal): %s", _cert_exc)
 
         return OptimizationResult(
             success=success,

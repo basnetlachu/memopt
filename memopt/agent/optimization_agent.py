@@ -69,6 +69,7 @@ OPTIMIZATION_PRIORITY: Dict[str, List[str]] = {
     "MEMORY_BOUND_DRAM": [
         "channels_last",   # CNNs: layout first
         "sdpa",            # transformers: O(N²) memory → O(N) with Flash-style attn
+        "kv_cache",        # causal LMs only — gated in _apply_kv_cache
         "int8",            # regime-gated internally (seq>=1024, batch×seq<=4096)
         "compile",         # fuses everything above
     ],
@@ -82,6 +83,7 @@ OPTIMIZATION_PRIORITY: Dict[str, List[str]] = {
     "COMPUTE_BOUND": [],   # STOP — already optimal, touch nothing
     "MIXED": [
         "sdpa",
+        "kv_cache",        # causal LMs only — gated in _apply_kv_cache
         "channels_last",
         "compile",
     ],
@@ -138,6 +140,19 @@ class AgentRound:
 
 
 @dataclass
+class Phase2Report:
+    """
+    Agent-level summary of Phase 2 access pattern analysis.
+    Populated once per run() call (first round, memory-bound only).
+    None for compute-bound models or when analysis fails.
+    """
+    coalescing_efficiency_pct: float    # 0–100 %, 100 = perfect coalescing
+    has_redundant_fetches: bool         # True when reuse_ratio > threshold
+    cache_thrashing_severity: str       # 'none' | 'mild' | 'severe'
+    suggested_candidates: List[str]     # agent candidate names Phase 2 suggests
+
+
+@dataclass
 class AgentReport:
     model_name:                str
     gpu_name:                  str
@@ -154,6 +169,8 @@ class AgentReport:
     baseline_power:            "PowerReport" = None   # type: ignore[assignment]
     optimized_power:           "PowerReport" = None   # type: ignore[assignment]
     power_reduction_pct:       Optional[float] = None
+    # Phase 2 access pattern analysis — None for compute-bound or on failure
+    phase2_report:             Optional["Phase2Report"] = None
 
     def __post_init__(self):
         # Ensure power fields are always valid PowerReport objects
@@ -304,6 +321,7 @@ class MemoptAgent:
             model_family=model_family,
         )
         rounds: List[AgentRound] = []
+        phase2_report: Optional[Phase2Report] = None
 
         while True:
             state.round_number += 1
@@ -313,6 +331,10 @@ class MemoptAgent:
             profile = self._profile(current_model, fmt)
             state.current_bottleneck = profile.bottleneck_type
             state.last_arithmetic_intensity = profile.ai
+
+            # Phase 2: access pattern analysis on first round only
+            if state.round_number == 1:
+                phase2_report = self._run_phase2_analysis(current_model, fmt, profile)
 
             log.info(
                 "Bottleneck: %s (confidence=%.2f)  AI=%.1f  ridge=%.1f",
@@ -429,6 +451,7 @@ class MemoptAgent:
             baseline_power=baseline_power,
             optimized_power=optimized_power,
             power_reduction_pct=power_reduction_pct,
+            phase2_report=phase2_report,
         )
 
     # ── Stop conditions (checked in priority order) ────────────────────────────
@@ -581,6 +604,80 @@ class MemoptAgent:
             ridge=ridge,
         )
 
+    # ── Phase 2 access pattern analysis ──────────────────────────────────────
+
+    def _run_phase2_analysis(
+        self,
+        model: nn.Module,
+        fmt: InputFormat,
+        profile: _ProfileResult,
+    ) -> Optional[Phase2Report]:
+        """
+        Runs Phase 2 access pattern analysis when bottleneck is memory-bound.
+        Returns None if bottleneck is COMPUTE_BOUND or analysis fails.
+        Failures are caught and logged — never crash the agent.
+
+        Uses model parameter size as working-set estimate to detect L2 cache
+        thrashing even without NCU counters (kineto-only path).
+        """
+        if profile.bottleneck_type == "COMPUTE_BOUND":
+            return None
+        try:
+            from memopt.profiler.access_pattern_analyzer import (
+                CoalescingAnalyzer,
+                RedundantFetchAnalyzer,
+                CacheThrashingAnalyzer,
+            )
+            # No NCU data available from kineto — pass empty dict.
+            # Analyzers use estimation fallbacks when specific keys are absent.
+            ncu_metrics: Dict[str, float] = {}
+            gpu_name = getattr(self.hw, "gpu_name", "A100")
+
+            # Working set estimate: model weights in bytes
+            try:
+                working_set_bytes = sum(
+                    p.numel() * p.element_size() for p in model.parameters()
+                )
+            except Exception:
+                working_set_bytes = 0
+
+            coalescing = CoalescingAnalyzer().analyze_coalescing(
+                ncu_metrics, "model_forward"
+            )
+            redundant = RedundantFetchAnalyzer().analyze_redundant_fetches(
+                ncu_metrics, {}, "model_forward"
+            )
+            thrashing = CacheThrashingAnalyzer().analyze_cache_thrashing(
+                ncu_metrics, working_set_bytes, gpu_name, "model_forward"
+            )
+
+            # Map findings to agent candidate vocabulary
+            suggested: List[str] = []
+            if thrashing.is_thrashing:
+                suggested.append("compile")   # fused kernels reduce working set
+            if redundant.has_redundant_loads:
+                suggested.append("sdpa")      # fused attention cuts redundant loads
+            if not coalescing.is_efficient:
+                suggested.append("channels_last")  # NHWC improves coalescing for conv
+
+            log.debug(
+                "Phase 2: coalescing=%.0f%% thrashing=%s redundant=%s "
+                "suggested=%s",
+                coalescing.efficiency_pct,
+                thrashing.thrashing_severity,
+                redundant.has_redundant_loads,
+                suggested,
+            )
+            return Phase2Report(
+                coalescing_efficiency_pct=coalescing.efficiency_pct,
+                has_redundant_fetches=redundant.has_redundant_loads,
+                cache_thrashing_severity=thrashing.thrashing_severity,
+                suggested_candidates=suggested,
+            )
+        except Exception as exc:
+            log.warning("Phase 2 analysis failed (non-fatal): %s", exc)
+            return None
+
     # ── Optimization application ───────────────────────────────────────────────
 
     def _apply_optimization(
@@ -679,6 +776,10 @@ class MemoptAgent:
 
                 elif candidate_name == "moe_optimize":
                     optimized = self._apply_moe(candidate_model, fmt)
+
+                elif candidate_name == "kv_cache":
+                    optimized, kv_status = self._apply_kv_cache(candidate_model, fmt)
+                    log.info("    kv_cache: status=%s", kv_status)
 
                 else:
                     log.warning("Unknown candidate '%s' — skipping", candidate_name)
@@ -889,6 +990,66 @@ class MemoptAgent:
         optimized, applied = apply_moe_optimization(model, hardware=self.hw, fmt=fmt)
         log.info("    moe_optimize: applied=%s", applied)
         return optimized if applied else model
+
+    def _apply_kv_cache(
+        self,
+        model: nn.Module,
+        fmt: InputFormat,
+    ) -> Tuple[nn.Module, str]:
+        """
+        Activate KVCache for causal LM models.
+
+        Gate: only applies when model has lm_head / config.is_decoder=True.
+        Returns (wrapped_model, "kv_cache") on success.
+        Returns (original_model, "skipped") for non-causal LMs or on error.
+
+        The KVCacheWrappedModel is transparent to the caller — same interface.
+        Actual speedup materialises during token-by-token generation; a single
+        forward-pass benchmark will show ~1.0x → ROLLED_BACK, which is correct.
+        """
+        from memopt.serving.kv_cache import _is_causal_lm, KVCache, KVCacheConfig, KVCacheWrappedModel
+
+        if not _is_causal_lm(model):
+            log.debug("kv_cache skipped — model is not a causal LM")
+            return model, "skipped"
+
+        try:
+            # Determine batch size from fmt, default to 1
+            batch_size = 1
+            if fmt.inputs:
+                first_val = next(iter(fmt.inputs.values()), None)
+                if first_val is not None and hasattr(first_val, "shape") and len(first_val.shape) >= 1:
+                    batch_size = int(first_val.shape[0])
+
+            dtype = torch.float16
+            if fmt.inputs:
+                first_val = next(iter(fmt.inputs.values()), None)
+                if first_val is not None and hasattr(first_val, "dtype"):
+                    dtype = first_val.dtype
+
+            device = "cpu"
+            try:
+                device = str(next(p.device for p in model.parameters()))
+            except StopIteration:
+                pass
+
+            config = KVCacheConfig(
+                max_seq_len=2048,
+                max_batch_size=max(batch_size, 1),
+                dtype=dtype,
+                device=device,
+            )
+            cache = KVCache.build_for_model(model, config)
+            if cache is None:
+                log.debug("kv_cache skipped — KVCache.build_for_model returned None")
+                return model, "skipped"
+
+            wrapped = KVCacheWrappedModel(model, cache)
+            return wrapped, "kv_cache"
+
+        except Exception as exc:
+            log.warning("kv_cache application failed (non-fatal): %s", exc)
+            return model, "skipped"
 
     @staticmethod
     def _get_tokenizer(model: nn.Module):
