@@ -23,6 +23,19 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 import threading
 
+# VMM integration — lazy, opt-in; no effect if memopt.vmm is not available
+_vmm = None
+
+def _get_vmm():
+    global _vmm
+    if _vmm is None:
+        try:
+            from memopt.vmm import VMM
+            _vmm = VMM()
+        except Exception:
+            _vmm = False
+    return _vmm if _vmm else None
+
 log = logging.getLogger(__name__)
 
 BLOCK_SIZE = 16  # tokens per block — matches common hardware cache line
@@ -229,7 +242,16 @@ class PagedKVCache:
         """
         Fetch all KV tensors for sequence seq_id.
         Returns (k, v) each (current_len, num_heads, head_dim).
+        Records access with VMM so blocks stay in the hot tier and
+        prefetch learning is updated.
         """
+        vmm = _get_vmm()
+        if vmm is not None:
+            state_lookup = self.sequences.get(seq_id)
+            if state_lookup is not None:
+                block_idx = max(0, state_lookup.current_pos - 1) // BLOCK_SIZE
+                vmm.fetch(seq_id, block_idx)
+
         state = self.sequences[seq_id]
         if state.current_pos == 0:
             empty = torch.zeros(

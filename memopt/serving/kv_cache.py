@@ -5,12 +5,31 @@ Avoids O(n²) recomputation during token-by-token generation.
 
 Works with any transformer that uses attention layers.
 Graceful skip for encoder-only models.
+
+VMM integration (opt-in, lazy):
+    When memopt.vmm is available, block allocation and freeing is routed
+    through the VMM so blocks can spill to DRAM/NVMe under memory pressure.
+    If the VMM is not installed, behaviour is identical to before.
 """
 import torch
 import torch.nn as nn
 import logging
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
+
+# VMM integration — lazy to avoid circular imports and remain opt-in
+_vmm = None
+
+def _get_vmm():
+    """Return the process-level VMM singleton, creating it on first call."""
+    global _vmm
+    if _vmm is None:
+        try:
+            from memopt.vmm import VMM
+            _vmm = VMM()
+        except Exception:
+            _vmm = False   # Mark as unavailable so we don't retry
+    return _vmm if _vmm else None
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +115,8 @@ class KVCache:
     ):
         self.num_layers = num_layers
         self.config = config
+        self._vmm_seq_id: Optional[str] = None
+
         self.entries: List[KVCacheEntry] = [
             KVCacheEntry(
                 config.max_seq_len,
@@ -106,6 +127,15 @@ class KVCache:
             )
             for _ in range(num_layers)
         ]
+
+        # Register each layer slab with the VMM (opt-in, silently skipped if unavailable)
+        vmm = _get_vmm()
+        if vmm is not None:
+            import uuid
+            self._vmm_seq_id = f"kvcache-{uuid.uuid4().hex[:8]}"
+            slab_bytes = num_layers * config.max_seq_len * num_heads * head_dim * 2 * 2
+            vmm.allocate(self._vmm_seq_id, block_index=0, size_bytes=slab_bytes)
+            log.debug("KVCache registered with VMM seq_id=%s (%d bytes)", self._vmm_seq_id, slab_bytes)
 
     @classmethod
     def build_for_model(
@@ -165,6 +195,22 @@ class KVCache:
         """Clear all cached KV tensors. Call before each new sequence."""
         for entry in self.entries:
             entry.reset()
+        # Notify VMM that this slab was accessed (keeps it in the hot tier)
+        vmm = _get_vmm()
+        if vmm is not None and self._vmm_seq_id is not None:
+            vmm.fetch(self._vmm_seq_id, block_index=0)
+
+    def release(self):
+        """
+        Free the VMM slab for this cache instance.
+        Call when the cache is permanently discarded (e.g. request complete).
+        No-op if the VMM is not available.
+        """
+        vmm = _get_vmm()
+        if vmm is not None and self._vmm_seq_id is not None:
+            vmm.free_sequence(self._vmm_seq_id)
+            log.debug("KVCache released VMM seq_id=%s", self._vmm_seq_id)
+            self._vmm_seq_id = None
 
     def get_past_kv(self):
         """

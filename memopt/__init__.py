@@ -46,19 +46,17 @@ Training Optimization:
 
 __version__ = "1.0.0"
 
-# Core API
-from .measurement import BandwidthTracker, BandwidthMeasurement, BandwidthReport
-
-# Training optimization API
+# Core API — guarded so the package can be imported without torch installed
+# (e.g. during testing of torch-free submodules like vmm)
+try:
+    from .measurement import BandwidthTracker, BandwidthMeasurement, BandwidthReport
+except ImportError:
+    BandwidthTracker = None       # type: ignore[assignment,misc]
+    BandwidthMeasurement = None   # type: ignore[assignment,misc]
+    BandwidthReport = None        # type: ignore[assignment,misc]
 
 __all__ = [
-    # Primary API
-    "MemoryCoalescer",
     "BandwidthTracker",
     "BandwidthMeasurement",
     "BandwidthReport",
-    # Training API
-    "optimize_training",
-    "auto_optimize",
-    "TrainingOptimizer",
 ]
