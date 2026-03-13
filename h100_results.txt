@@ -1,0 +1,51 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/memopt
+configfile: pyproject.toml
+collecting ... collected 13 items
+
+memopt/vmm/tests/test_vmm_benchmark.py::test_context_fits_within_tier_capacity 
+  Allocated 32,768 blocks | 4.29 GB
+PASSED
+memopt/vmm/tests/test_vmm_benchmark.py::test_prefetch_hit_rate 
+  Transitions: 63 -> 127
+PASSED
+memopt/vmm/tests/test_vmm_benchmark.py::test_prefetch_window_calibrates 
+  Calibrated prefetch window: 2.554ms
+PASSED
+memopt/vmm/tests/test_vmm_benchmark.py::test_promotion_latency 
+  Fetch latency: 0.118ms
+PASSED
+memopt/vmm/tests/test_vmm_benchmark.py::test_hbm_pressure_and_eviction 
+  HBM: 85.1 GB | Target: 165 blocks (177 GB virtual)
+  Block   0 | HBM: 1.1 GB
+  Block  20 | HBM: 22.5 GB
+  Block  40 | HBM: 44.0 GB
+  Block  60 | HBM: 65.5 GB
+  Block  80 | HBM: 73.0 GB
+  Block 100 | HBM: 66.6 GB
+  Block 120 | HBM: 74.1 GB
+  Block 140 | HBM: 67.6 GB
+  Block 160 | HBM: 75.2 GB
+
+  PASS: HBM=65.5GB DRAM=111.7GB
+  Total virtual: 177 GB allocated across tiers
+PASSED
+memopt/vmm/tests/test_vmm_benchmark.py::test_dma_bandwidth 
+  DMA bandwidth: 25.1 GB/s
+  Transfer time: 42.8ms for 1 GB
+PASSED
+memopt/vmm/tests/test_vmm_benchmark.py::test_prefetch_hides_latency 
+  Cold fetch: 0.588ms
+  Warm fetch: 0.230ms
+  Speedup:    2.6x
+PASSED
+memopt/vmm/tests/test_vmm_smoke.py::test_basic_allocate_fetch_free PASSED
+memopt/vmm/tests/test_vmm_smoke.py::test_stats PASSED
+memopt/vmm/tests/test_vmm_smoke.py::test_prefetch_records_access PASSED
+memopt/vmm/tests/test_vmm_smoke.py::test_multiple_sequences_isolated PASSED
+memopt/vmm/tests/test_vmm_smoke.py::test_fetch_unknown_block_raises PASSED
+memopt/vmm/tests/test_vmm_smoke.py::test_backend_and_tiers_present PASSED
+
+======================== 13 passed in 159.43s (0:02:39) ========================
