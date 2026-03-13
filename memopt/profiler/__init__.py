@@ -86,17 +86,6 @@ from .access_pattern_analyzer import (
 )
 
 # Phase 2: Optimization Synthesis
-from .optimization_synthesis import (
-    Phase2Profiler,
-    Phase2Report,
-    OptimizationCandidateGenerator,
-    OptimizationCandidate as Phase2OptimizationCandidate,
-    OptimizationType as Phase2OptimizationType,
-    ImpactScoreCalculator,
-    ImpactScore,
-    RecommendationFormatter,
-    FormattedRecommendation,
-)
 
 # Legacy imports for backward compatibility
 from .continuous_profiler import (

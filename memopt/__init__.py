@@ -24,9 +24,7 @@ Usage:
     print(f"Bandwidth reduction potential: {stats.bandwidth_reduction:.1f}%")
 
 Phase 3 Auto-Optimization:
-    from memopt.phase3 import AutoOptimizer
 
-    optimizer = AutoOptimizer()
     result = optimizer.optimize(model, inputs)
     print(f"Speedup: {result.speedup_pct:.1f}%")
 
@@ -49,17 +47,13 @@ Training Optimization:
 __version__ = "1.0.0"
 
 # Core API
-from .optimization import MemoryCoalescer, CoalescingConfig, CoalescingStats
 from .measurement import BandwidthTracker, BandwidthMeasurement, BandwidthReport
 
 # Training optimization API
-from .training import optimize_training, auto_optimize, TrainingOptimizer
 
 __all__ = [
     # Primary API
     "MemoryCoalescer",
-    "CoalescingConfig",
-    "CoalescingStats",
     "BandwidthTracker",
     "BandwidthMeasurement",
     "BandwidthReport",

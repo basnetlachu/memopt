@@ -10,11 +10,6 @@ from .input_handler import (
     InputFormat,
 )
 from .hardware_detector import detect_hardware, HardwareProfile
-from .model_type_detector import (
-    detect_model_type,
-    get_applicable_optimizations,
-    MODEL_FAMILY_OPTIMIZATIONS,
-)
 
 __all__ = [
     "load_large_model",

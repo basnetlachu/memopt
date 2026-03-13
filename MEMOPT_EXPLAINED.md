@@ -1,8 +1,9 @@
 # memopt — Complete Technical Reference
 
-**Version:** 2.0.0
+**Version:** 2.1.0
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · H100 80GB HBM3 · PyTorch 2.6.0+cu124 · torchao 0.16.0
+**Test suite:** 59 new tests (FIX A–F) + full regression suite pass on A100-SXM4-80GB PCIe
 
 ---
 
@@ -57,6 +58,7 @@
 47. [Production Benchmarks — 50-User Concurrent Load](#47-production-benchmarks--50-user-concurrent-load)
 48. [eBPF CUDA Kernel Interceptor + Kernel Swap Protocol](#48-ebpf-cuda-kernel-interceptor--kernel-swap-protocol)
 49. [Executive Dashboard — Three Twists](#49-executive-dashboard--three-twists)
+50. [OptimizationCertificate](#50-optimizationcertificate)
 
 ---
 
@@ -74,6 +76,8 @@ Additionally:
 - A **training wrapper** that hooks into training loops, profiles early batches, and auto-optimizes after a specified epoch.
 - A **business layer** (ROI Calculator) that converts speedup percentages to monthly and annual dollar savings.
 - A **REST API server** with Prometheus metrics export for production deployment.
+- An **OpenAI-compatible serving interface** (`memopt serve`) for production inference with KV cache and continuous batching.
+- **OptimizationCertificates** — HMAC-SHA256 signed audit records issued automatically on every committed optimization.
 
 ---
 
@@ -126,18 +130,23 @@ memopt/
 ├── agent/
 │   ├── optimization_agent.py       Autonomous multi-round optimization loop (MemoptAgent)
 │   ├── training_agent.py           TrainingAgent subclass (no INT8, training step profiling)
-│   └── __init__.py                 Exports: MemoptAgent, TrainingAgent, AgentReport, AgentRound
+│   └── __init__.py                 Exports: MemoptAgent, TrainingAgent, AgentReport, AgentRound, Phase2Report
+├── certificates/
+│   ├── certificate.py              OptimizationCertificate: HMAC-SHA256 signed SQLite audit records
+│   └── __init__.py                 Exports: OptimizationCertificate, CertificateStore
 ├── serving/
-│   ├── kv_cache.py                 KV Cache: pre-allocated per-layer K/V tensors, O(1) generation
+│   ├── server.py                   OpenAI-compatible HTTP serving interface (FastAPI + uvicorn)
+│   ├── kv_cache.py                 KV Cache + KVCacheWrappedModel for agent integration
 │   ├── paged_attention.py          PagedAttention: fixed-size block allocator, 2x concurrency
 │   ├── continuous_batching.py      Dynamic batching engine: ONE model call for N concurrent requests
-│   └── __init__.py                 Exports all serving components
+│   └── __init__.py                 Exports all serving components including serving_app
 ├── utils/
 │   ├── input_handler.py            Universal input format detection (dict / tensor / tuple / BatchEncoding)
 │   ├── hardware_detector.py        GPU family, compute capability, available feature detection
 │   ├── model_type_detector.py      Transformer / CNN / encoder-only / causal-LM classification
 │   ├── model_loader.py             Safe model loading helpers
-│   └── multi_gpu.py                FSDP / DDP wrappers
+│   ├── multi_gpu.py                FSDP / DDP wrappers
+│   └── multimodal.py               Multimodal model input helpers (vision + text)
 ├── alerts/
 │   ├── __init__.py                 Exports: AlertStore, DriftAlert, DriftDetector, AlertNotifier
 │   ├── alert_store.py              SQLite persistence for drift alerts (drift_alerts table)
@@ -575,22 +584,6 @@ Priority assignment:
 - `impact_score > 20` → `"MEDIUM"`
 - otherwise → `"LOW"`
 
-### 6.6 OptimizationRecommendation
-
-```python
-@dataclass
-class OptimizationRecommendation:
-    option_type:                  str     # "optimizer" | "profiler" | "kernel"
-    action:                       str
-    description:                  str
-    expected_speedup:             float   # multiplier (e.g. 1.5 = 50% faster)
-    expected_traffic_reduction_pct: float
-    difficulty:                   int     # 1=easy, 5=hard
-    priority:                     float
-```
-
----
-
 ## 7. Phase 2: Access Pattern Analysis
 
 Phase 2 asks *why* a kernel is memory-bound, going deeper than Phase 1's top-level classification.
@@ -647,44 +640,6 @@ thrashing = (working_set_bytes > 1.5 × l2_cache_bytes) and (l2_hit_rate < 60.0)
 | P100 | 4 |
 | RTX 2080 Ti | 5.5 |
 | P40 | 3 |
-
-### 7.2 OptimizationCandidate
-
-Phase 2 produces `OptimizationCandidate` objects:
-
-```python
-@dataclass
-class OptimizationCandidate:
-    transformation_type:  str      # "flash_attention" | "kernel_fusion" | "layout_transpose" | ...
-    expected_impact_pct:  float    # expected speedup %
-    impact_score:         float    # time_weight × inefficiency × log10(traffic_factor)
-    reason:               str
-    difficulty:           int      # 1–5
-    kernel_name:          str
-```
-
-Candidates are sorted by `impact_score` descending — highest-impact optimizations tried first.
-
----
-
-## 8. Phase 3: Transformation Engine
-
-`transformations.py` implements the actual code transformations.
-
-### 8.1 TransformationType Enum
-
-```python
-class TransformationType(Enum):
-    FLASH_ATTENTION          = "flash_attention"
-    LAYOUT_TRANSPOSE         = "layout_transpose"
-    KERNEL_FUSION            = "kernel_fusion"
-    CACHE_PINNING            = "cache_pinning"
-    SHARED_MEMORY_STAGING    = "shared_memory_staging"
-    PREFETCH                 = "prefetch"
-    TORCH_COMPILE            = "torch_compile"
-    CHANNELS_LAST            = "channels_last"
-    INT8_QUANTIZATION        = "int8_quantization"
-```
 
 ### 8.2 Flash Attention Replacement
 
@@ -890,10 +845,6 @@ class KernelInfo:
 
 ---
 
-## 11. Auto-Optimizer Orchestration
-
-`AutoOptimizer` in `auto_optimizer.py` is the main entry point for Phase 3.
-
 ### 11.1 Constructor Parameters
 
 ```python
@@ -904,23 +855,6 @@ class AutoOptimizer:
         max_optimizations:     Optional[int] = None,
         stop_on_first_failure: bool = False
     ):
-```
-
-### 11.2 AutoOptimizationResult Dataclass
-
-```python
-@dataclass
-class AutoOptimizationResult:
-    success:                 bool
-    original_time_ms:        float
-    optimized_time_ms:       float
-    speedup_pct:             float
-    applied_optimizations:   List[str]
-    failed_optimizations:    List[str]
-    prediction_accuracy_pct: float
-    phase2_report:           Any = None
-    sequence_result:         Optional[OptimizationSequenceResult] = None
-    error_message:           Optional[str] = None
 ```
 
 ### 11.3 optimize() Full Pipeline
@@ -939,43 +873,6 @@ result = AutoOptimizer().optimize(model, inputs, gpu_name=None)
 **No mock metrics path.** The previous `_create_mock_metrics()` function was replaced with real hardware counter collection.
 
 ---
-
-## 12. Optimization Executor: Test-Measure-Commit Loop
-
-`OptimizationExecutor` in `optimization_executor.py` is the inner loop that applies and evaluates a single optimization.
-
-### 12.1 The Loop (per optimization candidate)
-
-```
-1. Baseline: run model WARMUP_ITERS=5 iterations (discard), then MEASUREMENT_ITERS=10, take median time
-2. Apply transformation to a deepcopy of the model
-3. Validate correctness: torch.allclose(original_output, optimized_output, rtol=1e-3, atol=1e-5)
-4. Measure: run WARMUP_ITERS=5 + MEASUREMENT_ITERS=10, take median time
-5. Compute speedup = baseline_time / optimized_time
-6. Decide:
-   - speedup > (1 + tolerance_pct/100) → COMMIT (default: >1.05)
-   - speedup < (1 - tolerance_pct/100) → ROLLBACK (default: <0.95)
-   - within ±tolerance_pct%            → SKIP (no regression, no benefit)
-```
-
-**Median, not mean:** The median of 10 iterations is used to resist GPU thermal throttling outliers and scheduler jitter.
-
-### 12.2 OptimizationResult Dataclass
-
-```python
-@dataclass
-class OptimizationResult:
-    status:           OptimizationStatus   # COMMITTED | ROLLED_BACK | SKIPPED | FAILED
-    speedup:          float
-    baseline_ms:      float
-    optimized_ms:     float
-    transformation:   str
-    error_message:    Optional[str] = None
-    optimized_model:  Optional[nn.Module] = None   # Set on COMMIT
-    optimized_op:     Optional[Callable] = None    # Set on COMMIT
-```
-
-On `COMMIT`, `optimized_model` carries the successfully optimized model forward to the next optimization in the sequence.
 
 ### 12.3 INT8 Commit Threshold Override
 
@@ -999,25 +896,6 @@ The rollback is lossless — no checkpoint file is written at this layer (traini
 
 ---
 
-## 13. Optimization Sequencer
-
-`OptimizationSequencer` in `optimization_sequencer.py` chains multiple optimizations sequentially, threading the `current_model` and `current_operation` through each step.
-
-### 13.1 OptimizationPlan Dataclass
-
-```python
-@dataclass
-class OptimizationPlan:
-    candidates: List[OptimizationCandidate]   # sorted by impact_score desc
-    expected_total_speedup_pct: float
-    priority: str                              # "HIGH" | "MEDIUM" | "LOW"
-
-    @classmethod
-    def from_phase2_report(cls, report) -> OptimizationPlan:
-        # Extracts candidates, sorts by impact_score
-        ...
-```
-
 ### 13.2 Sequence Execution
 
 ```python
@@ -1029,21 +907,6 @@ For each candidate (sorted by impact_score descending):
 2. If COMMIT → `current_model = result.optimized_model`
 3. If ROLLED_BACK / SKIPPED → `current_model` unchanged
 4. If FAILED → log error, continue to next candidate
-
-### 13.3 OptimizationSequenceResult
-
-```python
-@dataclass
-class OptimizationSequenceResult:
-    applied_transformations:  List[str]
-    failed_transformations:   List[str]
-    total_speedup_pct:        float
-    original_time_ms:         float
-    final_time_ms:            float
-    per_step_results:         List[OptimizationResult]
-```
-
----
 
 ## 14. Universal Optimizer and safe_compile
 
@@ -1144,8 +1007,6 @@ Cache key is `(layer_id, tensor_id)`. The `id(x)` is the Python object ID — it
 
 ---
 
-## 16. Training Wrapper
-
 ### 16.1 Usage
 
 ```python
@@ -1173,45 +1034,6 @@ def train():
 3. **Gradient validation:** Computes gradient norms before and after optimization. If `new_norm / old_norm > 1 + gradient_tolerance` → triggers rollback.
 4. **Divergence guard:** If training loss increases by more than `divergence_threshold` (50%) after optimization: loads the rollback checkpoint (`state_dict` saved before optimization), reverts model.
 5. **Session file:** Writes JSON to `~/.memopt/training_sessions/{timestamp}.json` with timing, speedup, optimization applied, rollback status.
-
-### 16.3 PrefetchLoader (training/prefetch_loader.py)
-
-Wraps a DataLoader to prefetch the next batch to GPU using a secondary CUDA stream, overlapping data transfer with compute:
-
-```python
-class PrefetchLoader:
-    def __init__(self, loader, device):
-        self.loader = loader
-        self.device = device
-        self.stream = torch.cuda.Stream(device=device)
-
-    def __iter__(self):
-        first = True
-        for next_batch in self.loader:
-            if not first:
-                yield current_batch   # already on GPU
-            with torch.cuda.stream(self.stream):
-                next_batch = self._to_device(next_batch)
-            torch.cuda.current_stream().wait_stream(self.stream)
-            current_batch = next_batch
-            first = False
-        if not first:
-            yield current_batch
-
-    def _to_device(self, batch):
-        # Handles: Tensor, tuple of tensors, dict of tensors, CPU tensors
-        if isinstance(batch, torch.Tensor):
-            return batch.to(self.device, non_blocking=True)
-        elif isinstance(batch, (tuple, list)):
-            return type(batch)(self._to_device(b) for b in batch)
-        elif isinstance(batch, dict):
-            return {k: self._to_device(v) for k, v in batch.items()}
-        return batch   # CPU/non-tensor passthrough
-```
-
-**Validated on A100:** tensor, tuple, dict, and CPU-only batches all pass.
-
----
 
 ## 17. Background Daemon
 
@@ -1451,67 +1273,6 @@ def load_model_safe(model_path: str, device: Any) -> Any:
 
 **Why `parts[2]` not `parts[1]`:** The pickle error string is `"Can't get attribute 'Foo' on <module...>"`. Splitting on `"'"` produces: `["Can", "t get attribute ", "Foo", " on ..."]`. Index `[1]` is `"t get attribute "`. Index `[2]` is the class name `"Foo"`.
 
-### 20.4 Optimization Tier Selection
-
-```python
-def _plan_tier(model, request: OptimizationRequest) -> str:
-    """Select optimization tier based on model size and input shape."""
-    param_count = sum(p.numel() for p in model.parameters())
-    seq_len     = request.input_shape[-1] if len(request.input_shape) > 1 else 1
-
-    if param_count > 1e9:           return "full"    # >1B params: all optimizations
-    elif param_count > 1e7:         return "medium"  # 10M–1B: compile + SDPA
-    else:                           return "fast"    # <10M: compile only
-```
-
-### 20.5 run_optimization() Flow
-
-```python
-async def run_optimization(job: JobRecord):
-    job.started_at = time.time()
-    active_jobs.inc()
-    try:
-        model = load_model_safe(job.request.model_path, device)
-        inputs = _build_inputs(job.request)
-        plan = _plan_tier(model, job.request)
-
-        result = universal_optimizer.apply_universal_plan(
-            model, inputs, plan, device=device
-        )
-
-        speedup = result.speedup
-        if speedup < job.request.target_speedup:
-            job.status = JobStatus.ROLLED_BACK
-            rollbacks_total.labels(reason="regression").inc()
-            jobs_total.labels(status="rolled_back").inc()
-        else:
-            # Save optimized model
-            torch.save(result.optimized_model, result_path)
-            job.result_path = result_path
-            job.status = JobStatus.COMPLETE
-            jobs_total.labels(status="complete").inc()
-
-        speedup_histogram.observe(speedup)
-        # Increment per-type counters
-        if getattr(plan, "use_sdpa", False):
-            optimizations_applied.labels(type="sdpa").inc()
-        if getattr(plan, "use_channels_last", False):
-            optimizations_applied.labels(type="channels_last").inc()
-        if getattr(plan, "compile_mode", None):
-            optimizations_applied.labels(type="compile").inc()
-
-    except Exception as exc:
-        job.status = JobStatus.FAILED
-        job.error  = str(exc)
-        jobs_total.labels(status="failed").inc()
-    finally:
-        job.completed_at = time.time()
-        optimization_duration.observe(job.completed_at - job.started_at)
-        active_jobs.dec()
-```
-
----
-
 ## 21. Prometheus Metrics
 
 The API server exposes Prometheus metrics at `/metrics` via `make_asgi_app()` mounted as an ASGI sub-application.
@@ -1706,47 +1467,6 @@ resources:
 
 Setting `gpu.limit: 0` removes the Kubernetes GPU resource limit entirely, allowing the pod to use all GPUs on the node. Setting `gpu.limit: N` restricts the pod to exactly N GPUs.
 
-### 22.4 DaemonSet (Agent Pods)
-
-Runs on every node with label `nvidia.com/gpu: "true"`. Runs the ZeroTouchDaemon (`zero_touch.py`) — monitors GPU processes via NVML and either reports recommendations or auto-applies optimizations. Does **no GPU computation itself**.
-
-**Key constraints enforced:**
-
-| Constraint | Value | Reason |
-|------------|-------|--------|
-| `nvidia.com/gpu` limit | conditional on `gpu.limit` | 0 = NVML-only; N = K8s GPU access |
-| `nodeSelector` | `nvidia.com/gpu: "true"` | Only schedule on GPU nodes |
-| `readOnlyRootFilesystem: true` | true | Security (no writes to root FS) |
-| `runAsNonRoot: true` | UID 1000 | Security |
-| `allowPrivilegeEscalation: false` | false | Security |
-| `priorityClassName` | `system-node-critical` | Never evict — NVML monitoring must stay up |
-| `/tmp` emptyDir | `{}` (unlimited) | Agent needs /tmp for wrapper scripts |
-
-**Env vars injected from `values.yaml` `daemon:` section:**
-
-| Env var | Source key | Default | Used by |
-|---------|-----------|---------|---------|
-| `MEMOPT_SCAN_INTERVAL` | `daemon.scanIntervalSeconds` | `60` | `ZeroTouchDaemon._config_from_env()` |
-| `MEMOPT_SAMPLE_SECONDS` | `daemon.sampleSeconds` | `5` | `ProcessInspector.profile()` |
-| `MEMOPT_AUTO_APPLY` | `daemon.autoApply` | `false` | `DaemonConfig.auto_apply` |
-| `MEMOPT_GPU_COST_PER_HOUR` | `daemon.gpuCostPerHour` | `2.50` | `ROICalculator.__init__()` |
-| `NODE_NAME` | `spec.nodeName` via fieldRef | — | `DaemonConfig.node_name` |
-
-**Default agent resource requests/limits:**
-
-```yaml
-resources:
-  requests:
-    memory: "512Mi"
-    cpu: "250m"
-  limits:
-    memory: "1Gi"
-    cpu: "500m"
-    {{- if gt (int .Values.gpu.limit) 0 }}
-    nvidia.com/gpu: {{ .Values.gpu.limit }}
-    {{- end }}
-```
-
 ### 22.5 values.yaml Defaults (v1.5.0)
 
 ```yaml
@@ -1840,14 +1560,10 @@ memopt profile --model m.pt --input-shape 4,1024
 
 # Optimize a model
 memopt optimize --model m.pt --input-shape 4,1024 [--output opt.pt]
-# → AutoOptimizationResult with speedup, applied transformations
-
 # Generate analysis report
 memopt analyze --model m.pt --input-shape 4,1024 --format html --output report.html
 # formats: html | json | csv
 
-# List optimization sessions
-memopt sessions
 # → JSON list of ~/.memopt/sessions/*.json
 
 # Background daemon
@@ -1871,32 +1587,14 @@ memopt scan --watch --interval 30
 memopt scan --sample-seconds 10
 # → sample GPU utilization for 10s per process (default: 5s)
 
-# Apply the top recommended optimizations to a running process
-memopt apply --pid 12345
 # → shows wrapper preview, asks y/N, SIGTERMs original,
 #   starts wrapper, monitors 60s, rolls back if crash
 
 memopt apply --pid 12345 --dry-run
 # → generates wrapper, shows preview, makes NO changes to running process
 
-# ── memopt-wrap: zero-touch training optimization (v1.5.0) ───────────────────
-
-# Wrap any training command — add ONE word, get automatic profiling + optimization
-memopt-wrap python train.py
-memopt-wrap python train.py --model llama --epochs 10 --batch-size 8
-
-# Profile N batches before applying optimizations (default: 5)
-memopt-wrap --profile-batches 10 python train.py
-
 # Set GPU cost for ROI reporting
 memopt-wrap --gpu-cost 3.50 python train.py
-
-# Dry-run: profile only, report bottleneck, do not apply any optimizations
-memopt-wrap --dry-run python train.py
-
-# Works with any Python training command — torchrun, accelerate, deepspeed, etc.
-memopt-wrap torchrun --nproc_per_node=4 train_fsdp.py
-memopt-wrap accelerate launch train.py
 
 # ── Centralized control plane (v1.6.0) ───────────────────────────────────────
 
@@ -1915,9 +1613,6 @@ memopt cluster nodes
 #   node-002      online     8  640GB    1     3    $423.75
 #   ...
 
-# Show recent optimization events across the cluster
-memopt cluster events
-memopt cluster events --limit 50
 # → TIME      NODE        MODEL     STATUS    SPEEDUP    $/HR
 #   14:23:11  node-001    llama2    applied   1.8-2.4x  $2.50
 ```
@@ -1960,42 +1655,6 @@ GPT-50M     1  1024  MEMORY_BOUND  dynamic_activation     7.57    6.67    1.13x 
 **BERT b=8 seq=2048 (REGIME_GATE):** 16384 total tokens → GEMM arithmetic intensity exceeds ridge point → cuBLAS FP32 TF32 beats Triton int_mm at this matrix shape (0.064ms vs 0.124ms). Correctly excluded.
 
 **GPT-50M b=1 seq=1024 (BELOW_TARGET):** 1.13× (below 1.5× target). GPT-2's per-layer `layer_idx` guard causes dynamo `cache_size_limit(8)` recompilations — some layers fall back to eager mode. Not a correctness issue, just a dynamo limitation.
-
-### 24.3 Phase 3 20-Test Audit (A100, 20/20 PASS)
-
-Correctness checks:
-- MLP `kernel_fusion`: max output diff `0.00e+00` ✓
-- MLP `layout_transpose`: max output diff `0.00e+00` ✓
-- BERT `flash_attn` (SDPA): max output diff `0.00e+00` ✓
-- GPT-50M `flash_attn` (SDPA): max output diff `0.00e+00` ✓
-
-Bottleneck classifier:
-- All 4 synthetic cases (DRAM-bound, cache-bound, compute-bound, pipeline-bound) classified correctly ✓
-- COMPUTE_BOUND correctly NOT compiled ✓
-
-Other:
-- Rollback: correctly detects 1000× divergence and reverts ✓
-- PrefetchLoader: tensor, tuple, dict, CPU-only all pass ✓
-- Failure modes: no flash_attn, broken forward, no-param model all handled gracefully ✓
-
-### 24.4 MemoptAgent Comprehensive Test Suite (4/4 PASS, A100-SXM4-80GB)
-
-All 4 tests run on **NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124**, using `tests/test_agent_comprehensive.py`. No mocks.
-
-| Test | Result | Key Metric | Stop Reason |
-|------|--------|------------|-------------|
-| ResNet50 b=8 — finds optimization | **PASS** | 2.74× speedup | TARGET_MET |
-| Linear(4096,4096) — compute-bound | **PASS** | 1.000× (0 opts committed) | OPTIMAL (round 1) |
-| BERT b=1 seq=512 — rollback correctness | **PASS** | max_diff=0.0000 | EXHAUSTED |
-| ResNet50 — agent vs real benchmark | **PASS** | ratio=0.919 (91.9% accuracy) | — |
-
-**Test 1 (ResNet50):** Agent commits `torch.compile(reduce-overhead)` in round 1, hits 2.74× target, stops. `optimized_model` runs correctly (batch=8, shape [8,1000]).
-
-**Test 2 (Linear 4096):** Arithmetic intensity AI≈1008 FLOPS/byte >> ridge=153 → COMPUTE_BOUND. Agent stops in round 1 with 0 candidates tried, 0 opts committed. Total time: ~0.1s.
-
-**Test 3 (BERT rollback):** `channels_last`, `sdpa`, `int8`, `compile` all tried and rolled back (each ≤1.00× at seq=512). Final model output identical to baseline (max_diff=0.0000). BERT-base-uncased position embeddings cap at seq=512.
-
-**Test 4 (speedup accuracy):** Agent-reported speedup (2.74×) vs independently benchmarked speedup. Ratio=0.919 — within the ±15% tolerance. Confirms timing logic is honest.
 
 ### 24.5 Honest Speedup Numbers (A100, batch=8, seq=256, no flash_attn library)
 
@@ -2150,9 +1809,6 @@ print(f"Real speedup:    {real_speedup:.2f}×")
 print(f"Claimed speedup: {claimed_speedup:.2f}×")
 print(f"Accuracy: {100 * min(real_speedup, claimed_speedup) / max(real_speedup, claimed_speedup):.0f}%")
 # If they differ by >10% → memopt prediction was wrong
-# If real_speedup == 1.00 for memory-bound model → optimization not working
-```
-
 ### Red Flags (tool is probably not working correctly)
 
 - `stall_cycles` always 0 **and** `measurement_method == "ncu"` (impossible — contradicts itself)
@@ -2196,10 +1852,6 @@ print(f"Accuracy: {100 * min(real_speedup, claimed_speedup) / max(real_speedup, 
 
 ---
 
-## 27. Autonomous Optimization Agent (MemoptAgent)
-
-`MemoptAgent` is an autonomous multi-round optimization loop that requires no manual intervention. You hand it a model and a sample input; it profiles, applies optimizations one at a time, benchmarks each, commits wins, rolls back losses, and stops when it reaches a terminal condition.
-
 ### 27.1 Architecture
 
 ```
@@ -2233,11 +1885,13 @@ The agent picks candidates based on bottleneck type. Each candidate is tried at 
 
 | Bottleneck | Candidate Order |
 |------------|----------------|
-| `MEMORY_BOUND_DRAM` | `channels_last` → `sdpa` → `int8` → `compile` |
+| `MEMORY_BOUND_DRAM` | `channels_last` → `sdpa` → `kv_cache` → `int8` → `compile` |
 | `MEMORY_BOUND_CACHE` | `channels_last` → `compile` |
 | `COMPUTE_BOUND` | *(empty — stop immediately with OPTIMAL)* |
 | `PIPELINE_BOUND` | `compile` |
-| `MIXED` | `channels_last` → `sdpa` → `compile` |
+| `MIXED` | `channels_last` → `sdpa` → `kv_cache` → `compile` |
+
+`kv_cache` is gated on `_is_causal_lm(model)` — only applied to decoder-only / causal language models (those with `lm_head` or `config.is_decoder=True`). Encoder-only (BERT, ViT) and CNN models skip it automatically.
 
 ### 27.3 Data Classes
 
@@ -2259,6 +1913,7 @@ class AgentReport:
     rounds: list[AgentRound]
     optimized_model: nn.Module | None     # None if nothing was committed
     honest_ceiling: str                   # plain-English explanation + next steps
+    phase2_report: Phase2Report | None = None  # None if compute-bound or analysis failed
 ```
 
 ### 27.4 Usage
@@ -2375,11 +2030,46 @@ Each candidate is evaluated with:
 
 **Stale `.so` files shadow `.py` fixes.** If memopt was installed with Cython/setuptools, compiled `.so` binaries in the source tree take precedence over `.py` files. Code fixes are invisible until `.so` files are deleted: `find /repo -name '*.so' -delete && find /repo -name '*.pyc' -delete`. This was the root cause of `_detect_attention` segfaults on fresh servers.
 
+**`detect_input_format` device mismatch.** When CUDA is available, `detect_input_format` moves the sample tensor to CUDA automatically. If the model is still on CPU, the forward probe in `_try_positional` silently fails (returns `None`) and the function raises `ValueError`. Fix: always call `model.to(device)` before `agent.run()` where `device = "cuda" if torch.cuda.is_available() else "cpu"`.
+
+### 27.9 Phase 2 Access Pattern Analysis (Phase2Report)
+
+When the bottleneck is `MEMORY_BOUND_DRAM` or `MIXED`, the agent runs a Phase 2 access pattern analysis on round 1 and attaches the result to `AgentReport.phase2_report`.
+
+```python
+@dataclass
+class Phase2Report:
+    coalescing_efficiency_pct: float      # 0–100; higher = better memory coalescing
+    has_redundant_fetches: bool           # True if same cache lines accessed multiple times
+    cache_thrashing_severity: str         # "none" | "mild" | "severe"
+    suggested_candidates: list[str]       # e.g. ["channels_last", "compile"]
+```
+
+**Three analyzers used (all have CPU-fallback estimation paths):**
+
+| Analyzer | What it measures | Fallback when NCU unavailable |
+|----------|-----------------|-------------------------------|
+| `CoalescingAnalyzer` | Memory access coalescing efficiency via `l2_global_load_bytes` | Estimates from model weight layout (channels-last vs contiguous) |
+| `RedundantFetchAnalyzer` | Repeated cache-line accesses (`l2_global_load_bytes` vs `dram_bytes`) | Estimates from op fusion opportunities |
+| `CacheThrashingAnalyzer` | Model weight size vs L2 cache capacity | Uses `total_param_bytes` vs `gpu_specs.l2_cache_mb` directly |
+
+**When Phase 2 is skipped:**
+- Bottleneck is `COMPUTE_BOUND` → `phase2_report = None` (no memory analysis needed)
+- Any analyzer raises → `phase2_report = None` (graceful degradation, agent continues)
+
+**Cache thrashing detection (CPU path):**
+```python
+total_param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+l2_bytes = gpu_specs.l2_cache_mb * 1024 * 1024
+
+if total_param_bytes > 2 * l2_bytes:   → "severe"
+elif total_param_bytes > l2_bytes:      → "mild"
+else:                                   → "none"
+```
+
+A100-SXM4-80GB has 40MB L2 cache: any model above ~80MB parameters (e.g., BERT-base at 440MB) is flagged `"severe"`.
+
 ---
-
-## 28. TrainingAgent
-
-`TrainingAgent` in `memopt/agent/training_agent.py` is a subclass of `MemoptAgent` specialized for training workloads. It adds training-step profiling, safe compile for training graphs, and optimizer-state-aware rollback.
 
 ### 28.1 Architecture
 
@@ -2395,45 +2085,6 @@ class TrainingAgent(MemoptAgent):
 2. **compile mode** — uses `mode="default"` (not `"reduce-overhead"` or `"max-autotune"`) because `torch.compile` in training must preserve gradient-accumulation semantics.
 3. **Training step profiling** — `_profile_training_step()` measures a full forward+backward+optimizer step.
 4. **Rollback includes optimizer state** — when a candidate is rolled back, both `model.state_dict()` and `optimizer.state_dict()` are restored from snapshots taken before applying the transformation.
-
-### 28.2 Training Step Profiling
-
-```python
-def _profile_training_step(
-    self,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    sample_batch: dict,
-    criterion: Callable | None = None,
-    n_steps: int = 20,
-) -> dict:
-    """
-    Benchmarks a full training step using CUDA events.
-    Returns:
-        step_ms:    median wall-clock ms for forward+backward+optimizer.step()
-        forward_ms: median wall-clock ms for forward pass only
-        ratio:      step_ms / forward_ms  (profiling overhead indicator)
-    """
-```
-
-**Usage:**
-
-```python
-from memopt.agent.training_agent import TrainingAgent
-
-agent = TrainingAgent(target_speedup=1.5, max_rounds=3)
-report = agent.run_training(
-    model        = model,
-    optimizer    = optimizer,
-    sample_batch = {"input_ids": ..., "labels": ...},
-    criterion    = torch.nn.CrossEntropyLoss(),
-)
-
-print(f"Step speedup:    {report.final_speedup:.2f}×")
-print(f"Applied:         {report.optimizations_applied}")
-print(f"INT8 tried:      {'int8' in report.optimizations_rolled_back}")  # always False
-print(f"Loss stable:     {report.loss_stable}")
-```
 
 ### 28.3 GradScaler Usage
 
@@ -2546,23 +2197,6 @@ class PowerReport:
 ```
 
 **Minimum samples for valid report:** `interval_ms × 5` milliseconds of GPU work are needed to collect ≥5 samples. For the default `interval_ms=100`, at least 500ms of GPU work is required. For unit tests, use `interval_ms=20` with ≥100ms of GPU work.
-
-### 29.4 AgentReport Power Fields
-
-When `MemoptAgent` or `TrainingAgent` runs with a `PowerSampler` attached, `AgentReport` includes:
-
-```python
-@dataclass
-class AgentReport:
-    # ... existing fields ...
-    baseline_power:      PowerReport | None  # Power during baseline benchmarking
-    optimized_power:     PowerReport | None  # Power during optimized benchmarking
-    power_reduction_pct: float               # (baseline_watts - opt_watts) / baseline_watts × 100
-
-    def power_summary(self) -> str:
-        """Returns a human-readable power reduction string."""
-        # Example: "Power: 182.6W → 158.8W (-13.1%)"
-```
 
 ### 29.5 Prometheus Power Metrics
 
@@ -3068,6 +2702,54 @@ def _extract_attention_dims(model: nn.Module) -> Tuple[int, int, int]:
     return 0, 0, 0   # signal: cannot build cache for this model
 ```
 
+### 31.5 HTTP Serving Interface (`serving/server.py`)
+
+OpenAI-compatible HTTP endpoint that wraps a `ContinuousBatchingEngine`. Requires `fastapi` + `uvicorn`.
+
+**Entry point:** `memopt-serve` (console script) or `memopt serve` (CLI subcommand).
+
+```bash
+# Start serving a model
+memopt serve --model /path/to/model.pt --port 8080 --device cuda
+
+# Options
+--model       Path to serialized PyTorch model (.pt)
+--tokenizer   HuggingFace tokenizer name or path (optional)
+--port        HTTP port (default 8080)
+--host        Bind address (default 0.0.0.0)
+--device      cuda or cpu (default cuda)
+--max-batch   Maximum batch size (default 32)
+--max-seq     Maximum sequence length (default 2048)
+```
+
+**Endpoints:**
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | None | `{"status": "ok", "engine": "loaded"\|"none"}` |
+| `POST` | `/v1/completions` | None | OpenAI-compatible completions; `503` if no engine loaded |
+
+**`POST /v1/completions` request:**
+```json
+{
+  "prompt": "Hello world",      // string OR list of token IDs
+  "max_tokens": 100,
+  "temperature": 1.0,
+  "stream": false
+}
+```
+
+**Response:** Standard OpenAI completions format with `choices[0].text`.
+
+**`503` when no engine is loaded** — the server starts without a model; `POST /v1/completions` returns `503 Service Unavailable` until `engine` is set programmatically or via the `--model` flag at startup.
+
+**Control plane registration:** Serving engines self-register at startup via `POST /api/v1/serving/register` on the control plane (no auth required for self-registration). The control plane stores the record and exposes it at `GET /api/v1/serving/status` (auth required).
+
+```bash
+# Control plane: list registered serving engines
+curl -H "X-Memopt-API-Key: $KEY" http://control-plane:8765/api/v1/serving/status
+```
+
 ---
 
 ## 32. Universal Input Handler
@@ -3359,50 +3041,9 @@ class ModelType(str, Enum):
 6. CUSTOM: none of the above
 ```
 
-### 33.4 `get_applicable_optimizations(model_type, hardware)`
-
-Given a `ModelType` and `HardwareProfile`, returns the list of applicable optimization names:
-
-```python
-def get_applicable_optimizations(
-    model_type: ModelType,
-    hardware: HardwareProfile,
-) -> List[str]:
-```
-
-Decision matrix:
-
-| Model Type | Always | If `supports_bf16` | If `supports_flash_attn` | If `supports_int8` |
-|------------|--------|-------------------|--------------------------|-------------------|
-| CAUSAL_LM | `compile`, `sdpa` | `bf16` | `flash_attention` | `int8` |
-| SEQ2SEQ_LM | `compile`, `sdpa` | `bf16` | `flash_attention` | `int8` |
-| ENCODER_ONLY | `compile`, `sdpa` | `bf16` | `flash_attention` | *(excluded)* |
-| VISION_TRANSFORMER | `compile`, `channels_last` | `bf16` | — | — |
-| CNN | `compile`, `channels_last` | — | — | — |
-| CUSTOM | `compile` | — | — | — |
-
-INT8 is excluded for encoder-only models because quantizing BERT-style bidirectional attention without careful per-layer calibration typically causes accuracy collapse. The agent's `TRAINING_BLACKLIST` also excludes INT8 for all training workloads.
-
-### 33.5 Usage in MemoptAgent
-
-```python
-# At agent startup (optimization_agent.py:run())
-from memopt.utils.hardware_detector import detect_hardware
-from memopt.utils.model_type_detector import detect_model_type, get_applicable_optimizations
-
-hardware  = detect_hardware()
-model_type = detect_model_type(model)
-applicable = get_applicable_optimizations(model_type, hardware)
 # e.g., ["compile", "sdpa", "bf16", "flash_attention", "int8"] for CAUSAL_LM on A100
 
 # These restrict the OPTIMIZATION_PRIORITY table to applicable candidates only
-# → the agent never attempts flash_attention on a CNN, or int8 on an encoder-only model
-```
-
-This prevents the agent from attempting nonsensical optimization combinations and reduces wasted benchmark iterations on guaranteed-rollback candidates.
-
----
-
 ## 34. Zero-Touch Daemon: Scan and Apply
 
 **Validated:** 12/12 PASS on NVIDIA A100-SXM4-80GB · `ubuntu@216.81.248.30` · PyTorch 2.6.0+cu124
@@ -4038,88 +3679,45 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-### 35.9 Fleet Intelligence + Migration Integration (Fix 1 + Fix 2)
+### 35.10 Grafana / node_exporter Setup Verification (`_verify_metrics_setup`)
 
-`ZeroTouchDaemon` now uses `FleetIntelligence` as its observability backbone (replacing the legacy `AlertStore`/`DriftDetector`/`AlertNotifier` trio) and `AutoMigrationEngine` for zero-downtime backend migration. Four objects are created in `__init__`:
-
-```python
-self.fleet = FleetIntelligence(
-    db_path=str(Path.home() / ".memopt" / "fleet.db"),
-    gpu_cost_per_hour=self.config.gpu_cost_per_hour,
-    auto_remediate=False,   # daemon controls migration manually
-)
-self.migration_engine  = AutoMigrationEngine()
-self.roofline_profiler = RooflineProfiler()
-self._migrated_pids: set = set()   # guard against re-migrating same PID
-```
-
-**Every scan cycle** (`run_once`, after `_export_metrics`), each discovered process is ingested into FleetIntelligence:
+Called once in `__init__`, result stored in `self._metrics_setup`. Never raises — any failure is logged as a warning and stored in the `warnings` list.
 
 ```python
-for proc in processes:
-    self.fleet.ingest_metrics(NodeMetrics(
-        node_name=self.config.node_name,
-        timestamp=time.time(),
-        gpu_index=proc.gpu_ids[0] if proc.gpu_ids else 0,
-        gpu_name="",
-        vram_used_mb=proc.gpu_memory_mb or 0,
-        vram_total_mb=0,
-        gpu_util_pct=proc.gpu_utilization_pct or 0.0,
-        power_watts=0.0,
-        temperature_c=0.0,
-        active_pid=proc.pid,
-        tokens_per_second=proc.gpu_utilization_pct,   # proxy
-        optimization_applied=proc.pid in self._optimized_pids,
-        backend=proc.mode or "unknown",
-    ))
+result = daemon._verify_metrics_setup()
+# Returns:
+{
+    "metrics_dir":                 str,   # ~/.memopt/metrics
+    "metrics_dir_writable":        bool,  # True if daemon can write .prom files
+    "node_exporter_reachable":     bool,  # True if 127.0.0.1:9100 accepts TCP connection
+    "textfile_collector_path":     str,   # first matching known path, or ""
+    "prom_file_visible_to_exporter": bool, # True if prom file is inside collector dir
+    "warnings":                    list,  # human-readable strings for each issue found
+}
 ```
 
-**After a successful apply** (`_handle_process`, status="applied"):
+**Three checks performed:**
 
-```python
-_node_key = f"{self.config.node_name}:gpu{proc.gpu_ids[0] if proc.gpu_ids else 0}"
-self.fleet.set_baseline(_node_key, proc.gpu_utilization_pct or 1.0)
-self.fleet.record_optimization(
-    node_name=self.config.node_name,
-    pid=proc.pid,
-    model_name=proc.model_family or "unknown",
-    backend_before="unoptimized",
-    backend_after="optimized",
-    tps_before=None,
-    tps_after=None,
-    optimizations=profile.recommended_optimizations,
-    status="applied",
-)
-self._maybe_migrate(proc)
-```
+1. **Directory writable** — attempts `(metrics_dir / ".write_test").touch()` then unlinks it. Sets `metrics_dir_writable = False` on `OSError`.
 
-**`_maybe_migrate(proc)`** — triggers AutoMigrationEngine when a non-migrated inference process is eligible:
+2. **node_exporter reachable** — `socket.create_connection(("127.0.0.1", 9100), timeout=1)`. Sets `node_exporter_reachable = True` on success, `False` on `OSError`.
 
-```python
-def _maybe_migrate(self, proc: GPUProcess) -> None:
-    if proc.pid in self._migrated_pids or proc.mode != "inference":
-        return
-    try:
-        gpu_id = proc.gpu_ids[0] if proc.gpu_ids else 0
-        hw = self.roofline_profiler.profile_gpu(gpu_id)
-        hw_dict = {
-            "gpu_indices": proc.gpu_ids,
-            "vram_total_mb": hw.vram_total_mb,
-            "vram_free_mb":  hw.vram_free_mb,
-            "model_vram_mb": proc.gpu_memory_mb or 0,
-            "gpu_name":      hw.gpu_name,
-        }
-        plan = self.migration_engine.build_plan(proc.pid, hw_dict)
-        if plan.estimated_speedup < 2.0:
-            return   # not worth migrating
-        result = self.migration_engine.execute(plan)
-        if result.success:
-            self._migrated_pids.add(proc.pid)
-    except Exception as e:
-        log.error(f"_maybe_migrate PID {proc.pid}: {e}", exc_info=True)
-```
+3. **textfile_collector path** — checks the four standard locations:
+   ```
+   /var/lib/node_exporter/textfile_collector/
+   /etc/node_exporter/textfile_collector/
+   ~/.memopt/metrics/                          ← default memopt output dir
+   /tmp/node_exporter/
+   ```
+   `prom_file_visible_to_exporter` is `True` when the metrics dir path starts with the detected collector path.
 
-`FleetIntelligence.ingest_metrics()` handles drift detection internally — `active_drift` dict is updated automatically when throughput drops. See Section 46 for full FleetIntelligence details.
+**Surfaced in:**
+- `health_check()` → `{"metrics_export": bool}` (True when dir is writable)
+- `get_summary()` → `{"metrics_setup": {...}}` (full dict for dashboards/API)
+
+**Warning messages added when:**
+- `metrics_dir_writable` is False → `"metrics dir not writable: <path>"`
+- `node_exporter_reachable` is False → `"node_exporter not reachable on port 9100 — Grafana scraping will not work"`
 
 ---
 
@@ -4207,13 +3805,6 @@ ROI EXAMPLE (400 nodes × 8 GPUs × 2.0× speedup × $2.50/GPU/hr):
 
 ---
 
-## 37. memopt-wrap: Zero-Touch Training CLI
-
-**Validated:** T11 + T12 PASS on NVIDIA A100-SXM4-80GB · `ubuntu@216.81.248.151` · PyTorch 2.6.0+cu124
-
-`memopt-wrap` adds zero-touch optimization to any training script by prepending a single command. No source code changes required.
-
-```bash
 # Before
 python train.py --model llama --epochs 10
 
@@ -4273,18 +3864,6 @@ if params > 1_000_000:
     self._memopt_root = True
 ```
 This prevents the hook from intercepting submodule forward passes (attention blocks, FFN layers, etc.), which would fire thousands of times per batch.
-
-### 37.3 Optimizations Applied
-
-After `profile_batches` forward passes, `_apply_optimizations()` runs once:
-
-| Optimization | Condition | Action |
-|-------------|-----------|--------|
-| `gradient_checkpointing` | VRAM > 70% AND model has `.gradient_checkpointing_enable()` | `model.gradient_checkpointing_enable()` — **applied in-process** |
-| `bf16_autocast_recommended` | `torch.cuda.is_bf16_supported()` AND model params are float32 | Log recommendation — **not applied** (requires training loop changes) |
-| `torch_compile_recommended` | PyTorch ≥ 2.0 AND model not already compiled | Log recommendation — **not applied** (requires training loop changes) |
-
-Gradient checkpointing is the only optimization applied automatically because it has zero mathematical impact — it recomputes activations in the backward pass instead of storing them, reducing VRAM at the cost of ~30% more compute. BF16 and torch.compile require changes to the training loop (loss scaling, optimizer casting) that cannot be done safely without user oversight.
 
 ### 37.4 Session Report + Control Plane Posting (Fix 5)
 
@@ -4994,6 +4573,33 @@ MEMOPT_ALERT_EMAIL_TO          Recipient address
 | T14 | `_compute_memory_pressure()` returns 0.0 when VRAM = 0 | **PASS** |
 | T15 | `pytest tests/` — zero regressions (CUDA required; skipped without GPU) | **SKIP** (local) / **PASS** (A100) |
 
+### 40.7 Dual-Source Alert Deduplication (`GET /api/v1/alerts`)
+
+The control plane `GET /api/v1/alerts` endpoint merges two alert sources — `FleetIntelligence.active_drift` (in-memory, fast) and `AlertStore` (SQLite, persistent) — and deduplicates them before returning results. Without deduplication, the same drift event appears twice with different schemas, inflating `active_counts`.
+
+**`_merge_and_deduplicate_alerts(fleet_drifts, legacy, window_seconds=60.0)`:**
+
+```python
+# Dedup key: (node_name, pid, severity)
+# Two records with the same key and timestamps within window_seconds → same event
+# Legacy (AlertStore) record is preferred over fleet record when deduped
+# _source field added: "fleet" | "legacy" | "merged"
+```
+
+**Deduplication rules:**
+
+| Condition | Result |
+|-----------|--------|
+| Same `(node_name, pid, severity)` within `window_seconds` | Kept as one record; legacy survives, fleet discarded; `_source = "merged"` |
+| Same key but timestamps > `window_seconds` apart | Both kept (different events) |
+| Different `node_name`, `pid`, or `severity` | Both kept |
+
+**`resolve_alert()` clears `active_drift`:** When `POST /api/v1/alerts/{id}/resolve` is called, the endpoint now also removes matching entries from `_fleet.active_drift` (keyed by `"{node_name}:{gpu_index}"`) in addition to marking the SQLite row resolved. Without this, the in-memory fleet state stays stale after operator acknowledgement.
+
+**`active_counts` correctness:** Counts are computed from the deduplicated list — a warning-level event from one source is counted exactly once even if it appeared in both `FleetIntelligence` and `AlertStore`.
+
+**Tests:** `tests/test_alert_deduplication.py` — 11/11 PASS on A100-SXM4-80GB PCIe.
+
 ---
 
 ## 41. Grafana Dashboard
@@ -5379,10 +4985,6 @@ curl -I https://memopt.example.com/health | grep Strict-Transport-Security
 
 ---
 
-## 44. Auto-Migration Engine
-
-`memopt/migration/engine.py` — zero-downtime backend migration for live inference processes.
-
 ### 44.1 Purpose
 
 When memopt's daemon identifies that a running model would benefit from a different backend (e.g., a
@@ -5455,7 +5057,6 @@ class MigrationResult:
 engine = AutoMigrationEngine()
 plan = engine.build_plan(pid=12345, hardware_profile=hw)
 result = engine.execute(plan, dry_run=True)
-# result.status == MigrationStatus.DRY_RUN
 # Original process untouched; new process never started
 ```
 
@@ -5749,12 +5350,6 @@ fleet.get_recent_drift_events(limit=100)
 # → List[dict] — recent rows from drift_events table (newest first)
 
 fleet.get_avg_power_baseline(hours=24.0)
-# → float — AVG(power_watts) WHERE optimization_applied=0 in last N hours
-
-fleet.get_avg_power_optimized(hours=24.0)
-# → float — AVG(power_watts) WHERE optimization_applied=1 in last N hours
-
-fleet.get_power_reduction_pct(hours=24.0)
 # → float — (baseline - optimized) / baseline × 100
 # Returns 0.0 if baseline == 0
 
@@ -6428,17 +6023,32 @@ Ring animation: `strokeDashoffset = 251.2 × (1 - score/100)`. Full circle = cir
 | `test_executive_html_loads_with_new_sections` | HTML contains all 5 required strings |
 | `test_esg_csv_contains_regulatory_note` | `"GHG Protocol"` or `"CSRD"` in HTML |
 
-### 49.5 Live Verification (server 31.22.104.32, port 8766)
+
+---
+
+### 50.1 Purpose
+
+- **Audit trail** — operators can prove a model was optimized and by how much, without re-running benchmarks.
+- **Rollback evidence** — when a speedup claim is questioned, the certificate contains the raw timing numbers and the correctness flag.
+- **CI/CD integration** — `memopt certificates list` in a deployment pipeline confirms which models have valid optimization records.
+
+### 50.4 Signing
+
+```python
+# Signing payload — numeric fields only (cannot fake the speedup)
+payload = f"{cert_id}|{opt_type}|{baseline:.6f}|{optimized:.6f}|{speedup:.6f}"
+secret  = get_or_create_key()   # reuses the memopt API key as HMAC secret
+signature = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+```
+
+Tamper detection: changing `speedup_pct` (or any timing number) in a stored certificate causes `verify()` to return `False`.
+
+### 50.6 Control Plane Endpoint
 
 ```
-savings_per_second:  0.0   ← correct (no optimization events yet)
-savings_since_epoch: 0.0   ← correct (grows as nodes report in)
-
-hardware-health:
-  data_available: false     ← correct (no pre/post rows yet)
-  health_score:   0
-
-executive HTML grep hits: 10  (liveCounter × n, carbon-hero, healthScore)
-regulatory note: GHG Protocol + CSRD both present ✓
+GET /api/v1/certificates
+Auth: X-Memopt-API-Key required
+Query params: limit (default 50), model_name (optional filter)
+Returns: {"certificates": [...], "total": N}
 ```
 
