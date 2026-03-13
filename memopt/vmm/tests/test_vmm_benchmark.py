@@ -3,7 +3,7 @@ VMM benchmark — validates the Infinite Context claim on real GPU.
 Run with -s to see numbers:
     pytest memopt/vmm/tests/test_vmm_benchmark.py -v -s
 """
-import math, time, pytest, torch
+import math, time, pytest
 from memopt.vmm import VMM
 
 # Allocation parameters — sized to run in < 2 min on A100
@@ -84,6 +84,10 @@ def test_promotion_latency():
 
 def test_hbm_pressure_and_eviction():
     """Allocates 3x HBM via 1-GB blocks — proves eviction keeps job alive."""
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("torch not installed")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -111,6 +115,10 @@ def test_hbm_pressure_and_eviction():
 
 def test_dma_bandwidth():
     """Measures real HBM<->DRAM DMA bandwidth on dedicated copy stream."""
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("torch not installed")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -137,6 +145,10 @@ def test_dma_bandwidth():
 
 def test_prefetch_hides_latency():
     """Warm (prefetched) fetch must be faster than cold fetch."""
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("torch not installed")
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 

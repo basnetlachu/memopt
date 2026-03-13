@@ -14,11 +14,15 @@ The VMM is opt-in and lazy — nothing here runs at import time beyond
 backend detection, which is free (a few os.path checks + one torch call).
 """
 from __future__ import annotations
+from typing import TYPE_CHECKING, Optional
 from .hal import backend, tiers, tier_names
 from .page_table import PageTable, PageTableEntry
 from .tier_manager import TierManager
 from .prefetch_engine import PrefetchEngine
 from .weight_manager import WeightManager
+
+if TYPE_CHECKING:
+    from memopt.cluster import GKDStore
 
 
 class VMM:
@@ -28,10 +32,11 @@ class VMM:
     Thread-safe: all mutable state is protected by locks inside PageTable.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, gkd: Optional["GKDStore"] = None) -> None:
         self.page_table   = PageTable()
         self.tier_manager = TierManager(self.page_table)
         self.prefetch     = PrefetchEngine(self.tier_manager)
+        self.gkd          = gkd   # None = GKD disabled (backwards compatible)
 
     def allocate(self, sequence_id: str, block_index: int, size_bytes: int) -> PageTableEntry:
         """Allocate a new KV block for a sequence in the hottest available tier."""
@@ -42,6 +47,10 @@ class VMM:
         Return the PageTableEntry for this block, promoting it to the hot tier
         if needed. Records the access for prefetch learning.
         """
+        # TODO Phase 2: GKD lookup — requires serving layer to pass token_ids through
+        # if self.gkd is not None:
+        #     hit = self.gkd.lookup(token_ids, sequence_length)
+        #     if hit: return hit.block_ref
         self.prefetch.record_access(sequence_id, block_index)
         return self.tier_manager.fetch(sequence_id, block_index)
 
