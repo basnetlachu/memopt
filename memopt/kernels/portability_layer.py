@@ -91,19 +91,38 @@ class PortabilityLayer:
 
     def _compile_triton(self, source: str, target: str) -> Optional[types.ModuleType]:
         """
-        Execute the Triton kernel source in a fresh module namespace.
+        Write Triton kernel source to a temp .py file and import it.
 
-        Triton's Python JIT compiles to PTX (NVIDIA) or AMDGCN (AMD)
-        automatically based on the detected device. We just exec() the
-        source — triton.jit decorators do the rest.
+        Triton's @jit decorator requires the decorated functions to live in
+        a real file on disk (it inspects __file__ to locate the source).
+        exec() from a string raises "@jit functions should be defined in a
+        Python file". We work around this by writing to a tempfile and using
+        importlib to load the module from disk.
         """
+        import importlib.util
+        import sys
+        import tempfile
+
         try:
-            import triton  # noqa: F401 — needed in exec namespace
+            import triton  # noqa: F401 — validate triton is installed
 
-            module = types.ModuleType("jit_kernel")
-            module.__dict__["triton"] = triton
+            # Write source to a real .py file on disk
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, prefix="memopt_jit_"
+            ) as f:
+                f.write(source)
+                tmp_path = f.name
 
-            exec(compile(source, "<jit_kernel>", "exec"), module.__dict__)
+            try:
+                spec = importlib.util.spec_from_file_location("jit_kernel", tmp_path)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules["jit_kernel"] = module
+                spec.loader.exec_module(module)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
             if not hasattr(module, "run_kernel"):
                 logger.warning(

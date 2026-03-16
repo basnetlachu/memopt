@@ -204,8 +204,20 @@ class JITGenerator:
                 messages=[{"role": "user", "content": prompt}],
             )
             source = response.content[0].text.strip()
+            # Strip markdown code fences if the model wrapped the code
+            if source.startswith("```"):
+                lines = source.splitlines()
+                # Drop opening fence (```python or ```)
+                lines = lines[1:]
+                # Drop closing fence if present
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                source = "\n".join(lines).strip()
             if not source.startswith("import triton"):
-                logger.warning("JIT: API response did not start with 'import triton'")
+                logger.warning(
+                    "JIT: API response did not start with 'import triton' "
+                    f"(got: {source[:80]!r})"
+                )
                 return None
             return source
 
