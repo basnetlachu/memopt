@@ -15,6 +15,14 @@ No benefit for single-sequence inference.
 Implementation: pure Python block manager.
 No custom CUDA kernels (those would add 2x more speed but
 require C++/CUDA development).
+
+Kernel hooks (Pillar 3):
+  This module is a pure KV block manager — it allocates/frees paged memory
+  blocks and tracks reference counts. It performs no attention computation
+  (no RoPE, no softmax, no layer norm), so there are no hook substitution
+  points here. The fused kernel hooks (apply_rope, apply_layer_norm_residual,
+  apply_scaled_softmax) belong in the model's forward pass, which calls into
+  this cache for storage. See memopt/serving/kernel_hooks.py for hook API.
 """
 import torch
 import torch.nn as nn

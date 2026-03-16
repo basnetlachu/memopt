@@ -21,6 +21,15 @@ Key implementation detail:
 
 This is pure Python asyncio.
 No custom CUDA kernels required.
+
+Kernel hooks (Pillar 3):
+  This module handles request scheduling and batch assembly — it does not
+  perform attention computation directly. The model's forward pass (called
+  via _run_model_step) is where RoPE, layer norm, and softmax execute.
+  To wire fused kernel hooks into inference, apply them inside the model's
+  forward method or wrap the model before passing it to ContinuousBatchingEngine.
+  See memopt/serving/kernel_hooks.py for the apply_rope / apply_layer_norm_residual
+  / apply_scaled_softmax hook API.
 """
 import asyncio
 import torch

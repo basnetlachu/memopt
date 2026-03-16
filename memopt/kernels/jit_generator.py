@@ -153,43 +153,94 @@ class JITGenerator:
 
     def _build_prompt(self, event) -> str:
         """
-        Construct the synthesis prompt from the bottleneck event.
+        Construct an architecture-aware synthesis prompt from the bottleneck event.
 
-        The prompt asks for a fused Triton kernel that eliminates the
-        HBM round trips causing the stall. It specifies:
-          - The op to fuse
-          - Exact input shapes and dtypes
-          - Target hardware and its memory bandwidth
-          - Access pattern (sequential/strided/random)
-          - Correctness requirement: output must match torch reference
-          - Format requirement: return only valid Python/Triton source,
-            no explanation, no markdown fences
+        Calls self._portability.profile() (if available) to inject the correct
+        BLOCK_SIZE, safe tile dimensions, and architecture name so the LLM
+        generates a kernel that compiles and runs correctly on the target hardware.
+
+        For CPU / Apple M (use_triton=False), the prompt requests plain PyTorch
+        ops instead of Triton so TorchCompileStrategy can torch.compile the output.
         """
         shapes_str = ", ".join(str(s) for s in event.input_shapes)
+
+        # ── Gather architecture context ──────────────────────────────
+        hw_profile = None
+        if self._portability is not None:
+            try:
+                hw_profile = self._portability.profile()
+            except Exception:
+                pass
+
+        if hw_profile is not None:
+            arch_name      = hw_profile.arch_name
+            compute_cap    = hw_profile.compute_cap
+            max_block_size = hw_profile.max_block_size
+            safe_tile_m    = hw_profile.safe_tile_m
+            safe_tile_n    = hw_profile.safe_tile_n
+            safe_tile_k    = hw_profile.safe_tile_k
+            use_triton     = hw_profile.use_triton
+        else:
+            arch_name      = "unknown"
+            compute_cap    = ""
+            max_block_size = 64
+            safe_tile_m    = 64
+            safe_tile_n    = 64
+            safe_tile_k    = 32
+            use_triton     = True   # optimistic default
+
+        cap_line = f"Compute capability: sm{compute_cap.replace('.', '')}" if compute_cap else ""
+
+        if use_triton:
+            lang_instructions = textwrap.dedent(f"""
+                Write a fused Triton kernel.
+
+                Architecture constraints (MUST follow to avoid compilation errors):
+                  - Architecture: {arch_name}  {cap_line}
+                  - Maximum safe BLOCK_SIZE: {max_block_size}  (use this or smaller, power-of-2)
+                  - Safe GEMM tile dimensions: M={safe_tile_m}, N={safe_tile_n}, K={safe_tile_k}
+                  - tl.arange arguments MUST be compile-time integer literals — NEVER variables.
+                  - DO NOT use tl.cat, tl.join, or tensor slicing like x[:64].
+                    Instead use SEPARATE tl.load calls for each half of the tensor.
+                  - Embed all tile sizes as integer literals in the source, not as parameters.
+
+                Requirements:
+                1. Fuse load + compute + store into a single kernel pass.
+                   Do not write results back to HBM between stages.
+                2. The kernel output must match the PyTorch reference within
+                   float16 tolerance (atol=1e-3).
+                3. Include a launch wrapper named `run_kernel` that accepts the
+                   same arguments as the original op and returns a torch.Tensor.
+
+                Return only valid Python source code using the Triton library.
+                No explanation. No markdown fences. No comments outside the code.
+                Start directly with `import triton`.
+            """).strip()
+        else:
+            lang_instructions = textwrap.dedent("""
+                Write a fused PyTorch implementation (no Triton — target is CPU or Apple MPS).
+
+                Requirements:
+                1. Use only torch / torch.nn.functional — no triton imports.
+                2. Fuse operations to minimise Python overhead (single expression if possible).
+                3. The output must match the reference within float32 tolerance (atol=1e-5).
+                4. Include a function named `run_kernel` that accepts the same arguments
+                   as the original op and returns a torch.Tensor.
+
+                Return only valid Python source. No markdown fences. No explanation.
+                Start directly with `import torch`.
+            """).strip()
+
         return textwrap.dedent(f"""
-            Write a fused Triton kernel for the following memory-bound operation.
+            {lang_instructions}
 
             Operation: {event.op_name}
             Input shapes: {shapes_str}
             Dtype: {event.dtype}
             Hardware: {event.hardware}
+            Architecture: {arch_name}
             Access pattern: {event.access_pattern}
             Observed HBM stall rate: {event.stall_rate:.1%}
-
-            Requirements:
-            1. Fuse load + compute + store into a single kernel pass.
-               Do not write results back to HBM between stages.
-            2. Use shared memory (tl.load with cache hints) to reduce
-               HBM round trips.
-            3. The kernel output must be numerically identical to the
-               PyTorch reference op within float16 tolerance (atol=1e-3).
-            4. Include a launch wrapper function named `run_kernel` that
-               accepts the same arguments as the original op and returns
-               a torch.Tensor.
-
-            Return only valid Python source code using the Triton library.
-            No explanation. No markdown. No comments outside the code.
-            Start directly with `import triton`.
         """).strip()
 
     def _call_api(self, prompt: str, api_key: str) -> Optional[str]:

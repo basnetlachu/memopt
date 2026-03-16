@@ -263,3 +263,105 @@ def test_end_to_end_no_gpu():
 
         s = detector.stats()
         assert s["total_profiled"] == 1
+
+
+# ── Pillar 3 Hardware-Agnostic: BackendStrategy tests ──────────────────
+
+def test_hardware_profile_detection():
+    """detect_hardware() always returns a valid HardwareProfile."""
+    from memopt.kernels.portability_layer import detect_hardware, HardwareProfile
+    hw = detect_hardware()
+    assert isinstance(hw, HardwareProfile)
+    assert hw.backend in ("triton_cuda", "triton_rocm", "torch_compile", "mlir", "cpu")
+    assert hw.arch_name != ""
+    assert hw.max_block_size >= 16
+    assert hw.safe_tile_m   >= 16
+    assert hw.safe_tile_n   >= 16
+    assert hw.safe_tile_k   >= 16
+    assert isinstance(hw.use_triton, bool)
+
+
+def test_portability_layer_returns_correct_strategy():
+    """
+    PortabilityLayer.profile() returns the same HardwareProfile as detect_hardware().
+    The `target()` shim returns 'cuda', 'rocm', or 'cpu'.
+    """
+    from memopt.kernels.portability_layer import detect_hardware
+    layer = PortabilityLayer()
+    hw    = layer.profile()
+    # profile() returns the pre-detected HardwareProfile
+    assert hw.backend == detect_hardware().backend
+    assert layer.target() in ("cuda", "rocm", "cpu")
+
+
+def test_portability_bad_source_returns_none():
+    """Syntax errors in generated source must not raise — return None."""
+    layer = PortabilityLayer()
+    # Confirmed existing test still passes with new implementation
+    result = layer.compile("this is not valid python!!!", "cuda")
+    assert result is None
+
+
+def test_arch_aware_prompt_contains_block_size():
+    """
+    Architecture-aware _build_prompt injects max_block_size and arch_name
+    from the HardwareProfile so the LLM generates safe kernels.
+    """
+    gen   = JITGenerator(portability=PortabilityLayer())
+    event = BottleneckEvent(
+        op_name="aten::softmax",
+        input_shapes=[[32, 512]],
+        dtype="float16",
+        access_pattern="sequential",
+        stall_rate=0.55,
+        hardware="cuda:A100",
+    )
+    prompt = gen._build_prompt(event)
+    hw     = gen._portability.profile()
+
+    # Prompt must include the architecture name
+    assert hw.arch_name in prompt, \
+        f"Expected arch '{hw.arch_name}' in prompt"
+
+    # Prompt must include the max_block_size value as a literal (Triton path only —
+    # the CPU/MPS path generates plain PyTorch code with no tile size constraints)
+    if hw.use_triton:
+        assert str(hw.max_block_size) in prompt, \
+            f"Expected max_block_size={hw.max_block_size} in prompt"
+
+    # Prompt must still contain the op name and stall rate
+    assert "aten::softmax" in prompt
+    assert "55.0%" in prompt
+
+
+def test_rocm_smoke_test_catches_nan():
+    """
+    TritonROCmStrategy._rocm_smoke_test must reject modules that produce NaN
+    and accept modules that produce finite output.
+    """
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("torch not installed")
+
+    from memopt.kernels.portability_layer import TritonROCmStrategy
+
+    strategy = TritonROCmStrategy()
+
+    # Module that always produces NaN — must be rejected
+    nan_mod = types.ModuleType("nan_kernel")
+    nan_mod.run_kernel = lambda t: torch.full_like(t, float("nan"))
+    assert strategy._rocm_smoke_test(nan_mod) is False, \
+        "Smoke test should reject NaN-producing kernel"
+
+    # Module that produces finite output — must be accepted
+    good_mod = types.ModuleType("good_kernel")
+    good_mod.run_kernel = lambda t: t * 2.0
+    assert strategy._rocm_smoke_test(good_mod) is True, \
+        "Smoke test should accept finite-output kernel"
+
+    # Module that raises during execution — must be rejected (not raise)
+    broken_mod = types.ModuleType("broken_kernel")
+    broken_mod.run_kernel = lambda t: (_ for _ in ()).throw(RuntimeError("oops"))
+    assert strategy._rocm_smoke_test(broken_mod) is False, \
+        "Smoke test should reject kernel that raises"
