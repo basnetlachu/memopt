@@ -135,40 +135,64 @@ def _rope_unfused(xq: torch.Tensor, xk: torch.Tensor,
 
 
 def _make_rope_prompt(seq_len, n_heads, head_dim, dtype, hw) -> str:
-    return f"""
-Write a fused Triton kernel for Rotary Position Embedding (RoPE).
+    half = head_dim // 2
+    return f"""Write a fused Triton kernel for Rotary Position Embedding (RoPE).
 
-The unfused PyTorch path performs 4 separate HBM accesses:
-  1. Read xq, compute rotate_half(xq), write xq_rot
-  2. Read xk, compute rotate_half(xk), write xk_rot
+Tensor shapes (all contiguous, row-major):
+  xq:  [{seq_len}, {n_heads}, {head_dim}]  dtype={dtype}
+  xk:  [{seq_len}, {n_heads}, {head_dim}]  dtype={dtype}
+  cos: [{seq_len}, {head_dim}]              dtype={dtype}  (same for all heads at each position)
+  sin: [{seq_len}, {head_dim}]              dtype={dtype}  (same for all heads at each position)
+  output xq_rot, xk_rot: same shapes as xq, xk
 
-Your kernel must:
-- Accept: xq [seq_len={seq_len}, n_heads={n_heads}, head_dim={head_dim}] contiguous,
-          xk [same shape] contiguous,
-          cos [seq_len, head_dim] (broadcast across all n_heads),
-          sin [seq_len, head_dim] (broadcast across all n_heads)
-- Return: (xq_rot, xk_rot) both shape [seq_len, n_heads, head_dim], dtype={dtype}
-- For each token s and each head h:
-    cos_row = cos[s, :]           # shape [head_dim]
-    sin_row = sin[s, :]           # shape [head_dim] — same for all heads at position s
-    x       = xq[s, h, :]
-    x1, x2  = x[:head_dim//2], x[head_dim//2:]
-    rotate  = cat(-x2, x1)
-    out     = x * cos_row + rotate * sin_row
-- Fuse the rotate_half computation in registers — never write intermediate
-  tensors to HBM
-- Tile over (seq_len * n_heads) rows, BLOCK_SIZE=128 elements per block
-- The run_kernel(xq, xk, cos, sin) function returns (xq_rot, xk_rot)
+The unfused PyTorch reference (what you must match exactly):
+  def rotate_half(x):
+      x1, x2 = x[..., :{half}], x[..., {half}:]
+      return torch.cat((-x2, x1), dim=-1)
+  cos_ = cos.unsqueeze(1)  # [{seq_len}, 1, {head_dim}]
+  sin_ = sin.unsqueeze(1)  # [{seq_len}, 1, {head_dim}]
+  xq_rot = xq * cos_ + rotate_half(xq) * sin_
+  xk_rot = xk * cos_ + rotate_half(xk) * sin_
+
+Kernel design — one threadblock per (token, head) pair:
+  grid = (seq_len * n_heads,)   # {seq_len * n_heads} blocks total
+  pid  = tl.program_id(0)
+  s    = pid // n_heads          # token index
+  h    = pid %  n_heads          # head index
+
+  xq base offset = s * {n_heads * head_dim} + h * {head_dim}
+  cos base offset = s * {head_dim}           # same cos row for all heads at position s
+
+  load  xq_row  = tl.load(xq_ptr  + xq_off  + tl.arange(0, {head_dim}))
+  load  xk_row  = tl.load(xk_ptr  + xk_off  + tl.arange(0, {head_dim}))
+  load  cos_row = tl.load(cos_ptr + cos_off + tl.arange(0, {head_dim}))
+  load  sin_row = tl.load(sin_ptr + sin_off + tl.arange(0, {head_dim}))
+
+  x1_q = xq_row[:{half}];  x2_q = xq_row[{half}:]
+  rot_q = tl.cat(-x2_q, x1_q)
+  xq_out = xq_row * cos_row + rot_q * sin_row
+
+  (same for xk)
+  store xq_rot_ptr + xq_off + tl.arange(0, {head_dim})
+  store xk_rot_ptr + xk_off + tl.arange(0, {head_dim})
+
+CRITICAL Triton constraints:
+- ALL arguments to tl.arange() MUST be Python integer literals, e.g. tl.arange(0, {head_dim})
+  Never pass a runtime variable to tl.arange — use the literal value {head_dim}
+- Use tl.arange(0, {half}) and tl.arange({half}, {head_dim}) for the two halves
+- n_heads ({n_heads}) and head_dim ({head_dim}) are known constants — embed them as literals
+- Do NOT declare HEAD_DIM as a tl.constexpr parameter — embed {head_dim} directly
+- Use tl.cat to concatenate the two halves in registers
 
 Hardware: {hw}
 
-Return only valid Python source starting with `import triton`.
-No explanation. No markdown fences. No comments outside the code.
-The run_kernel function signature must be exactly:
+The run_kernel function must have exactly this signature:
 def run_kernel(xq, xk, cos, sin):
     ...
     return xq_rot, xk_rot
-""".strip()
+
+Return only valid Python source starting with `import triton`.
+No markdown fences. No prose. Code only."""
 
 
 def test_fused_rope():
