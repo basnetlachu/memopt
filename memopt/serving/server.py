@@ -166,6 +166,26 @@ def _build_engine(
     _engine = ContinuousBatchingEngine(model=model, config=config)
     log.info("ContinuousBatchingEngine ready (device=%s)", device)
 
+    # Pillar 3 — auto-optimizer startup
+    try:
+        from memopt.kernels.kernel_cache import KernelCache
+        from memopt.kernels.portability_layer import PortabilityLayer
+        from memopt.kernels.jit_generator import JITGenerator
+        from memopt.serving.auto_optimizer import AutoOptimizer
+        from memopt.serving import kernel_hooks
+
+        _kv_cache    = KernelCache()
+        _portability = PortabilityLayer()
+        _generator   = JITGenerator(cache=_kv_cache, portability=_portability)
+        _optimizer   = AutoOptimizer(generator=_generator, cache=_kv_cache)
+        _optimizer.start()
+        kernel_hooks.init_hooks(cache=_kv_cache, optimizer=_optimizer)
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"Auto-optimizer startup failed: {e} — serving without kernel optimisation"
+        )
+
     # Self-register with control plane if configured
     cp = os.getenv("MEMOPT_CONTROL_PLANE", "")
     if cp and args is not None:
