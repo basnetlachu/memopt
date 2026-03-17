@@ -336,7 +336,11 @@ class MLIRStrategy:
         os.makedirs(out_dir, exist_ok=True)
 
         try:
-            path = os.path.join(out_dir, f"kernel_{int(time.monotonic() * 1000)}.mlir")
+            import uuid
+            path = os.path.join(
+                out_dir,
+                f"kernel_{int(time.monotonic() * 1000)}_{uuid.uuid4().hex[:8]}.mlir"
+            )
             with open(path, "w") as f:
                 f.write(source)
             logger.info(f"MLIR: emitted to {path}")

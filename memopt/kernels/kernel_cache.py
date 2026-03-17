@@ -114,8 +114,13 @@ class KernelCache:
     def _write_to_disk(self, entry: CacheEntry) -> None:
         path = os.path.join(self._dir, f"{entry.key}.json")
         try:
+            data = asdict(entry)
+            # Store hash for integrity verification on load
+            data["source_sha256"] = hashlib.sha256(
+                entry.source.encode()
+            ).hexdigest()
             with open(path, "w") as f:
-                json.dump(asdict(entry), f)
+                json.dump(data, f)
         except Exception as e:
             logger.debug(f"KernelCache: disk write failed: {e}")
 
@@ -129,7 +134,22 @@ class KernelCache:
             try:
                 with open(path) as f:
                     data = json.load(f)
-                entry = CacheEntry(**data)
+                stored_hash = data.pop("source_sha256", None)
+                entry = CacheEntry(**{k: v for k, v in data.items()
+                                      if k in CacheEntry.__dataclass_fields__})
+                if stored_hash and entry.source:
+                    actual_hash = hashlib.sha256(entry.source.encode()).hexdigest()
+                    if actual_hash != stored_hash:
+                        logger.warning(
+                            f"KernelCache: integrity check failed for {fname} "
+                            f"— expected {stored_hash[:16]}... got {actual_hash[:16]}... "
+                            f"Skipping this cache entry."
+                        )
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                        continue
                 if now - entry.created_at > TTL_S:
                     os.remove(path)
                     continue

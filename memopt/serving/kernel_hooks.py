@@ -36,15 +36,24 @@ def _record_fallback(op_name: str) -> None:
     """Increment the fallback counter for op_name. Thread-safe."""
     with _fallback_lock:
         _fallback_counts[op_name] = _fallback_counts.get(op_name, 0) + 1
-    count = _fallback_counts[op_name]
-    # Warn at 1, then every 100 — noisy enough to catch, quiet enough not
-    # to flood logs during a brief edge case window.
+        count = _fallback_counts[op_name]   # read inside lock — no TOCTOU
+
+    # Warning fired outside lock — logging is slow, never hold locks while logging
     if count == 1 or count % 100 == 0:
         logger.warning(
             f"Kernel fallback [{op_name}]: {count} total. "
             f"Fused kernel hit an unexpected tensor layout. "
             f"Check stats()['fallback_counts'] for details."
         )
+
+
+def _log_cache_miss(op_name: str, reason: str) -> None:
+    """
+    Log why a hook fell back to unfused PyTorch.
+    Reasons: 'no_cache' | 'no_module' | 'no_run_kernel' | 'warmup'
+    At debug level — not noisy in production, visible when debugging.
+    """
+    logger.debug(f"Hook fallback [{op_name}]: reason={reason}")
 
 
 def init_hooks(cache, optimizer) -> None:
@@ -82,20 +91,26 @@ def apply_rope(
         )
 
     # Check cache
-    if _cache is not None:
+    if _cache is None:
+        _log_cache_miss("memopt.rope_fused", "no_cache")
+    else:
         from memopt.kernels.kernel_cache import cache_key
         key    = cache_key("memopt.rope_fused",
                            [list(xq.shape), list(xk.shape)],
                            _get_hardware())
         module = _cache.get(key)
-        if module is not None:
-            try:
-                run = getattr(module, "run_kernel", None)
-                if run is not None:
+        if module is None:
+            _log_cache_miss("memopt.rope_fused", "warmup")
+        else:
+            run = getattr(module, "run_kernel", None)
+            if run is None:
+                _log_cache_miss("memopt.rope_fused", "no_run_kernel")
+            else:
+                try:
                     return run(xq, xk, cos, sin)
-            except Exception as e:
-                _record_fallback("memopt.rope_fused")
-                logger.debug(f"RoPE fused kernel error: {e} — falling back")
+                except Exception as e:
+                    _record_fallback("memopt.rope_fused")
+                    logger.debug(f"RoPE fused kernel error: {e} — falling back")
 
     # Unfused fallback
     return _rope_unfused(xq, xk, cos, sin)
@@ -120,20 +135,26 @@ def apply_layer_norm_residual(
             args=(x, residual, weight, bias),
         )
 
-    if _cache is not None:
+    if _cache is None:
+        _log_cache_miss("memopt.ln_residual_fused", "no_cache")
+    else:
         from memopt.kernels.kernel_cache import cache_key
         key    = cache_key("memopt.ln_residual_fused",
                            [list(x.shape), list(residual.shape)],
                            _get_hardware())
         module = _cache.get(key)
-        if module is not None:
-            try:
-                run = getattr(module, "run_kernel", None)
-                if run is not None:
+        if module is None:
+            _log_cache_miss("memopt.ln_residual_fused", "warmup")
+        else:
+            run = getattr(module, "run_kernel", None)
+            if run is None:
+                _log_cache_miss("memopt.ln_residual_fused", "no_run_kernel")
+            else:
+                try:
                     return run(x, residual, weight, bias)
-            except Exception as e:
-                _record_fallback("memopt.ln_residual_fused")
-                logger.debug(f"LN+Residual fused kernel error: {e} — falling back")
+                except Exception as e:
+                    _record_fallback("memopt.ln_residual_fused")
+                    logger.debug(f"LN+Residual fused kernel error: {e} — falling back")
 
     import torch.nn.functional as F
     return F.layer_norm(x + residual, (x.shape[-1],), weight, bias, eps)
@@ -155,20 +176,26 @@ def apply_scaled_softmax(
             args=(scores, scale),
         )
 
-    if _cache is not None:
+    if _cache is None:
+        _log_cache_miss("memopt.scaled_softmax_fused", "no_cache")
+    else:
         from memopt.kernels.kernel_cache import cache_key
         key    = cache_key("memopt.scaled_softmax_fused",
                            [list(scores.shape)],
                            _get_hardware())
         module = _cache.get(key)
-        if module is not None:
-            try:
-                run = getattr(module, "run_kernel", None)
-                if run is not None:
+        if module is None:
+            _log_cache_miss("memopt.scaled_softmax_fused", "warmup")
+        else:
+            run = getattr(module, "run_kernel", None)
+            if run is None:
+                _log_cache_miss("memopt.scaled_softmax_fused", "no_run_kernel")
+            else:
+                try:
                     return run(scores, scale)
-            except Exception as e:
-                _record_fallback("memopt.scaled_softmax_fused")
-                logger.debug(f"Softmax fused kernel error: {e} — falling back")
+                except Exception as e:
+                    _record_fallback("memopt.scaled_softmax_fused")
+                    logger.debug(f"Softmax fused kernel error: {e} — falling back")
 
     import torch.nn.functional as F
     return F.softmax(scores * scale, dim=-1)

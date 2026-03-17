@@ -46,6 +46,12 @@ log = logging.getLogger("memopt.serving.server")
 _engine: Optional[ContinuousBatchingEngine] = None
 _tokenizer = None
 
+# Pillar 3 — module-level references prevent garbage collection
+_p3_kv_cache:    object = None
+_p3_portability: object = None
+_p3_generator:   object = None
+_p3_optimizer:   object = None
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="memopt serving", version="1.0") if _HAS_FASTAPI else None
@@ -174,12 +180,17 @@ def _build_engine(
         from memopt.serving.auto_optimizer import AutoOptimizer
         from memopt.serving import kernel_hooks
 
-        _kv_cache    = KernelCache()
-        _portability = PortabilityLayer()
-        _generator   = JITGenerator(cache=_kv_cache, portability=_portability)
-        _optimizer   = AutoOptimizer(generator=_generator, cache=_kv_cache)
-        _optimizer.start()
-        kernel_hooks.init_hooks(cache=_kv_cache, optimizer=_optimizer)
+        global _p3_kv_cache, _p3_portability, _p3_generator, _p3_optimizer
+        _p3_kv_cache    = KernelCache()
+        _p3_portability = PortabilityLayer()
+        _p3_generator   = JITGenerator(
+            cache=_p3_kv_cache, portability=_p3_portability
+        )
+        _p3_optimizer   = AutoOptimizer(
+            generator=_p3_generator, cache=_p3_kv_cache
+        )
+        _p3_optimizer.start()
+        kernel_hooks.init_hooks(cache=_p3_kv_cache, optimizer=_p3_optimizer)
     except Exception as e:
         import logging as _logging
         _logging.getLogger(__name__).warning(

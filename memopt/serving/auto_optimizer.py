@@ -19,6 +19,7 @@ Thread safety: all internal state is protected by threading.RLock.
 """
 from __future__ import annotations
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 WARM_UP_CALLS    = 50      # calls before triggering synthesis
 SYNTHESIS_GAP_S  = 300.0   # seconds between re-synthesis attempts per op
-STALL_RATE_PROXY = 0.65    # assumed stall rate for hooks (not profiled inline)
+STALL_RATE_PROXY = float(os.environ.get("MEMOPT_STALL_RATE_PROXY", "0.65"))
 
 
 class AutoOptimizer:
@@ -120,16 +121,18 @@ class AutoOptimizer:
         shapes = self._extract_shapes(args)
         dtype  = self._extract_dtype(args)
 
+        # Measure real stall rate if CUDA events are available
+        stall_rate = self._measure_stall_rate(args)
+
         event = BottleneckEvent(
             op_name=op_name,
             input_shapes=shapes,
             dtype=dtype,
             access_pattern="sequential",
-            stall_rate=STALL_RATE_PROXY,
+            stall_rate=stall_rate,
             hardware=hw,
         )
 
-        # Override prompt for known ops
         original_build = self._gen._build_prompt
         self._gen._build_prompt = lambda ev: self._build_prompt(ev)
         try:
@@ -137,42 +140,107 @@ class AutoOptimizer:
         finally:
             self._gen._build_prompt = original_build
 
-        logger.info(f"AutoOptimizer: synthesis fired for {op_name}")
+        logger.info(
+            f"AutoOptimizer: synthesis fired for {op_name} "
+            f"stall_rate={stall_rate:.2f} shapes={shapes}"
+        )
 
-    def _build_prompt(self, event) -> str:
-        """Route to op-specific prompt builders from the validated test suite."""
-        op  = event.op_name
-        s   = event.input_shapes
-        hw  = event.hardware
+    def _measure_stall_rate(self, args: tuple) -> float:
+        """
+        Measure real HBM stall rate using CUDA event timing.
+        Returns STALL_RATE_PROXY if CUDA is unavailable or measurement fails.
 
-        # Import prompt builders from test suite — these are the exact prompts
-        # that produced the validated kernels (RoPE 5.18x, LN 1.30x, SM 1.32x).
-        # Wrapped in try/except because test modules have pytest guards at top level.
+        Method: compare actual elapsed time to the theoretical minimum
+        time based on bytes transferred and peak HBM bandwidth.
+        Gap between ideal and actual is attributed to memory stalls.
+        """
         try:
-            from memopt.kernels.tests.test_pillar3_fused import (
-                _make_rope_prompt,
-                _make_ln_residual_prompt,
-                _make_softmax_scale_prompt,
+            import torch
+            if not torch.cuda.is_available():
+                return STALL_RATE_PROXY
+
+            tensors = [a for a in args if isinstance(a, torch.Tensor)]
+            if not tensors:
+                return STALL_RATE_PROXY
+
+            total_bytes = sum(
+                t.numel() * t.element_size() for t in tensors
             )
+            if total_bytes < 1024:
+                return STALL_RATE_PROXY
 
-            if op == "memopt.rope_fused" and len(s) >= 2 and len(s[0]) == 3:
-                seq, n_heads, head_dim = s[0]
-                return _make_rope_prompt(seq, n_heads, head_dim, event.dtype, hw)
+            props    = torch.cuda.get_device_properties(0)
+            peak_bw  = props.memory_clock_rate * 1e3 * props.memory_bus_width / 8
 
-            if op == "memopt.ln_residual_fused" and len(s) >= 1 and len(s[0]) == 2:
-                seq, hidden = s[0]
-                return _make_ln_residual_prompt(seq, hidden, event.dtype, hw)
+            # Time a no-op tensor copy as a bandwidth probe
+            probe = tensors[0].clone()
+            start = torch.cuda.Event(enable_timing=True)
+            end   = torch.cuda.Event(enable_timing=True)
+            start.record()
+            _ = probe + probe   # force HBM read + write
+            end.record()
+            torch.cuda.synchronize()
+            elapsed_s = start.elapsed_time(end) / 1000.0
 
-            if op == "memopt.scaled_softmax_fused" and len(s) >= 1 and len(s[0]) == 4:
-                import math
-                b, nh, sq, _ = s[0]
-                return _make_softmax_scale_prompt(b, nh, sq, event.dtype, hw)
+            if elapsed_s <= 0:
+                return STALL_RATE_PROXY
+
+            probe_bytes = probe.numel() * probe.element_size() * 3
+            ideal_s     = probe_bytes / peak_bw
+            stall       = max(0.0, min(0.95, 1.0 - ideal_s / elapsed_s))
+            logger.debug(
+                f"Measured stall rate: {stall:.2f} "
+                f"(elapsed={elapsed_s*1000:.3f}ms ideal={ideal_s*1000:.3f}ms)"
+            )
+            return stall
 
         except Exception as e:
-            logger.debug(f"AutoOptimizer: prompt builder import failed: {e}")
+            logger.debug(f"Stall rate measurement failed: {e} — using proxy")
+            return STALL_RATE_PROXY
 
-        # Fallback to generic JITGenerator prompt
-        return self._gen.__class__._build_prompt(self._gen, event)
+    def _build_prompt(self, event) -> str:
+        """Route to op-specific prompt builders with shape validation."""
+        from memopt.kernels.tests.test_pillar3_fused import (
+            _make_rope_prompt,
+            _make_ln_residual_prompt,
+            _make_softmax_scale_prompt,
+        )
+        import math  # noqa: F401
+
+        op = event.op_name
+        s  = event.input_shapes
+        hw = event.hardware
+
+        if op == "memopt.rope_fused":
+            if len(s) >= 2 and len(s[0]) == 3:
+                seq, n_heads, head_dim = s[0]
+                return _make_rope_prompt(seq, n_heads, head_dim, event.dtype, hw)
+            logger.warning(
+                f"AutoOptimizer: rope_fused expected 3D shapes, got {s} "
+                f"— falling back to generic prompt"
+            )
+
+        elif op == "memopt.ln_residual_fused":
+            if len(s) >= 1 and len(s[0]) == 2:
+                seq, hidden = s[0]
+                return _make_ln_residual_prompt(seq, hidden, event.dtype, hw)
+            logger.warning(
+                f"AutoOptimizer: ln_residual_fused expected 2D shapes, got {s} "
+                f"— falling back to generic prompt"
+            )
+
+        elif op == "memopt.scaled_softmax_fused":
+            if len(s) >= 1 and len(s[0]) == 4:
+                b, nh, sq, sk = s[0]
+                return _make_softmax_scale_prompt(b, nh, sq, event.dtype, hw)
+            logger.warning(
+                f"AutoOptimizer: scaled_softmax_fused expected 4D shapes, got {s} "
+                f"— falling back to generic prompt"
+            )
+
+        # Generic fallback — delegates to JITGenerator's own prompt builder
+        # Uses direct instance method call, not fragile __class__ lookup
+        return self._gen._build_prompt(event)
 
     def _extract_shapes(self, args: tuple) -> list:
         try:

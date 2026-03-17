@@ -24,9 +24,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL   = os.environ.get("MEMOPT_LLM_MODEL", "claude-sonnet-4-20250514")
 MAX_TOKENS        = 2048
 SYNTHESIS_TIMEOUT = 30.0   # seconds — abandon synthesis if API takes longer
+
+_DTYPE_TOLERANCES = {
+    "float16":  (1e-2, 1e-2),   # FP16 has ~3 decimal digits of precision
+    "bfloat16": (1e-2, 1e-2),   # BF16 same range as FP16
+    "float32":  (1e-5, 1e-5),   # FP32 has ~7 decimal digits
+    "float64":  (1e-8, 1e-8),   # FP64 has ~15 decimal digits
+}
 
 
 class JITGenerator:
@@ -256,12 +263,12 @@ class JITGenerator:
             )
             source = response.content[0].text.strip()
             # Strip markdown code fences if the model wrapped the code
-            if source.startswith("```"):
-                lines = source.splitlines()
-                # Drop opening fence (```python or ```)
-                lines = lines[1:]
-                # Drop closing fence if present
-                if lines and lines[-1].strip().startswith("```"):
+            _FENCE_OPENINGS = {"```", "```python", "```triton", "```cuda"}
+            _FENCE_CLOSINGS = {"```"}
+            if source.splitlines()[0].strip() in _FENCE_OPENINGS:
+                lines = source.splitlines()[1:]   # strip opening fence
+                # Only strip closing fence if it is an exact match — not code
+                if lines and lines[-1].strip() in _FENCE_CLOSINGS:
                     lines = lines[:-1]
                 source = "\n".join(lines).strip()
             if not source.startswith("import triton"):
@@ -305,7 +312,13 @@ class JITGenerator:
                 return False
 
             kernel_out = run(*tensors)
-            return torch.allclose(ref_out, kernel_out, atol=1e-3, rtol=1e-3)
+            atol, rtol = _DTYPE_TOLERANCES.get(event.dtype, (1e-3, 1e-3))
+            return torch.allclose(
+                ref_out.float(),        # compare in FP32 to avoid dtype mismatch
+                kernel_out.float(),
+                atol=atol,
+                rtol=rtol,
+            )
 
         except Exception as e:
             logger.warning(f"JIT: validation error: {e}")
