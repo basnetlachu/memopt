@@ -97,7 +97,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "memopt_gpu_power_watts",
+          "expr": "memopt_power_avg_watts",
           "legendFormat": "GPU {{gpu_id}}",
           "refId": "A"
         }
@@ -304,6 +304,29 @@
         "tooltip": { "mode": "multi" },
         "legend": { "displayMode": "list", "placement": "bottom" }
       }
+    }
+
+    ,
+
+    {
+      "title": "VMM virtual/physical ratio",
+      "type": "stat",
+      "targets": [{"expr": "memopt_vmm_virtual_physical_ratio"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 2}}
+    },
+    {
+      "title": "Kernel synthesis outcomes",
+      "type": "piechart",
+      "targets": [
+        {"expr": "memopt_kernel_synthesis_succeeded", "legendFormat": "succeeded"},
+        {"expr": "memopt_kernel_synthesis_discarded", "legendFormat": "discarded"}
+      ]
+    },
+    {
+      "title": "Cross-node borrows total",
+      "type": "stat",
+      "targets": [{"expr": "memopt_cluster_borrows_total"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
     }
 
   ],

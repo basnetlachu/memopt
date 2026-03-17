@@ -326,6 +326,20 @@ import os as _os
 
 _ALLOW_UNSAFE_LOAD: bool = _os.environ.get("MEMOPT_ALLOW_UNSAFE_LOAD") == "1"
 
+# Pillar 4 — observability
+try:
+    from memopt.observability import MetricsCollector, OptimizationLedger
+    _p4_collector = MetricsCollector()
+    _p4_ledger    = OptimizationLedger()
+    _p4_collector.start()
+except Exception as _p4_err:
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        f"Observability startup failed: {_p4_err}"
+    )
+    _p4_collector = None
+    _p4_ledger    = None
+
 
 def load_model_safe(model_path: str, device: Any) -> Any:
     """
@@ -808,6 +822,17 @@ async def agent_optimize(request: AgentRequest, _: str = Security(verify_api_key
 # /metrics is served by the prometheus_client ASGI app (mounted below).
 # It returns text/plain Prometheus exposition format, not JSON.
 # Scrape with: curl http://localhost:8080/metrics
+
+
+@app.get("/ledger")
+async def ledger_entries(n: int = 100):
+    """Return the n most recent optimization ledger entries as JSON."""
+    if _p4_ledger is None:
+        return {"entries": [], "totals": {}}
+    return {
+        "entries": _p4_ledger.recent(n=n),
+        "totals":  _p4_ledger.totals(),
+    }
 
 
 @app.get("/health")
