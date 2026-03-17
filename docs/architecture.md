@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 101 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 106 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -264,7 +264,32 @@ Redis backend degrades gracefully to local if Redis is unreachable — inference
 
 ### 5.5 Transport (`cluster/transport.py`)
 
-`TCPTransport` wraps raw TCP sockets for async tensor send/recv between nodes. `make_transport()` returns the right transport for the environment.
+The transport layer implements a typed `AbstractTransport` ABC with three concrete backends selected automatically at runtime:
+
+| Backend | Condition | Latency |
+|---------|-----------|---------|
+| `UCXTransport` (RDMA) | ucx-py installed + IB/RoCE device with `PORT_ACTIVE` | ~1–5 µs |
+| `UCXTransport` (TCP via UCX) | ucx-py installed, no IB hardware | ~100 µs |
+| `TCPTransport` | ucx-py not installed | ~100–500 µs |
+
+`make_transport(listen_port, prefer_rdma)` implements the fallback chain. `MEMOPT_TRANSPORT=tcp` env var forces TCP unconditionally — useful for CI and debugging.
+
+**AbstractTransport** defines 8 abstract methods: `start_server`, `connect`, `register_memory`, `deregister_memory`, `read`, `write`, `close`, `stats`. All three implementations satisfy this contract; callers never branch on implementation type.
+
+**UCXTransport** — wraps the `ucx-py` library (NVIDIA's UCX binding). `__init__` raises `ImportError` if ucx-py is not installed; `make_transport()` catches this and falls back to TCP. TLS selection runs once at init via `_detect_best_tls()`:
+
+| Hardware detected | UCX TLS string |
+|-------------------|---------------|
+| IB `PORT_ACTIVE` + CUDA | `rc,cuda_copy,cuda_ipc` |
+| IB `PORT_ACTIVE`, no CUDA | `rc,tcp` |
+| CUDA only | `tcp,cuda_copy` |
+| CPU only | `tcp` |
+
+`_detect_best_tls()` runs `ibv_devinfo` with a 2-second timeout — never blocks startup. GPU-direct zero-copy (GPU HBM → NIC DMA → remote GPU HBM) is activated automatically when the `rc,cuda_copy` path is selected; requires GPUDirectRDMA kernel module + Mellanox/Broadcom NIC with correct firmware. UCX async ops (`connect`, `read`, `write`) each create and close their own event loop — no event loop is required in the caller.
+
+**TCPTransport** — raw socket implementation unchanged from before. `read()` and `write()` track `_bytes_sent`/`_bytes_recv` for `stats()`. `stats()` returns the required keys: `transport`, `bytes_sent`, `bytes_recv`, `latency_us_p50`, `latency_us_p99`.
+
+ucx-py is an **optional** dependency — not listed in `requirements.txt`. Install with `pip install ucx-py` or `conda install -c rapidsai ucx-py` to enable RDMA on InfiniBand/RoCE clusters.
 
 ### 5.6 Hypervisor (`cluster/hypervisor.py`)
 
@@ -1152,7 +1177,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**97 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**106 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
@@ -1161,7 +1186,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `vmm/tests/test_vmm_smoke.py` | 6 | 6 PASS |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
 | `cluster/tests/test_gkd.py` | 13 | 13 PASS |
-| `cluster/tests/test_cluster.py` | 14 | 14 PASS |
+| `cluster/tests/test_cluster.py` | 19 | 19 PASS (5 new: AbstractTransport interface, TCP override, UCX fallback, interface completeness, stats keys) |
 | `cluster/tests/test_pillar2_twonode.py` | 8 | 6 PASS, 1 SKIP, 1 flaky* |
 | `observability/tests/test_observability.py` | 20 | 20 PASS |
 
