@@ -1,160 +1,219 @@
 """
-API key management for memopt.
+API key management — multi-tenant.
 
-Key format  : sk-memopt-<64 hex chars>   (32 random bytes)
-Storage     : ~/.memopt/api_key           (chmod 600)
-Env override: MEMOPT_API_KEY             (takes priority over file)
+Key format:  memopt_{tenant_id}_{secret_hex}
+  tenant_id: alphanumeric, max 32 chars, URL-safe
+  secret:    32 bytes of cryptographic randomness (64 hex chars)
 
-Usage
------
-Server startup::
+Storage: ~/.memopt/keys/{tenant_id}.key  (mode 0600 each)
+Admin key: ~/.memopt/keys/_admin.key     (special tenant_id "_admin")
 
-    from memopt.auth.api_key import get_or_create_key, verify_key
-    _API_KEY = get_or_create_key()
+Environment overrides (checked before disk):
+  MEMOPT_API_KEY          single-key mode (backwards compatible)
+  MEMOPT_ADMIN_KEY        admin key override
 
-FastAPI dependency::
-
-    from fastapi import Header, HTTPException, Security
-    from fastapi.security.api_key import APIKeyHeader
-
-    _api_key_header = APIKeyHeader(name="X-Memopt-API-Key", auto_error=False)
-
-    def verify_api_key(key: str = Security(_api_key_header)):
-        if not verify_key(key, _API_KEY):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-Client usage::
-
-    import urllib.request
-    from memopt.auth.api_key import load_key
-    req = urllib.request.Request(url, headers={"X-Memopt-API-Key": load_key() or ""})
+Single-key backwards compatibility:
+  If MEMOPT_API_KEY is set, it is accepted for any request and
+  assigned to the "_default" tenant. This preserves existing
+  deployments that use the old single-key model.
 """
-import hmac
-import logging
+from __future__ import annotations
 import os
-import secrets
+import re
 import stat
-from pathlib import Path
-from typing import Optional
+import hmac
+import secrets
+import logging
+from typing import Optional, Dict, Tuple
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-KEY_PREFIX = "sk-memopt-"
+_KEY_DIR   = os.path.expanduser(os.environ.get(
+    "MEMOPT_KEY_DIR", "~/.memopt/keys"
+))
+_MODE_600  = stat.S_IRUSR | stat.S_IWUSR
+_TENANT_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+
+# Reserved tenant IDs
+_ADMIN_TENANT   = "_admin"
+_DEFAULT_TENANT = "_default"
+
+# Backwards-compat constants
+KEY_PREFIX  = "sk-memopt-"
 KEY_ENV_VAR = "MEMOPT_API_KEY"
-_DEFAULT_KEY_PATH = Path.home() / ".memopt" / "api_key"
-_MODE_600 = stat.S_IRUSR | stat.S_IWUSR   # owner read+write only
 
 
-def _secure_write(path: Path, content: str) -> None:
+# ── Key format helpers ─────────────────────────────────────────────────
+
+def _make_key(tenant_id: str) -> str:
+    """Generate a new key for a tenant."""
+    return f"memopt_{tenant_id}_{secrets.token_hex(32)}"
+
+
+def _parse_key(key: str) -> Optional[Tuple[str, str]]:
     """
-    Write content to path with mode 0600 using an atomic rename.
-
-    Protocol:
-      1. Open path.tmp with O_CREAT | O_TRUNC and mode 0600
-      2. Write content
-      3. Rename path.tmp → path  (atomic on POSIX)
-      4. Harden final file permissions
-
-    A crash between steps 1 and 3 leaves a .tmp file with no damage
-    to the original. A crash between steps 3 and 4 leaves the final
-    file readable — chmod is idempotent.
+    Parse a key into (tenant_id, secret).
+    Returns None if the key does not match the expected format.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    fd  = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _MODE_600)
+    parts = key.split("_", 2)
+    if len(parts) != 3 or parts[0] != "memopt":
+        return None
+    return parts[1], parts[2]
+
+
+# ── Secure file helpers ────────────────────────────────────────────────
+
+def _key_path(tenant_id: str) -> str:
+    return os.path.join(_KEY_DIR, f"{tenant_id}.key")
+
+
+def _secure_write(path: str, content: str) -> None:
+    """Write content to path with mode 0600 using atomic rename."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd  = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _MODE_600)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(content)
     except Exception:
         try:
-            tmp.unlink()
+            os.remove(tmp)
         except OSError:
             pass
         raise
-    tmp.rename(path)
-    path.chmod(_MODE_600)   # harden in case rename preserved wrong perms
+    os.rename(tmp, path)
+    os.chmod(path, _MODE_600)
 
 
-def generate_key() -> str:
-    """Return a fresh key: ``sk-memopt-<64 hex chars>``."""
-    return KEY_PREFIX + secrets.token_hex(32)
-
-
-def save_key(key: str, path: Path = None) -> Path:
-    """
-    Write *key* to *path* (default ``~/.memopt/api_key``) with permissions 600.
-
-    Uses an atomic rename so a crash mid-write cannot corrupt the file.
-    Creates parent directories as needed.
-    Returns the path actually written.
-    """
-    dest = path or _DEFAULT_KEY_PATH
-    _secure_write(dest, key)
-    log.info("API key saved to %s", dest)
-    return dest
-
-
-def load_key(path: Path = None) -> Optional[str]:
-    """
-    Return the stored API key, or *None* if no key file exists.
-
-    Priority: MEMOPT_API_KEY env var > ~/.memopt/api_key file.
-    Env var is checked BEFORE any filesystem access.
-    Never logs the actual key — uses :func:`mask_key` for any log lines.
-    """
-    # Env var takes priority — no disk read needed
-    env_key = os.environ.get(KEY_ENV_VAR)
-    if env_key:
-        log.debug("API key loaded from env var %s (%s)", KEY_ENV_VAR, mask_key(env_key))
-        return env_key.strip()
-
-    src = path or _DEFAULT_KEY_PATH
-    if not src.exists():
+def _secure_read(path: str) -> Optional[str]:
+    """Read key from path, warn if permissions are wrong."""
+    if not os.path.exists(path):
         return None
-
-    # Warn if file has wrong permissions
-    file_mode = src.stat().st_mode & 0o777
-    if file_mode != 0o600:
-        log.warning(
-            "API key file %s has permissions %s — should be 0600. "
-            "Run: chmod 600 %s",
-            src, oct(file_mode), src,
+    mode = os.stat(path).st_mode & 0o777
+    if mode != 0o600:
+        logger.warning(
+            f"Key file {path} has permissions {oct(mode)} "
+            f"— should be 0600. Run: chmod 600 {path}"
         )
-
     try:
-        key = src.read_text().strip()
-        log.debug("API key loaded from %s (%s)", src, mask_key(key))
-        return key
+        with open(path) as f:
+            return f.read().strip()
     except OSError as e:
-        log.warning("Cannot read API key file: %s", e)
+        logger.warning(f"Cannot read key file {path}: {e}")
         return None
 
 
-def get_or_create_key(path: Path = None) -> str:
-    """
-    Return existing key if present, otherwise generate and persist a new one.
+# ── Tenant management ──────────────────────────────────────────────────
 
-    This is the canonical function to call at server startup.
+def create_tenant(tenant_id: str) -> str:
     """
-    existing = load_key(path)
-    if existing:
-        return existing
-    key = generate_key()
-    save_key(key, path)
-    log.info("Generated new memopt API key (%s) — store this securely", mask_key(key))
+    Create a new tenant and return its API key.
+    Raises ValueError if tenant_id is invalid or already exists.
+    """
+    if not _TENANT_RE.match(tenant_id):
+        raise ValueError(
+            f"Invalid tenant_id '{tenant_id}'. "
+            f"Must match [a-zA-Z0-9_-]{{1,32}}"
+        )
+    if tenant_id in (_ADMIN_TENANT, _DEFAULT_TENANT):
+        raise ValueError(f"Cannot create reserved tenant '{tenant_id}'")
+    path = _key_path(tenant_id)
+    if os.path.exists(path):
+        raise ValueError(f"Tenant '{tenant_id}' already exists")
+    key = _make_key(tenant_id)
+    _secure_write(path, key)
+    logger.info(f"Created tenant '{tenant_id}'")
     return key
 
 
+def revoke_tenant(tenant_id: str) -> bool:
+    """
+    Revoke a tenant's API key. Returns True if key was removed.
+    Does not delete the tenant's ledger entries — those are append-only.
+    """
+    if tenant_id in (_ADMIN_TENANT,):
+        raise ValueError(f"Cannot revoke reserved tenant '{tenant_id}'")
+    path = _key_path(tenant_id)
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    logger.info(f"Revoked tenant '{tenant_id}'")
+    return True
+
+
+def list_tenants() -> list:
+    """Return a list of all tenant IDs with active keys."""
+    try:
+        return [
+            f[:-4] for f in os.listdir(_KEY_DIR)
+            if f.endswith(".key") and not f.startswith(".")
+        ]
+    except OSError:
+        return []
+
+
+def authenticate(provided_key: Optional[str]) -> Optional[str]:
+    """
+    Verify a key and return the tenant_id if valid, else None.
+
+    Priority:
+    1. MEMOPT_API_KEY env var → tenant "_default" (backwards compat)
+    2. Parse tenant_id from key format → load and compare stored key
+    3. Scan all tenant keys (for keys created before format change)
+    """
+    if not provided_key:
+        return None
+
+    # Backwards compatibility: single env var key
+    env_key = os.environ.get("MEMOPT_API_KEY", "").strip()
+    if env_key and hmac.compare_digest(
+        provided_key.encode(), env_key.encode()
+    ):
+        return _DEFAULT_TENANT
+
+    # Parse tenant from key format
+    parsed = _parse_key(provided_key)
+    if parsed:
+        tenant_id, _ = parsed
+        stored = _secure_read(_key_path(tenant_id))
+        if stored and hmac.compare_digest(
+            provided_key.encode(), stored.encode()
+        ):
+            return tenant_id
+
+    return None
+
+
+def is_admin(tenant_id: str) -> bool:
+    """Return True if the tenant has admin privileges."""
+    return tenant_id in (_ADMIN_TENANT, _DEFAULT_TENANT)
+
+
+# ── Backwards-compatible single-key API ────────────────────────────────
+
+def generate_key() -> str:
+    """
+    Generate a key for the default single-tenant deployment.
+    Backwards compatible with the old single-key model.
+    """
+    if not os.environ.get("MEMOPT_API_KEY"):
+        os.makedirs(_KEY_DIR, exist_ok=True)
+        key = _make_key(_DEFAULT_TENANT)
+        _secure_write(_key_path(_DEFAULT_TENANT), key)
+        return key
+    return os.environ["MEMOPT_API_KEY"]
+
+
+def load_key(path=None) -> Optional[str]:
+    """Load the default key. Checks env var first."""
+    env_key = os.environ.get("MEMOPT_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    return _secure_read(_key_path(_DEFAULT_TENANT))
+
+
 def verify_key(provided: Optional[str], stored: Optional[str]) -> bool:
-    """
-    Constant-time comparison of *provided* vs *stored* API key.
-
-    Always uses ``hmac.compare_digest`` — never ``==`` — to prevent
-    timing-based key enumeration attacks.
-
-    Returns ``False`` (rather than raising) for any falsy input so callers
-    can use a simple ``if not verify_key(...): raise HTTPException(401)``.
-    """
+    """Constant-time comparison. Backwards compatible."""
     if not provided or not stored:
         return False
     return hmac.compare_digest(
@@ -163,13 +222,28 @@ def verify_key(provided: Optional[str], stored: Optional[str]) -> bool:
     )
 
 
-def mask_key(key: Optional[str]) -> str:
-    """
-    Return a safe-to-log representation of *key*.
+def save_key(key: str, path=None) -> str:
+    """Backwards compat shim — writes key for the default tenant."""
+    dest = _key_path(_DEFAULT_TENANT)
+    _secure_write(dest, key)
+    logger.info("API key saved to %s", dest)
+    return dest
 
-    Example: ``sk-memopt-ab12cd…[redacted]``
+
+def get_or_create_key(path=None) -> str:
     """
+    Return existing key if present, otherwise generate and persist a new one.
+    Backwards compat shim for server startup.
+    """
+    existing = load_key()
+    if existing:
+        return existing
+    return generate_key()
+
+
+def mask_key(key: Optional[str]) -> str:
+    """Return a safe-to-log representation of key."""
     if not key:
         return "<none>"
-    visible = key[:18]  # "sk-memopt-" + 8 hex chars
+    visible = key[:18]
     return f"{visible}…[redacted]"

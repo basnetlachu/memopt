@@ -15,6 +15,7 @@ from memopt.observability.collector   import MetricsCollector, MetricRegistry
 from memopt.observability.ledger      import OptimizationLedger, _compute_savings
 from memopt.observability.certificate import sign_entry, verify_certificate
 from memopt.observability.arbitrage   import ArbitrageEngine, GPUOffer
+import memopt.auth.api_key as _ak_mod
 
 
 # ── MetricRegistry ─────────────────────────────────────────────────────
@@ -263,3 +264,103 @@ def test_arbitrage_dry_run_does_not_provision():
     engine = TrackingEngine(current_price_hr=2.00)
     assert not provisioned["called"]
     del os.environ["MEMOPT_ARBITRAGE_DRY_RUN"]
+
+
+# ── Multi-tenant key management ────────────────────────────────────────
+
+def _reload_ak(key_dir: str):
+    """Reload api_key module pointing at a temp key directory."""
+    import importlib
+    os.environ["MEMOPT_KEY_DIR"] = key_dir
+    os.environ.pop("MEMOPT_API_KEY", None)
+    importlib.reload(_ak_mod)
+    return _ak_mod
+
+
+def test_create_and_authenticate_tenant():
+    """create_tenant returns a key that authenticate() accepts."""
+    with tempfile.TemporaryDirectory() as d:
+        ak = _reload_ak(d)
+        key = ak.create_tenant("acme")
+        assert key.startswith("memopt_acme_")
+        tenant = ak.authenticate(key)
+        assert tenant == "acme"
+
+
+def test_invalid_tenant_id_rejected():
+    """create_tenant must raise ValueError for invalid tenant IDs."""
+    with tempfile.TemporaryDirectory() as d:
+        ak = _reload_ak(d)
+        with pytest.raises(ValueError, match="Invalid tenant_id"):
+            ak.create_tenant("bad tenant!")   # spaces not allowed
+        with pytest.raises(ValueError, match="Cannot create reserved"):
+            ak.create_tenant("_admin")
+
+
+def test_authenticate_wrong_key_returns_none():
+    """authenticate() must return None for an unknown or tampered key."""
+    with tempfile.TemporaryDirectory() as d:
+        ak = _reload_ak(d)
+        ak.create_tenant("corp")
+        assert ak.authenticate("memopt_corp_" + "ff" * 32) is None
+        assert ak.authenticate(None) is None
+        assert ak.authenticate("totally-wrong") is None
+
+
+# ── Append-only ledger ────────────────────────────────────────────────
+
+def test_ledger_append_only_rejects_duplicate_batch_id():
+    """Writing the same batch_id twice must silently drop the second write."""
+    with tempfile.TemporaryDirectory() as d:
+        ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        e = ledger.record(tokens=100, node_id="n1")
+        # Manually call _write again with same batch_id — must not raise,
+        # must not duplicate the row.
+        ledger._write(e)
+        assert len(ledger.recent(n=100)) == 1
+
+
+def test_hash_chain_valid_after_writes():
+    """verify_chain must return ok=True after several normal writes."""
+    with tempfile.TemporaryDirectory() as d:
+        ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        for i in range(5):
+            ledger.record(tokens=100 * (i + 1), actual_j_per_token=0.0004)
+        result = ledger.verify_chain()
+        assert result["ok"] is True
+        assert result["entries_checked"] == 5
+
+
+def test_hash_chain_detects_tampering():
+    """verify_chain must detect direct SQL column modification."""
+    with tempfile.TemporaryDirectory() as d:
+        ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger.record(tokens=200, actual_j_per_token=0.0004)
+
+        # Tamper: update SQL column but not raw_json
+        with ledger._connect() as conn:
+            conn.execute("UPDATE entries SET tokens_generated = 999999")
+
+        result = ledger.verify_chain()
+        assert result["ok"] is False
+        assert result["reason"] == "column_mismatch"
+
+
+def test_ledger_tenant_isolation():
+    """recent() and totals() with tenant_id must only return that tenant's data."""
+    with tempfile.TemporaryDirectory() as d:
+        ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger.record(tokens=100, tenant_id="alpha")
+        ledger.record(tokens=200, tenant_id="alpha")
+        ledger.record(tokens=300, tenant_id="beta")
+
+        alpha_recent = ledger.recent(tenant_id="alpha")
+        assert len(alpha_recent) == 2
+        assert all(e["tenant_id"] == "alpha" for e in alpha_recent)
+
+        beta_totals = ledger.totals(tenant_id="beta")
+        assert beta_totals["tokens_total"] == 300
+        assert beta_totals["n_batches"] == 1
+
+        all_totals = ledger.totals()
+        assert all_totals["tokens_total"] == 600

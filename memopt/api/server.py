@@ -31,11 +31,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, Header, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
-from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel, field_validator
-from memopt.auth.api_key import get_or_create_key, verify_key, mask_key
+from starlette.responses import Response
+from memopt.auth.api_key import (
+    get_or_create_key, verify_key, mask_key,
+    authenticate, is_admin,
+    create_tenant, revoke_tenant, list_tenants,
+)
 
 log = logging.getLogger("memopt.api")
 logging.basicConfig(
@@ -707,6 +712,24 @@ def verify_api_key(key: str = Security(_api_key_header)) -> str:
     return key
 
 
+def get_tenant(x_memopt_api_key: Optional[str] = Header(default=None)) -> str:
+    """
+    FastAPI dependency — validates key and returns the tenant_id.
+    Supports both the new multi-tenant key format and the legacy single-key mode.
+    """
+    tenant_id = authenticate(x_memopt_api_key)
+    if tenant_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return tenant_id
+
+
+def require_admin(tenant_id: str = Depends(get_tenant)) -> str:
+    """FastAPI dependency — requires admin privileges."""
+    if not is_admin(tenant_id):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return tenant_id
+
+
 @app.post("/optimize")
 async def optimize(request: OptimizeRequest, _: str = Security(verify_api_key)):
     """
@@ -825,14 +848,58 @@ async def agent_optimize(request: AgentRequest, _: str = Security(verify_api_key
 
 
 @app.get("/ledger")
-async def ledger_entries(n: int = 100):
-    """Return the n most recent optimization ledger entries as JSON."""
+async def ledger_entries(n: int = 100, tenant_id: str = Depends(get_tenant)):
+    """
+    Return the n most recent optimization ledger entries for the calling tenant.
+    Admin tenants see all entries (no tenant filter).
+    """
     if _p4_ledger is None:
         return {"entries": [], "totals": {}}
+    if is_admin(tenant_id):
+        return {
+            "entries": _p4_ledger.recent(n=n),
+            "totals":  _p4_ledger.totals(),
+        }
     return {
-        "entries": _p4_ledger.recent(n=n),
-        "totals":  _p4_ledger.totals(),
+        "entries": _p4_ledger.recent(n=n, tenant_id=tenant_id),
+        "totals":  _p4_ledger.totals(tenant_id=tenant_id),
     }
+
+
+# ── Tenant management (admin only) ───────────────────────────────────────────
+
+@app.post("/tenants/{new_tenant_id}", status_code=201)
+async def create_tenant_endpoint(
+    new_tenant_id: str,
+    _admin: str = Depends(require_admin),
+):
+    """Create a new tenant and return its API key. Admin only."""
+    try:
+        key = create_tenant(new_tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"tenant_id": new_tenant_id, "api_key": key}
+
+
+@app.delete("/tenants/{target_tenant_id}")
+async def revoke_tenant_endpoint(
+    target_tenant_id: str,
+    _admin: str = Depends(require_admin),
+):
+    """Revoke a tenant's API key. Admin only."""
+    try:
+        removed = revoke_tenant(target_tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Tenant '{target_tenant_id}' not found")
+    return {"tenant_id": target_tenant_id, "revoked": True}
+
+
+@app.get("/tenants")
+async def list_tenants_endpoint(_admin: str = Depends(require_admin)):
+    """List all active tenants. Admin only."""
+    return {"tenants": list_tenants()}
 
 
 @app.get("/health")
@@ -860,8 +927,12 @@ def health():
     }
 
 
-# ── Mount Prometheus /metrics ─────────────────────────────────────────────────
-# make_asgi_app() returns a standard ASGI app that serves the Prometheus text
-# exposition at its root path.  Mounting it at "/metrics" means
-# GET /metrics returns Content-Type: text/plain; version=0.0.4.
-app.mount("/metrics", make_asgi_app())
+# ── Prometheus /metrics — authenticated ──────────────────────────────────────
+
+@app.get("/metrics")
+async def metrics(_admin: str = Depends(require_admin)):
+    """
+    Prometheus text exposition — admin key required.
+    Scrape with: curl -H 'X-Memopt-Api-Key: <admin_key>' http://localhost:8080/metrics
+    """
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

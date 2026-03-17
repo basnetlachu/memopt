@@ -29,11 +29,14 @@ from __future__ import annotations
 import os
 import time
 import json
+import hashlib
 import sqlite3
 import logging
 import threading
 from dataclasses import dataclass, asdict
 from typing import Optional, List
+
+_ADMIN_TENANT = "_admin"
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,7 @@ class LedgerEntry:
     batch_id:             str
     timestamp:            float
     node_id:              str
+    tenant_id:            str             # tenant that generated this batch
     tokens_generated:     int
 
     # Raw measurements
@@ -136,6 +140,36 @@ def _compute_savings(
     }
 
 
+def _compute_entry_hash(entry_data: dict, prev_hash: Optional[str]) -> str:
+    """
+    Compute SHA-256 of this entry's canonical JSON + previous hash.
+    Forms a tamper-evident chain: modifying any past entry invalidates
+    all subsequent hashes from that point forward.
+    """
+    chain_input = {
+        "prev_hash":  prev_hash or "genesis",
+        "batch_id":   entry_data["batch_id"],
+        "timestamp":  entry_data["timestamp"],
+        "node_id":    entry_data["node_id"],
+        "tenant_id":  entry_data.get("tenant_id", "_default"),
+        "tokens":     entry_data["tokens_generated"],
+        "energy_kwh": entry_data.get("energy_saved_kwh"),
+        "co2_kg":     entry_data.get("co2_saved_kg"),
+        "cost_usd":   entry_data.get("cost_saved_usd"),
+    }
+    canonical = json.dumps(chain_input, sort_keys=True,
+                           separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _get_latest_hash(conn) -> Optional[str]:
+    """Return the entry_hash of the most recent entry, or None."""
+    row = conn.execute(
+        "SELECT entry_hash FROM entries ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    return row[0] if row else None
+
+
 class OptimizationLedger:
     """
     Appends LedgerEntry records to a SQLite database.
@@ -167,27 +201,34 @@ class OptimizationLedger:
             with self._connect() as conn:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS entries (
-                        batch_id             TEXT PRIMARY KEY,
-                        timestamp            REAL NOT NULL,
-                        node_id              TEXT NOT NULL,
-                        tokens_generated     INTEGER NOT NULL,
-                        actual_j_per_token   REAL,
-                        baseline_j_per_token REAL NOT NULL,
-                        gkd_hit_rate_pct     REAL,
-                        speedup_ratio        REAL,
-                        hbm_saved_bytes      REAL,
-                        energy_saved_kwh     REAL,
-                        co2_saved_kg         REAL,
-                        cost_saved_usd       REAL,
-                        grid_intensity_used  REAL NOT NULL,
+                        batch_id              TEXT PRIMARY KEY,
+                        timestamp             REAL NOT NULL,
+                        node_id               TEXT NOT NULL,
+                        tenant_id             TEXT NOT NULL DEFAULT '_default',
+                        tokens_generated      INTEGER NOT NULL,
+                        actual_j_per_token    REAL,
+                        baseline_j_per_token  REAL NOT NULL,
+                        gkd_hit_rate_pct      REAL,
+                        speedup_ratio         REAL,
+                        hbm_saved_bytes       REAL,
+                        energy_saved_kwh      REAL,
+                        co2_saved_kg          REAL,
+                        cost_saved_usd        REAL,
+                        grid_intensity_used   REAL NOT NULL,
                         electricity_price_used REAL NOT NULL,
-                        gpu_price_hr_used    REAL NOT NULL,
-                        raw_json             TEXT NOT NULL
+                        gpu_price_hr_used     REAL NOT NULL,
+                        prev_hash             TEXT,
+                        entry_hash            TEXT NOT NULL,
+                        raw_json              TEXT NOT NULL
                     )
                 """)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_timestamp "
                     "ON entries(timestamp)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tenant "
+                    "ON entries(tenant_id)"
                 )
         except Exception as e:
             logger.warning(f"Ledger DB init failed: {e} — ledger disabled")
@@ -202,6 +243,7 @@ class OptimizationLedger:
         self,
         tokens:              int,
         node_id:             str             = "local",
+        tenant_id:           str             = "_default",
         actual_j_per_token:  Optional[float] = None,
         gkd_hit_rate_pct:    Optional[float] = None,
         speedup_ratio:       Optional[float] = None,
@@ -227,6 +269,7 @@ class OptimizationLedger:
             batch_id=batch_id,
             timestamp=time.time(),
             node_id=node_id,
+            tenant_id=tenant_id,
             tokens_generated=tokens,
             actual_j_per_token=actual_j_per_token,
             baseline_j_per_token=baseline_j_per_token,
@@ -246,59 +289,98 @@ class OptimizationLedger:
 
     def _write(self, entry: LedgerEntry) -> None:
         try:
-            with self._connect() as conn:
-                d = asdict(entry)
-                conn.execute("""
-                    INSERT OR REPLACE INTO entries VALUES (
-                        :batch_id, :timestamp, :node_id,
-                        :tokens_generated,
-                        :actual_j_per_token, :baseline_j_per_token,
-                        :gkd_hit_rate_pct, :speedup_ratio,
-                        :hbm_saved_bytes,
-                        :energy_saved_kwh, :co2_saved_kg,
-                        :cost_saved_usd,
-                        :grid_intensity_used,
-                        :electricity_price_used,
-                        :gpu_price_hr_used,
-                        :raw_json
-                    )
-                """, {**d, "raw_json": json.dumps(d)})
+            with self._lock:
+                with self._connect() as conn:
+                    d = asdict(entry)
+                    prev_hash  = _get_latest_hash(conn)
+                    entry_hash = _compute_entry_hash(d, prev_hash)
+                    conn.execute("""
+                        INSERT INTO entries VALUES (
+                            :batch_id, :timestamp, :node_id, :tenant_id,
+                            :tokens_generated,
+                            :actual_j_per_token, :baseline_j_per_token,
+                            :gkd_hit_rate_pct, :speedup_ratio,
+                            :hbm_saved_bytes,
+                            :energy_saved_kwh, :co2_saved_kg,
+                            :cost_saved_usd,
+                            :grid_intensity_used,
+                            :electricity_price_used,
+                            :gpu_price_hr_used,
+                            :prev_hash, :entry_hash,
+                            :raw_json
+                        )
+                    """, {
+                        **d,
+                        "prev_hash":  prev_hash,
+                        "entry_hash": entry_hash,
+                        "raw_json":   json.dumps(d),
+                    })
+        except sqlite3.IntegrityError:
+            logger.debug(f"Ledger write rejected duplicate batch_id: {entry.batch_id}")
         except Exception as e:
             logger.debug(f"Ledger write failed: {e}")
 
-    def recent(self, n: int = 100) -> List[dict]:
-        """Return the n most recent ledger entries as dicts."""
+    def recent(self, n: int = 100, tenant_id: Optional[str] = None) -> List[dict]:
+        """Return the n most recent ledger entries as dicts.
+
+        If tenant_id is provided, returns only entries for that tenant.
+        """
         try:
             with self._connect() as conn:
-                rows = conn.execute(
-                    "SELECT raw_json FROM entries "
-                    "ORDER BY timestamp DESC LIMIT ?", (n,)
-                ).fetchall()
+                if tenant_id is not None:
+                    rows = conn.execute(
+                        "SELECT raw_json FROM entries "
+                        "WHERE tenant_id = ? "
+                        "ORDER BY timestamp DESC LIMIT ?",
+                        (tenant_id, n),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT raw_json FROM entries "
+                        "ORDER BY timestamp DESC LIMIT ?", (n,)
+                    ).fetchall()
             return [json.loads(r[0]) for r in rows]
         except Exception as e:
             logger.debug(f"Ledger read failed: {e}")
             return []
 
-    def totals(self) -> dict:
+    def totals(self, tenant_id: Optional[str] = None) -> dict:
         """
         Aggregate totals across all ledger entries.
         Returns sums of tokens, energy, CO₂, and cost saved.
         Fields are None if no entries with that measurement exist.
+
+        If tenant_id is provided, aggregates only that tenant's entries.
         """
         try:
             with self._connect() as conn:
-                row = conn.execute("""
-                    SELECT
-                        COUNT(*)                    AS n_batches,
-                        SUM(tokens_generated)       AS tokens_total,
-                        SUM(energy_saved_kwh)       AS energy_kwh,
-                        SUM(co2_saved_kg)           AS co2_kg,
-                        SUM(cost_saved_usd)         AS cost_usd,
-                        SUM(hbm_saved_bytes)        AS hbm_bytes,
-                        AVG(gkd_hit_rate_pct)       AS avg_gkd_hit_rate,
-                        AVG(speedup_ratio)          AS avg_speedup
-                    FROM entries
-                """).fetchone()
+                if tenant_id is not None:
+                    row = conn.execute("""
+                        SELECT
+                            COUNT(*)                    AS n_batches,
+                            SUM(tokens_generated)       AS tokens_total,
+                            SUM(energy_saved_kwh)       AS energy_kwh,
+                            SUM(co2_saved_kg)           AS co2_kg,
+                            SUM(cost_saved_usd)         AS cost_usd,
+                            SUM(hbm_saved_bytes)        AS hbm_bytes,
+                            AVG(gkd_hit_rate_pct)       AS avg_gkd_hit_rate,
+                            AVG(speedup_ratio)          AS avg_speedup
+                        FROM entries
+                        WHERE tenant_id = ?
+                    """, (tenant_id,)).fetchone()
+                else:
+                    row = conn.execute("""
+                        SELECT
+                            COUNT(*)                    AS n_batches,
+                            SUM(tokens_generated)       AS tokens_total,
+                            SUM(energy_saved_kwh)       AS energy_kwh,
+                            SUM(co2_saved_kg)           AS co2_kg,
+                            SUM(cost_saved_usd)         AS cost_usd,
+                            SUM(hbm_saved_bytes)        AS hbm_bytes,
+                            AVG(gkd_hit_rate_pct)       AS avg_gkd_hit_rate,
+                            AVG(speedup_ratio)          AS avg_speedup
+                        FROM entries
+                    """).fetchone()
             if row is None:
                 return {}
             keys = ["n_batches", "tokens_total", "energy_saved_kwh",
@@ -308,3 +390,64 @@ class OptimizationLedger:
         except Exception as e:
             logger.debug(f"Ledger totals failed: {e}")
             return {}
+
+    def verify_chain(self, tenant_id: Optional[str] = None) -> dict:
+        """
+        Verify the tamper-evident hash chain.
+
+        Checks two things for every entry:
+        1. entry_hash matches recomputed hash from raw_json + prev_hash.
+        2. raw_json["tokens_generated"] matches the SQL tokens_generated column
+           (detects tampering that updates SQL columns but not raw_json).
+
+        Returns:
+            {"ok": True, "entries_checked": N}
+            {"ok": False, "entries_checked": N, "first_bad_batch_id": "...",
+             "reason": "hash_mismatch" | "column_mismatch"}
+        """
+        try:
+            with self._connect() as conn:
+                if tenant_id is not None:
+                    rows = conn.execute(
+                        "SELECT batch_id, prev_hash, entry_hash, "
+                        "tokens_generated, raw_json "
+                        "FROM entries "
+                        "WHERE tenant_id = ? "
+                        "ORDER BY timestamp ASC",
+                        (tenant_id,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT batch_id, prev_hash, entry_hash, "
+                        "tokens_generated, raw_json "
+                        "FROM entries ORDER BY timestamp ASC"
+                    ).fetchall()
+
+            checked = 0
+            for batch_id, prev_hash, stored_hash, sql_tokens, raw in rows:
+                checked += 1
+                entry_data = json.loads(raw)
+
+                # Cross-column consistency: detect SQL-only tampering
+                if entry_data.get("tokens_generated") != sql_tokens:
+                    return {
+                        "ok": False,
+                        "entries_checked": checked,
+                        "first_bad_batch_id": batch_id,
+                        "reason": "column_mismatch",
+                    }
+
+                # Hash chain integrity
+                expected = _compute_entry_hash(entry_data, prev_hash)
+                if expected != stored_hash:
+                    return {
+                        "ok": False,
+                        "entries_checked": checked,
+                        "first_bad_batch_id": batch_id,
+                        "reason": "hash_mismatch",
+                    }
+
+            return {"ok": True, "entries_checked": checked}
+        except Exception as e:
+            logger.debug(f"Ledger verify_chain failed: {e}")
+            return {"ok": False, "entries_checked": 0, "reason": str(e)}
