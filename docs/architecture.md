@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 113 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 114 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -521,6 +521,7 @@ Each hook:
 | `test_optimizer_does_not_fire_before_warmup` | No synthesis before 50 calls |
 | `test_optimizer_fires_after_warmup` | Synthesis fires after warmup threshold |
 | `test_optimizer_does_not_refire_within_gap` | At most one synthesis per `SYNTHESIS_GAP_S` |
+| `test_auto_optimizer_unknown_op_no_recursion` | `_build_prompt` must not recurse for unknown op names (regression: monkey-patch loop) |
 
 ### 6.8 Live GPU Proof (RTX PRO 6000 Blackwell, 2026-03-16)
 
@@ -1042,7 +1043,7 @@ FastAPI application with Prometheus metrics. Key endpoints:
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `POST` | `/optimize` | Any | Run full optimization pipeline on a model |
-| `POST` | `/agent` | Any | Autonomous multi-round optimization |
+| `POST` | `/agent` | — | **Removed** — returns `410 Gone`. Use `/optimize` instead. |
 | `GET` | `/status/{job_id}` | Any | Poll job status |
 | `GET` | `/metrics` | Admin | Prometheus text format (Pillar 4 collector) |
 | `GET` | `/ledger` | Any (tenant-scoped) | Per-batch energy/CO₂/cost savings JSON |
@@ -1219,12 +1220,12 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**113 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**114 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
 | `kernels/tests/test_kernels.py` | 19 | 19 PASS |
-| `serving/tests/test_serving_kernels.py` | 10 | 10 PASS |
+| `serving/tests/test_serving_kernels.py` | 11 | 11 PASS |
 | `vmm/tests/test_vmm_smoke.py` | 6 | 6 PASS |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
 | `cluster/tests/test_gkd.py` | 13 | 13 PASS |
