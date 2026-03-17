@@ -33,6 +33,9 @@ from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
+# MEMOPT_SIGNING_KEY must be set via environment variable only.
+# The application never writes this key to disk.
+# In production: inject via Kubernetes secret, AWS SSM, or Vault.
 _SIGNING_KEY  = os.environ.get("MEMOPT_SIGNING_KEY", "")
 _CERT_VERSION = "1.0"
 

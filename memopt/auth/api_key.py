@@ -42,6 +42,37 @@ log = logging.getLogger(__name__)
 KEY_PREFIX = "sk-memopt-"
 KEY_ENV_VAR = "MEMOPT_API_KEY"
 _DEFAULT_KEY_PATH = Path.home() / ".memopt" / "api_key"
+_MODE_600 = stat.S_IRUSR | stat.S_IWUSR   # owner read+write only
+
+
+def _secure_write(path: Path, content: str) -> None:
+    """
+    Write content to path with mode 0600 using an atomic rename.
+
+    Protocol:
+      1. Open path.tmp with O_CREAT | O_TRUNC and mode 0600
+      2. Write content
+      3. Rename path.tmp → path  (atomic on POSIX)
+      4. Harden final file permissions
+
+    A crash between steps 1 and 3 leaves a .tmp file with no damage
+    to the original. A crash between steps 3 and 4 leaves the final
+    file readable — chmod is idempotent.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(path) + ".tmp")
+    fd  = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _MODE_600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    tmp.rename(path)
+    path.chmod(_MODE_600)   # harden in case rename preserved wrong perms
 
 
 def generate_key() -> str:
@@ -53,14 +84,12 @@ def save_key(key: str, path: Path = None) -> Path:
     """
     Write *key* to *path* (default ``~/.memopt/api_key``) with permissions 600.
 
+    Uses an atomic rename so a crash mid-write cannot corrupt the file.
     Creates parent directories as needed.
     Returns the path actually written.
     """
     dest = path or _DEFAULT_KEY_PATH
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(key)
-    # chmod 600 — owner read/write only
-    dest.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    _secure_write(dest, key)
     log.info("API key saved to %s", dest)
     return dest
 
@@ -69,9 +98,11 @@ def load_key(path: Path = None) -> Optional[str]:
     """
     Return the stored API key, or *None* if no key file exists.
 
-    Environment variable ``MEMOPT_API_KEY`` takes priority over the file.
+    Priority: MEMOPT_API_KEY env var > ~/.memopt/api_key file.
+    Env var is checked BEFORE any filesystem access.
     Never logs the actual key — uses :func:`mask_key` for any log lines.
     """
+    # Env var takes priority — no disk read needed
     env_key = os.environ.get(KEY_ENV_VAR)
     if env_key:
         log.debug("API key loaded from env var %s (%s)", KEY_ENV_VAR, mask_key(env_key))
@@ -80,9 +111,23 @@ def load_key(path: Path = None) -> Optional[str]:
     src = path or _DEFAULT_KEY_PATH
     if not src.exists():
         return None
-    key = src.read_text().strip()
-    log.debug("API key loaded from %s (%s)", src, mask_key(key))
-    return key
+
+    # Warn if file has wrong permissions
+    file_mode = src.stat().st_mode & 0o777
+    if file_mode != 0o600:
+        log.warning(
+            "API key file %s has permissions %s — should be 0600. "
+            "Run: chmod 600 %s",
+            src, oct(file_mode), src,
+        )
+
+    try:
+        key = src.read_text().strip()
+        log.debug("API key loaded from %s (%s)", src, mask_key(key))
+        return key
+    except OSError as e:
+        log.warning("Cannot read API key file: %s", e)
+        return None
 
 
 def get_or_create_key(path: Path = None) -> str:

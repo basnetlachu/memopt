@@ -66,6 +66,7 @@ class CUDABackend:
             # TODO Phase 2: replace with GPUDirect Storage (GDS) for direct NVMe→HBM DMA at 14 GB/s
             f.write(b"\x00" * size_bytes)
             f.flush()
+            os.fsync(f.fileno())   # ensure zero-fill reaches disk before returning
             f.close()
             return f.name
         raise ValueError(f"Unknown tier: {tier!r}")
@@ -127,8 +128,20 @@ class CUDABackend:
                     # TODO Phase 2: replace with io_uring (liburing) for ~10 GB/s async NVMe
                     def _write():
                         cpu = src.cpu() if src.is_cuda else src
-                        with open(dst, "wb") as f:
-                            f.write(cpu.numpy().tobytes())
+                        data = cpu.numpy().tobytes()
+                        tmp_path = dst + ".tmp"
+                        try:
+                            with open(tmp_path, "wb") as f:
+                                f.write(data)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.rename(tmp_path, dst)  # atomic on POSIX
+                        except Exception:
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                            raise
                     threading.Thread(target=_write, daemon=True).start()
             else:
                 # tensor → tensor (HBM <-> DRAM)

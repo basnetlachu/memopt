@@ -19,10 +19,17 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Module-level singletons — initialised by init_hooks()
+# Module-level singletons — written once at startup, read on every request.
+# _hook_lock guards only the writes in init_hooks().
+# The reads in apply_* do NOT hold the lock — they rely on Python's
+# guaranteed atomic reference reads for module-level variables.
+# Module objects returned by cache.get() are captured in local variables
+# before run_kernel is called — this keeps the module alive (reference
+# count > 0) for the duration of the call even if the cache replaces
+# the entry concurrently.
 _cache:     Optional[object] = None
 _optimizer: Optional[object] = None
-_lock = threading.Lock()
+_hook_lock  = threading.Lock()   # guards init_hooks() writes only
 
 # Fallback telemetry — counts how many times each op fell back to PyTorch
 # due to a fused kernel error. A spike here is a canary that the synthesised
@@ -62,7 +69,7 @@ def init_hooks(cache, optimizer) -> None:
     and auto-optimizer. Safe to call multiple times — idempotent.
     """
     global _cache, _optimizer
-    with _lock:
+    with _hook_lock:
         _cache     = cache
         _optimizer = optimizer
     logger.info("Kernel hooks initialised")
@@ -98,7 +105,7 @@ def apply_rope(
         key    = cache_key("memopt.rope_fused",
                            [list(xq.shape), list(xk.shape)],
                            _get_hardware())
-        module = _cache.get(key)
+        module = _cache.get(key)   # local ref — keeps module alive (RCU pattern)
         if module is None:
             _log_cache_miss("memopt.rope_fused", "warmup")
         else:
@@ -107,6 +114,8 @@ def apply_rope(
                 _log_cache_miss("memopt.rope_fused", "no_run_kernel")
             else:
                 try:
+                    # module is referenced locally — safe from GC even if
+                    # cache replaces the entry concurrently during this call
                     return run(xq, xk, cos, sin)
                 except Exception as e:
                     _record_fallback("memopt.rope_fused")
@@ -142,7 +151,7 @@ def apply_layer_norm_residual(
         key    = cache_key("memopt.ln_residual_fused",
                            [list(x.shape), list(residual.shape)],
                            _get_hardware())
-        module = _cache.get(key)
+        module = _cache.get(key)   # local ref — keeps module alive (RCU pattern)
         if module is None:
             _log_cache_miss("memopt.ln_residual_fused", "warmup")
         else:
@@ -151,6 +160,8 @@ def apply_layer_norm_residual(
                 _log_cache_miss("memopt.ln_residual_fused", "no_run_kernel")
             else:
                 try:
+                    # module is referenced locally — safe from GC even if
+                    # cache replaces the entry concurrently during this call
                     return run(x, residual, weight, bias)
                 except Exception as e:
                     _record_fallback("memopt.ln_residual_fused")
@@ -183,7 +194,7 @@ def apply_scaled_softmax(
         key    = cache_key("memopt.scaled_softmax_fused",
                            [list(scores.shape)],
                            _get_hardware())
-        module = _cache.get(key)
+        module = _cache.get(key)   # local ref — keeps module alive (RCU pattern)
         if module is None:
             _log_cache_miss("memopt.scaled_softmax_fused", "warmup")
         else:
@@ -192,6 +203,8 @@ def apply_scaled_softmax(
                 _log_cache_miss("memopt.scaled_softmax_fused", "no_run_kernel")
             else:
                 try:
+                    # module is referenced locally — safe from GC even if
+                    # cache replaces the entry concurrently during this call
                     return run(scores, scale)
                 except Exception as e:
                     _record_fallback("memopt.scaled_softmax_fused")

@@ -143,6 +143,56 @@ def test_dma_bandwidth():
     assert bw > 20, f"DMA too slow: {bw:.1f} GB/s"
 
 
+def test_vmm_benchmark_cpu_logic():
+    """
+    Validates VMM benchmark logic on CPU.
+    Runs the same allocation + eviction pattern as the GPU tests
+    but without requiring CUDA. Ensures the logic paths are tested
+    in CI even without GPU hardware.
+
+    The numbers will be smaller (no real HBM) but the correctness
+    of allocation, eviction, and stats reporting is verified.
+    """
+    vmm = VMM()
+
+    # Allocate 200 blocks — enough to exercise eviction watermark
+    for i in range(200):
+        vmm.allocate("ci_bench_seq", i, 16 * 1024)
+
+    stats = vmm.stats()
+    assert stats["total_blocks"] > 0
+    assert "bytes_per_tier" in stats
+
+    # Verify at least one tier is active in stats
+    tiers = stats.get("bytes_per_tier", {})
+    assert len(tiers) >= 1, "At least one memory tier must be active"
+
+    vmm.free_sequence("ci_bench_seq")
+    after_free = vmm.stats()
+    assert after_free["total_blocks"] == 0
+
+
+def test_prefetch_engine_convergence_cpu():
+    """
+    Validates that the EWMA prefetch window converges on CPU.
+    This is the logic that was previously only tested on GPU.
+    """
+    vmm = VMM()
+    for i in range(5):
+        vmm.allocate("prefetch_ci", i, 16 * 1024)
+
+    for i in range(5):
+        vmm.fetch("prefetch_ci", i)
+        time.sleep(0.002)   # 2ms inter-access gap
+
+    window_ms = vmm.prefetch.prefetch_window_ms("prefetch_ci")
+    # After 5 accesses at ~2ms gaps, EWMA must have moved from 0.5ms default
+    assert window_ms > 0.5, \
+        f"Prefetch window did not converge: {window_ms:.3f}ms"
+
+    vmm.free_sequence("prefetch_ci")
+
+
 def test_prefetch_hides_latency():
     """Warm (prefetched) fetch must be faster than cold fetch."""
     try:

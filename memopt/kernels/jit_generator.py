@@ -28,6 +28,16 @@ ANTHROPIC_MODEL   = os.environ.get("MEMOPT_LLM_MODEL", "claude-sonnet-4-20250514
 MAX_TOKENS        = 2048
 SYNTHESIS_TIMEOUT = 30.0   # seconds — abandon synthesis if API takes longer
 
+# Retry / circuit breaker constants
+_MAX_RETRIES        = 3
+_RETRY_BASE_S       = 1.0    # first retry after 1s, then 2s, then 4s
+_CIRCUIT_OPEN_S     = 300.0  # stop retrying for 5 min after 3 consecutive failures
+
+# Circuit breaker state — module level so all JITGenerator instances share it
+_circuit_failures    = 0
+_circuit_opened_at   = 0.0
+_circuit_lock        = threading.Lock()
+
 _DTYPE_TOLERANCES = {
     "float16":  (1e-2, 1e-2),   # FP16 has ~3 decimal digits of precision
     "bfloat16": (1e-2, 1e-2),   # BF16 same range as FP16
@@ -251,37 +261,104 @@ class JITGenerator:
         """).strip()
 
     def _call_api(self, prompt: str, api_key: str) -> Optional[str]:
-        """Call the Claude API and return the kernel source string."""
-        try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
+        """
+        Call the Claude API with exponential backoff and circuit breaker.
 
-            response = client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            source = response.content[0].text.strip()
-            # Strip markdown code fences if the model wrapped the code
-            _FENCE_OPENINGS = {"```", "```python", "```triton", "```cuda"}
-            _FENCE_CLOSINGS = {"```"}
-            if source.splitlines()[0].strip() in _FENCE_OPENINGS:
-                lines = source.splitlines()[1:]   # strip opening fence
-                # Only strip closing fence if it is an exact match — not code
-                if lines and lines[-1].strip() in _FENCE_CLOSINGS:
-                    lines = lines[:-1]
-                source = "\n".join(lines).strip()
-            if not source.startswith("import triton"):
-                logger.warning(
-                    "JIT: API response did not start with 'import triton' "
-                    f"(got: {source[:80]!r})"
+        Circuit breaker opens after _MAX_RETRIES consecutive failures and
+        stays open for _CIRCUIT_OPEN_S seconds. While open, all synthesis
+        attempts fail immediately without hitting the API — this prevents
+        a cascade of blocked threads during an outage.
+
+        Retryable: rate limit (429), server error (500, 502, 503).
+        Non-retryable: auth error (401), bad request (400).
+        """
+        global _circuit_failures, _circuit_opened_at
+
+        # Check circuit breaker
+        with _circuit_lock:
+            if _circuit_failures >= _MAX_RETRIES:
+                elapsed = time.monotonic() - _circuit_opened_at
+                if elapsed < _CIRCUIT_OPEN_S:
+                    logger.warning(
+                        f"JIT circuit breaker OPEN — API synthesis suspended "
+                        f"for {_CIRCUIT_OPEN_S - elapsed:.0f}s more. "
+                        f"Inference continues on unfused path."
+                    )
+                    return None
+                else:
+                    # Half-open: allow one probe attempt
+                    _circuit_failures = 0
+                    logger.info("JIT circuit breaker half-open — probing API")
+
+        last_error = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                import anthropic
+                client   = anthropic.Anthropic(api_key=api_key)
+                response = client.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
                 )
-                return None
-            return source
+                source = response.content[0].text.strip()
 
-        except Exception as e:
-            logger.warning(f"JIT: API call failed: {e}")
-            return None
+                # Strip markdown fences (exact match only)
+                _FENCE_OPENINGS = {"```", "```python", "```triton", "```cuda"}
+                _FENCE_CLOSINGS = {"```"}
+                lines = source.splitlines()
+                if lines and lines[0].strip() in _FENCE_OPENINGS:
+                    lines = lines[1:]
+                    if lines and lines[-1].strip() in _FENCE_CLOSINGS:
+                        lines = lines[:-1]
+                    source = "\n".join(lines).strip()
+
+                if not source.startswith(("import triton", "import torch")):
+                    logger.warning(
+                        "JIT: API response did not start with import — discarding"
+                    )
+                    # Not a retryable error — the model returned something weird
+                    with _circuit_lock:
+                        _circuit_failures = 0
+                    return None
+
+                # Success — reset circuit breaker
+                with _circuit_lock:
+                    _circuit_failures = 0
+                return source
+
+            except Exception as e:
+                last_error = e
+                err_str    = str(e).lower()
+
+                # Non-retryable errors
+                if any(x in err_str for x in
+                       ("401", "unauthorized", "invalid api key",
+                        "400", "bad request")):
+                    logger.warning(f"JIT: non-retryable API error: {e}")
+                    with _circuit_lock:
+                        _circuit_failures = 0
+                    return None
+
+                # Retryable — apply backoff
+                wait = _RETRY_BASE_S * (2 ** attempt)
+                logger.warning(
+                    f"JIT: API attempt {attempt + 1}/{_MAX_RETRIES} failed: {e}. "
+                    f"Retrying in {wait:.1f}s"
+                )
+                time.sleep(wait)
+
+        # All retries exhausted — open circuit breaker
+        with _circuit_lock:
+            _circuit_failures += 1
+            if _circuit_failures >= _MAX_RETRIES:
+                _circuit_opened_at = time.monotonic()
+                logger.error(
+                    f"JIT circuit breaker OPENED after {_MAX_RETRIES} failures. "
+                    f"Last error: {last_error}. "
+                    f"Synthesis suspended for {_CIRCUIT_OPEN_S}s. "
+                    f"Inference continues on unfused path."
+                )
+        return None
 
     def _validate(self, compiled, event) -> bool:
         """
@@ -398,3 +475,15 @@ class JITGenerator:
                 "total_discarded":  self._total_discarded,
                 "in_flight":        len(self._in_flight),
             }
+
+
+def circuit_breaker_status() -> dict:
+    """Return current circuit breaker state for the /metrics endpoint."""
+    with _circuit_lock:
+        open_s = (_CIRCUIT_OPEN_S - (time.monotonic() - _circuit_opened_at)
+                  if _circuit_failures >= _MAX_RETRIES else 0.0)
+        return {
+            "state":       "open" if open_s > 0 else "closed",
+            "failures":    _circuit_failures,
+            "reopen_in_s": max(0.0, open_s),
+        }

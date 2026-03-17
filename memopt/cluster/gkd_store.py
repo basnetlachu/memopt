@@ -141,6 +141,9 @@ class RedisGKDBackend:
                               0.005 = 5ms. Keeps GKD lookup off the
                               hot inference path even if Redis is slow.
         """
+        self._degraded       = False
+        self._degraded_since: Optional[float] = None
+
         try:
             import redis, json
             self._redis = redis.Redis(
@@ -154,9 +157,30 @@ class RedisGKDBackend:
             self._redis.ping()
             logger.info("GKD Redis backend connected: %s:%d", host, port)
         except Exception as e:
-            logger.warning("GKD Redis unavailable (%s) — falling back to local backend", e)
             self._available = False
             self._local_fallback = LocalGKDBackend()
+            self._mark_degraded(str(e))
+
+    def _mark_degraded(self, reason: str) -> None:
+        """Mark this backend as degraded and log at ERROR level once."""
+        if not self._degraded:
+            self._degraded       = True
+            self._degraded_since = time.monotonic()
+            logger.error(
+                "GKD Redis DEGRADED: %s. "
+                "Falling back to local backend — cluster-wide "
+                "deduplication is disabled. "
+                "Check Redis connectivity and set REDIS_URL.",
+                reason,
+            )
+
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
+
+    @property
+    def degraded_since(self) -> Optional[float]:
+        return self._degraded_since
 
     def _key(self, content_hash: str) -> str:
         return f"{self._KEY_PREFIX}{content_hash}"
@@ -447,6 +471,8 @@ class GKDStore:
             "entries_in_store":            self._backend.size(),
             "collision_checks_total":      col_checks,
             "collision_detections_total":  col_dets,
+            "backend_degraded":            getattr(self._backend, "degraded", False),
+            "backend_degraded_since":      getattr(self._backend, "degraded_since", None),
         }
 
     def reset_stats(self):
