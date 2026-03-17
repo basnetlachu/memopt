@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 77 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 101 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -10,29 +10,28 @@
 
 1. [What memopt Does](#1-what-memopt-does)
 2. [Repository Layout](#2-repository-layout)
-3. [Three-Pillar Architecture](#3-three-pillar-architecture)
+3. [Four-Pillar Architecture](#3-four-pillar-architecture)
 4. [Pillar 1: Infinite Context VMM](#4-pillar-1-infinite-context-vmm)
 5. [Pillar 2: Global KV Cache Deduplication (GKD)](#5-pillar-2-global-kv-cache-deduplication-gkd)
 6. [Pillar 3: Self-Synthesizing Kernels](#6-pillar-3-self-synthesizing-kernels)
-7. [Profiling Pipeline](#7-profiling-pipeline)
-8. [Bottleneck Classification](#8-bottleneck-classification)
-9. [Access Pattern Analysis](#9-access-pattern-analysis)
-10. [Roofline Model](#10-roofline-model)
-11. [Hardware Detector and Model Type Detector](#11-hardware-detector-and-model-type-detector)
-12. [Universal Input Handler](#12-universal-input-handler)
-13. [Bandwidth Tracker](#13-bandwidth-tracker)
-14. [Power Sampler](#14-power-sampler)
-15. [Serving Engine: KV Cache, PagedAttention, Continuous Batching](#15-serving-engine-kv-cache-pagedattention-continuous-batching)
-16. [Background Daemon](#16-background-daemon)
-17. [Centralized Control Plane](#17-centralized-control-plane)
-18. [REST API Server](#18-rest-api-server)
-19. [API Key Authentication](#19-api-key-authentication)
-20. [License Validation](#20-license-validation)
+7. [Pillar 4: Proof of Efficiency (Observability)](#7-pillar-4-proof-of-efficiency-observability)
+8. [Profiling Pipeline](#8-profiling-pipeline)
+9. [Bottleneck Classification](#9-bottleneck-classification)
+10. [Access Pattern Analysis](#10-access-pattern-analysis)
+11. [Roofline Model](#11-roofline-model)
+12. [Hardware Detector and Model Type Detector](#12-hardware-detector-and-model-type-detector)
+13. [Universal Input Handler](#13-universal-input-handler)
+14. [Bandwidth Tracker](#14-bandwidth-tracker)
+15. [Power Sampler](#15-power-sampler)
+16. [Serving Engine: KV Cache, PagedAttention, Continuous Batching](#16-serving-engine-kv-cache-pagedattention-continuous-batching)
+17. [Background Daemon](#17-background-daemon)
+18. [Centralized Control Plane](#18-centralized-control-plane)
+19. [REST API Server](#19-rest-api-server)
+20. [API Key Authentication](#20-api-key-authentication)
 21. [Grafana Dashboard](#21-grafana-dashboard)
 22. [HTTPS / TLS](#22-https--tls)
-23. [Validation Suite](#23-validation-suite)
-24. [CLI Reference](#24-cli-reference)
-25. [Validated Real Numbers (A100)](#25-validated-real-numbers-a100)
+23. [CLI Reference](#23-cli-reference)
+24. [Validated Real Numbers (A100)](#24-validated-real-numbers-a100)
 
 ---
 
@@ -49,6 +48,7 @@ Beyond single-model optimization, memopt provides:
 - **Infinite Context VMM** — multi-tier (HBM → DRAM → NVMe) KV-block paging with predictive prefetch so long-context inference never OOMs.
 - **Global KV Cache Deduplication (GKD)** — cluster-wide content-addressed cache that eliminates redundant KV recomputation for shared prompt prefixes (90%+ hit rate in production).
 - **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference.
+- **Proof of Efficiency** — Prometheus metrics aggregator, per-batch energy/CO₂/cost savings ledger (SQLite), HMAC-signed optimization certificates, and GPU price arbitrage engine.
 - **Background daemon** — zero-touch GPU process monitor via NVML.
 - **Serving runtime** — OpenAI-compatible HTTP interface with paged attention and continuous batching.
 - **Control plane** — lightweight FastAPI server for cluster node reporting, status, and serving engine registration.
@@ -115,6 +115,13 @@ memopt/                        ← Python package root
 │   ├── input_handler.py
 │   ├── model_loader.py
 │   └── multimodal.py
+├── observability/             ← Pillar 4: Proof of Efficiency  [new]
+│   ├── collector.py           ← Prometheus-compatible metrics aggregator
+│   ├── ledger.py              ← Per-batch energy/CO₂/cost savings ledger (SQLite)
+│   ├── certificate.py         ← HMAC-SHA256 signed optimization certificates
+│   ├── arbitrage.py           ← RunPod/Lambda Labs GPU price arbitrage engine
+│   └── tests/
+│       └── test_observability.py
 ├── vmm/
 │   ├── hal.py
 │   ├── page_table.py
@@ -132,7 +139,7 @@ memopt/                        ← Python package root
 docs/
 ├── architecture.md            ← this file
 deploy/                        ← deployment artifacts (not Python)
-├── grafana/                   ← Grafana dashboard JSON (Pillar 4)
+├── grafana/                   ← Grafana dashboard JSON
 └── tls/                       ← nginx TLS config
 conftest.py                    ← root pytest fixtures
 pyproject.toml
@@ -141,15 +148,16 @@ setup.py
 
 ---
 
-## 3. Three-Pillar Architecture
+## 3. Four-Pillar Architecture
 
-memopt's core is built around three pillars that address the main GPU memory bottlenecks in production LLM serving:
+memopt's core is built around four pillars that address the main GPU memory bottlenecks in production LLM serving:
 
 | Pillar | Module | Problem Solved |
 |--------|--------|---------------|
 | **1 — Infinite Context VMM** | `vmm/` | KV cache OOM for long contexts |
 | **2 — Global KV Deduplication** | `cluster/` | Redundant KV recomputation for shared prefixes |
 | **3 — Self-Synthesizing Kernels** | `kernels/` | HBM stall from unoptimised CUDA kernels |
+| **4 — Proof of Efficiency** | `observability/` | Measure, certify, and monetise every optimization |
 
 Each pillar is independent — deployable standalone or in combination.
 
@@ -184,16 +192,26 @@ vmm.free_sequence("seq_001")
 |------|---------|-----------|------------|
 | HBM  | 1 µs    | 3,350 GB/s | `torch.empty(..., device="cuda")` |
 | DRAM | 80 µs   | 50 GB/s   | `torch.empty(...).pin_memory()` |
-| NVMe | 100 ms  | 14 GB/s   | Temp file via `tempfile.NamedTemporaryFile` |
+| NVMe | 100 ms  | 14 GB/s   | Temp file via `tempfile.NamedTemporaryFile` + fsync + atomic rename |
 
 ### 4.4 Prefetch Engine (`vmm/prefetch_engine.py`)
 
 Records per-sequence access patterns and issues async DRAM→HBM copies one block ahead on a dedicated CUDA stream (`_copy_stream`). Never touches the compute stream.
 
-### 4.5 Test Coverage
+### 4.5 NVMe Crash Safety (`vmm/backends/unified_backend.py`, `vmm/backends/cuda_backend.py`)
+
+All writes to NVMe-tier block files are crash-safe:
+
+1. **fsync on allocation** — `allocate()` calls `os.fsync()` after the initial zero-fill so the file exists on disk before the handle is returned.
+2. **Atomic eviction writes** — `_write_nvme_block(path, data)` writes to `path.tmp`, fsyncs, then `os.rename()`s atomically. A crash mid-write leaves an incomplete `.vmm_block.tmp`; the committed file is never partially written.
+3. **Crash recovery on startup** — `UnifiedBackend.__init__()` calls `_recover_nvme_dir(tempfile.gettempdir())` which removes any `*.vmm_block.tmp` files left by a previous crash before the process begins serving.
+
+The CUDA backend applies the same fsync-on-allocation and atomic-rename-on-eviction pattern.
+
+### 4.6 Test Coverage
 
 - `test_vmm_smoke.py`: allocate/fetch/free, stats, prefetch recording, multi-sequence isolation, error handling (6 tests)
-- `test_vmm_benchmark.py`: tier capacity, prefetch hit rate, promotion latency, DMA bandwidth (7 tests, 3 GPU-only skips on CPU)
+- `test_vmm_benchmark.py`: tier capacity, prefetch hit rate, promotion latency, DMA bandwidth + 2 CPU CI tests (9 tests, 3 GPU-only skips)
 
 ---
 
@@ -241,6 +259,8 @@ If a collision is detected, the entry is treated as a miss and an error is logge
 | `RedisGKDBackend` | Cluster-wide production | `redis-py` |
 
 Redis backend degrades gracefully to local if Redis is unreachable — inference never crashes.
+
+**Degradation alerting** — when `RedisGKDBackend` falls back to local, it calls `_mark_degraded(reason)` which logs at `ERROR` level (not `DEBUG`) exactly once. This makes Redis connectivity problems immediately visible in log aggregators and alerting systems. The degradation state is exposed in `GKDStore.stats()` as `backend_degraded: bool` and `backend_degraded_since: float | None` so Grafana and the `/metrics` endpoint can surface it. A spike in `backend_degraded=True` with `hit_rate_pct` dropping to ~0% indicates a Redis outage silently consuming compute that GKD would otherwise eliminate.
 
 ### 5.5 Transport (`cluster/transport.py`)
 
@@ -355,6 +375,18 @@ Constructs a synthesis prompt containing op name, input shapes, dtype, hardware 
 
 Deduplication: a set of `_in_flight` keys prevents synthesising the same (op, shapes, hardware) pair concurrently.
 
+**Retry with exponential backoff** — `_call_api()` retries up to `_MAX_RETRIES=3` times on transient failures (rate limits, 5xx errors) with `1s → 2s → 4s` wait between attempts. Non-retryable errors (401 auth failure, 400 bad request) return immediately without retrying and reset the circuit breaker.
+
+**Circuit breaker** — module-level state (`_circuit_failures`, `_circuit_opened_at`, `_circuit_lock`) shared across all `JITGenerator` instances in the process. Opens after 3 consecutive failures; all synthesis attempts return `None` immediately for the next 300 s (configurable via `_CIRCUIT_OPEN_S`). After the timeout the breaker enters half-open state — one probe attempt is made, and success resets the counter.
+
+| Constant | Default | Meaning |
+|----------|---------|---------|
+| `_MAX_RETRIES` | 3 | Attempts before exhausting |
+| `_RETRY_BASE_S` | 1.0 | First retry delay (doubles each attempt) |
+| `_CIRCUIT_OPEN_S` | 300.0 | Seconds breaker stays open after 3 failures |
+
+`circuit_breaker_status()` is a module-level function that returns `{state, failures, reopen_in_s}` — consumed by the `/metrics` endpoint and `circuit_breaker_status` Prometheus gauge.
+
 **Code fence stripping** — Claude API responses are stripped of markdown code fences using exact-match sets (`{"```", "```python", "```triton", "```cuda"}`) before passing source to Triton. Only an exact ` ``` ` is treated as a closing fence — prevents truncating the last line of the kernel.
 
 **Validation tolerances** — correctness check uses dtype-aware `atol`/`rtol` via the module-level `_DTYPE_TOLERANCES` dict; both tensors are cast to `.float()` before comparison to avoid dtype mismatch errors:
@@ -395,16 +427,18 @@ Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 - Kernels written to disk only after passing both correctness (dtype-aware tolerances — see 6.3) and benchmark (≥1.05x speedup) checks.
 - Triton not installed → `PortabilityLayer.compile()` returns `None`, logs a pip install hint.
 - Kernel cache files verified via SHA-256 on every reload — corrupted entries are deleted, not executed.
+- **Circuit breaker** — API failures open the breaker for 300 s so a Claude API outage cannot fill the thread pool with blocked synthesis requests. Inference continues on unfused path throughout.
+- **RCU hot-swap** — synthesised module references are captured locally before `run_kernel()` is called. No lock on the inference hot path.
 - **Module-level globals** — `KernelCache`, `PortabilityLayer`, `JITGenerator`, and `AutoOptimizer` are held as module-level globals in `serving/server.py` (`_p3_kv_cache`, `_p3_portability`, `_p3_generator`, `_p3_optimizer`) to prevent Python GC from collecting them while the server is running.
 
 ### 6.7 Test Coverage (no GPU, no API key required)
 
 | Group | Tests |
 |-------|-------|
-| BottleneckDetector | passthrough, callback, no-double-trigger, stats, access pattern |
+| BottleneckDetector | passthrough, callback, no-double-trigger, stats, access pattern, stall estimation CPU |
 | KernelCache | miss, put+get, hit rate, key stability, hardware differentiation, invalidate |
 | PortabilityLayer | CPU returns None, bad source returns None, target detection |
-| JITGenerator | no API key skip, deduplication, stats keys, prompt content |
+| JITGenerator | no API key skip, deduplication, stats keys, prompt content, circuit breaker state |
 | Integration | end-to-end CPU pipeline |
 
 ### 6.9 Serving Integration (`serving/auto_optimizer.py` + `serving/kernel_hooks.py`)
@@ -443,6 +477,8 @@ Each hook:
 5. On fused kernel error: calls `_record_fallback(op)` — thread-safe counter (TOCTOU-safe: count read inside lock, `logger.warning` fired outside lock).
 
 **Hardware-aware cache keys** — `_get_hardware()` includes both the CUDA arch name and device name in the key string (e.g. `cuda:ampere:NVIDIA A100-SXM4-80GB`). A kernel compiled for Blackwell (sm120) is never served to an Ampere node.
+
+**RCU hot-swap safety** — `_cache` and `_optimizer` are module-level singletons written once at startup (guarded by `_hook_lock`) and read on every inference request without a lock. Each hook captures the module reference from `cache.get(key)` in a local variable before calling `run_kernel`. This local reference keeps the module object alive (CPython reference count > 0) for the duration of the call, even if `KernelCache.put()` atomically replaces the cache entry on a concurrent synthesis thread. No lock is taken on the hot inference path — a lock around `run_kernel()` would serialize all requests.
 
 **Server startup** — `server.py` promotes all four Pillar 3 objects to module-level globals (`_p3_kv_cache`, `_p3_portability`, `_p3_generator`, `_p3_optimizer`) before passing them to `kernel_hooks.init_hooks()`. This prevents the objects from being garbage-collected at function return, which would silently kill all fused kernel lookups.
 
@@ -487,9 +523,154 @@ This is the architecturally correct outcome. PyTorch ships a hand-tuned cuBLAS G
 
 ---
 
-## 7. Profiling Pipeline
+## 7. Pillar 4: Proof of Efficiency (Observability)
 
-### 7.1 Hardware Counter Collection (`profiler/hardware_counters.py`)
+### 7.1 Overview
+
+Pillar 4 closes the loop: every speedup Pillar 1–3 claims is **measured**, **certified**, and **costed**. The observability layer exposes real numbers in Prometheus format, stores per-batch economics in SQLite, signs audit records with HMAC-SHA256, and continuously monitors GPU cloud prices for migration opportunities.
+
+All four components survive gracefully with no GPU, no API keys, no Redis, and no network access — they degrade to monitoring-only mode rather than crashing.
+
+```
+inference request
+      │
+      ▼
+  [Pillars 1–3 run, optimization applied]
+      │
+      ▼
+  MetricsCollector.poll()          ← every 15s, scrapes VMM / GKD / kernel_hooks / PowerSampler
+      │
+      ▼
+  OptimizationLedger.record()      ← per-batch: tokens, J/token, energy saved, CO₂, cost saved
+      │
+      ▼
+  sign_entry(entry)                ← HMAC-SHA256 certificate of committed speedup
+      │
+      ▼
+  ArbitrageEngine._tick()          ← compares effective $/token across cloud providers
+```
+
+### 7.2 Metrics Collector (`observability/collector.py`)
+
+`MetricRegistry` — thread-safe in-memory store with NaN guard and Prometheus text exposition:
+
+```python
+registry.set("memopt_power_avg_watts", 203.9)
+registry.set("memopt_gkd_hit_rate_pct", 91.2, labels={"node": "a100-01"})
+text = registry.prometheus_text()  # "# HELP ... # TYPE ... metric{label=...} value"
+```
+
+`MetricsCollector` polls the live pillars every 15 s in a daemon thread. Metric names:
+
+| Metric | Source |
+|--------|--------|
+| `memopt_vmm_hbm_bytes` | VMM `stats()` |
+| `memopt_vmm_virtual_physical_ratio` | VMM `stats()` |
+| `memopt_gkd_hit_rate_pct` | GKDStore `stats()` |
+| `memopt_gkd_hbm_saved_bytes` | GKDStore `stats()` |
+| `memopt_kernel_cache_hit_rate_pct` | KernelCache `stats()` |
+| `memopt_kernel_synthesis_succeeded` | JITGenerator `stats()` |
+| `memopt_power_avg_watts` | PowerSampler `report()` |
+| `memopt_cluster_borrows_total` | Hypervisor `stats()` |
+
+### 7.3 Optimization Ledger (`observability/ledger.py`)
+
+`OptimizationLedger` records per-batch economics in `~/.memopt/ledger.db` (SQLite, WAL mode):
+
+```python
+ledger.record(
+    tokens_processed=512,
+    actual_j_per_token=0.00042,
+    gkd_hit_rate=0.91,
+    speedup_ratio=1.44,
+)
+```
+
+`_compute_savings()` calculates from measured J/token values — never fabricates numbers:
+- `energy_saved_kwh = tokens × (baseline_j − actual_j) / 3_600_000`
+- `co2_saved_kg = energy_saved_kwh × grid_intensity_kg_per_kwh` (default 0.233 kg/kWh, IEA EU 2024)
+- `cost_saved_usd = energy_saved_kwh × electricity_price_usd` (default $0.12/kWh)
+
+Environment overrides: `MEMOPT_BASELINE_J_PER_TOKEN`, `MEMOPT_GRID_INTENSITY_KG_KWH`, `MEMOPT_ELECTRICITY_PRICE_USD`, `MEMOPT_GPU_PRICE_USD_HR`.
+
+`ledger.totals()` returns cumulative `energy_saved_kwh`, `co2_saved_kg`, `cost_saved_usd` for dashboards. Survives SQLite errors gracefully — writes are non-fatal, `totals()` returns zeros on DB failure.
+
+### 7.4 Optimization Certificates (`observability/certificate.py`)
+
+`sign_entry(entry)` produces a tamper-evident audit record for every committed speedup:
+
+```python
+cert = sign_entry(entry)
+# cert["status"] = "signed" | "unsigned"
+# cert["signature"] = "<sha256 hex>"  (when MEMOPT_SIGNING_KEY is set)
+# cert["payload"] = {...}
+# cert["issued_at"] = 1742200000.0
+```
+
+Signing: HMAC-SHA256 over canonical JSON (`json.dumps(..., sort_keys=True, separators=(',',':'))`). Verification: `verify_certificate(cert, key)` uses `hmac.compare_digest()` — constant-time comparison, not vulnerable to timing attacks.
+
+`MEMOPT_SIGNING_KEY` env var — if unset, certificates are issued as `"unsigned"` (valid audit trail, no tamper-evidence). Verification returns `False` for unsigned certs when a key is supplied.
+
+### 7.5 Arbitrage Engine (`observability/arbitrage.py`)
+
+`ArbitrageEngine` polls GPU cloud prices in a background daemon thread and recommends migrations when sustained savings exceed a threshold:
+
+```
+current GPU cost     RunPod price list       Lambda Labs price list
+        │                   │                        │
+        └───────────────────┴────────────────────────┘
+                            │
+                   effective $/token = price_hr / (tokens_per_sec × 3600 × speedup_ratio)
+                            │
+                   saving_pct > threshold for ≥ 5 consecutive minutes?
+                            │
+                           yes → MigrationRecommendation(from_gpu, to_gpu, saving_pct)
+```
+
+`_effective_cost(offer, tps, speedup)` — normalises cloud prices by actual throughput, accounting for memopt's speedup gains (a cheaper GPU running 1.5× slower may cost more per token).
+
+Sustained threshold: `MEMOPT_ARBI_THRESHOLD_PCT` (default 15%) must be exceeded for `MEMOPT_ARBI_SUSTAINED_M` consecutive minutes (default 5) before firing — prevents chasing transient price spikes.
+
+API keys (`RUNPOD_API_KEY`, `LAMBDA_API_KEY`) are optional — engine runs in monitoring-only mode without them, logging a `WARNING` at startup.
+
+### 7.6 API Integration (`api/server.py`)
+
+Two endpoints added to the REST API server:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/metrics` | Prometheus text format (all Pillar 4 metrics) |
+| `GET` | `/ledger` | Recent ledger entries + cumulative totals (JSON) |
+
+Both endpoints degrade gracefully when the Pillar 4 collector or ledger failed to initialise (returns empty metrics / empty ledger rather than 500).
+
+### 7.7 Grafana Dashboard (`deploy/grafana/memopt_dashboard.json`)
+
+The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3 new panels:
+
+| New Panel | Metric | Viz |
+|-----------|--------|-----|
+| VMM Virtual/Physical Ratio | `memopt_vmm_virtual_physical_ratio` | Stat |
+| Kernel Synthesis Outcomes | `memopt_kernel_synthesis_succeeded` | Pie chart |
+| Cross-Node Borrows Total | `memopt_cluster_borrows_total` | Stat |
+
+### 7.8 Test Coverage (`observability/tests/test_observability.py`)
+
+20 CPU-only tests — no GPU, no API keys, no network required:
+
+| Group | Tests |
+|-------|-------|
+| MetricRegistry | CRUD, NaN guard, Prometheus text format, label encoding |
+| MetricsCollector | Mock GKD polling, daemon thread lifecycle |
+| Ledger | record/totals, precision (`< 1e-10`), DB-error survival |
+| Certificates | sign/verify round-trip, tamper detection, unsigned mode |
+| Arbitrage | No-keys startup, effective cost formula, threshold logic, dry-run |
+
+---
+
+## 8. Profiling Pipeline
+
+### 8.1 Hardware Counter Collection (`profiler/hardware_counters.py`)
 
 `HardwareCounterCollector` uses three methods in order of fidelity:
 
@@ -514,7 +695,7 @@ metrics = collector.collect(model, sample_input)
 # metrics.stall_rate, metrics.l2_hit_rate, metrics.dram_bytes_read, ...
 ```
 
-### 7.2 Phase 1 Profiler (`profiler/profiler.py`)
+### 8.2 Phase 1 Profiler (`profiler/profiler.py`)
 
 `Phase1Profiler` wraps the collector and produces a `ProfileReport`:
 
@@ -527,19 +708,19 @@ report = profiler.profile(model, sample_input)
 
 `LiveDashboard` prints a real-time terminal table updated every `interval_s` seconds.
 
-### 7.3 NCU Profiler (`profiler/ncu_profiler.py`)
+### 8.3 NCU Profiler (`profiler/ncu_profiler.py`)
 
 `NCUProfiler` manages the Nsight Compute subprocess, parses counter CSV, and returns `NCUCounters`. Used by `HardwareCounterCollector` when available.
 
-### 7.4 Traffic Attribution (`profiler/attribution.py`)
+### 8.4 Traffic Attribution (`profiler/attribution.py`)
 
 `TrafficAttributor` hooks `nn.Module.forward` to attribute HBM bytes read/written to individual layers. `TensorTracker` records per-tensor access patterns. Output: per-layer `Attribution` with estimated traffic and `OptimizationCandidate` list.
 
 ---
 
-## 8. Bottleneck Classification
+## 9. Bottleneck Classification
 
-### 8.1 Classifier (`profiler/classifier.py`)
+### 9.1 Classifier (`profiler/classifier.py`)
 
 `BottleneckClassifier` consumes `HardwareCounters` and applies a decision tree across five types:
 
@@ -558,16 +739,16 @@ Each classification returns:
 - `root_cause: str`
 - `recommendations: List[OptimizationRecommendation]` — ranked by expected impact
 
-### 8.2 Fixed Boundaries (confirmed on A100)
+### 9.2 Fixed Boundaries (confirmed on A100)
 
 - `is_cache_bound`: `l2_hit > 50%` — high hit rate means L2 bandwidth-bound (not DRAM-bound).
 - `is_dram_bound`: `l2_hit <= 50%` — cache misses go to HBM.
 
 ---
 
-## 9. Access Pattern Analysis
+## 10. Access Pattern Analysis
 
-### 9.1 Analyzers (`profiler/access_analyzer.py`)
+### 10.1 Analyzers (`profiler/access_analyzer.py`)
 
 Three specialized analyzers run in Phase 2:
 
@@ -579,9 +760,9 @@ Three specialized analyzers run in Phase 2:
 
 ---
 
-## 10. Roofline Model
+## 11. Roofline Model
 
-### 10.1 Ridge Point (`profiler/roofline.py`)
+### 11.1 Ridge Point (`profiler/roofline.py`)
 
 The ridge point separates compute-bound from memory-bound regimes:
 
@@ -593,15 +774,15 @@ For A100-SXM4-80GB: ridge ≈ 156 FLOP/byte (BF16 TensorCore / 2 TB/s HBM2e).
 
 A kernel with arithmetic intensity (AI) below the ridge is memory-bound; above it is compute-bound.
 
-### 10.2 GPU Specs Database (`profiler/gpu_specs.py`)
+### 11.2 GPU Specs Database (`profiler/gpu_specs.py`)
 
 Single source of truth for 28+ GPUs: H100, A100-SXM4, A100-PCIe, A10, RTX 4090/3090/3080, V100, and more. Each entry: `peak_flops_fp16`, `memory_bandwidth_bytes`, `l2_cache_bytes`, `compute_capability`.
 
 ---
 
-## 11. Hardware Detector and Model Type Detector
+## 12. Hardware Detector and Model Type Detector
 
-### 11.1 Hardware Detector (`utils/hardware_detector.py`)
+### 12.1 Hardware Detector (`utils/hardware_detector.py`)
 
 `detect_hardware()` returns a `HardwareProfile` with:
 
@@ -621,7 +802,7 @@ class HardwareProfile:
 
 `get_applicable_optimizations(model_family, hw)` returns a filtered list of optimization candidates for the specific hardware. Flash Attention 3 and FP8 are gated to `CC ≥ (9, 0)` (Hopper+).
 
-### 11.2 Model Type Detection (`utils/hardware_detector.py`)
+### 12.2 Model Type Detection (`utils/hardware_detector.py`)
 
 `detect_model_type(model)` classifies models into families:
 - `transformer_encoder` — BERT-style (class name contains "Bert" / "Roberta" etc.)
@@ -630,7 +811,7 @@ class HardwareProfile:
 
 Class-name matching runs first; structure fallback (checks for `conv2d` vs `MultiheadAttention` submodules) runs if no match.
 
-### 11.3 Shared GPU Info Helper (`utils/gpu_info.py`)
+### 12.3 Shared GPU Info Helper (`utils/gpu_info.py`)
 
 `get_cuda_info()` returns a lightweight `CudaInfo` dataclass:
 
@@ -648,9 +829,9 @@ Both `hardware_detector.py` and `portability_layer.py` call `get_cuda_info()` fo
 
 ---
 
-## 12. Universal Input Handler
+## 13. Universal Input Handler
 
-### 12.1 `utils/input_handler.py`
+### 13.1 `utils/input_handler.py`
 
 `detect_input_format(inputs)` handles four formats a model might receive:
 
@@ -665,9 +846,9 @@ Both `hardware_detector.py` and `portability_layer.py` call `get_cuda_info()` fo
 
 ---
 
-## 13. Bandwidth Tracker
+## 14. Bandwidth Tracker
 
-### 13.1 `measurement/bandwidth_tracker.py`
+### 14.1 `measurement/bandwidth_tracker.py`
 
 `BandwidthTracker` wraps model forward passes with CUDA event pairs and `torch.cuda.memory_snapshot()`. Returns a `BandwidthMeasurement`:
 
@@ -682,9 +863,9 @@ measurement = tracker.measure(model, inputs, n_iters=50)
 
 ---
 
-## 14. Power Sampler
+## 15. Power Sampler
 
-### 14.1 `profiler/power_sampler.py`
+### 15.1 `profiler/power_sampler.py`
 
 `PowerSampler` polls `pynvml.nvmlDeviceGetPowerUsage()` in a background thread at configurable intervals (default 100ms, tests use 20ms).
 
@@ -701,23 +882,23 @@ report = sampler.report()
 
 ---
 
-## 15. Serving Engine: KV Cache, PagedAttention, Continuous Batching
+## 16. Serving Engine: KV Cache, PagedAttention, Continuous Batching
 
-### 15.1 KV Cache (`serving/kv_cache.py`)
+### 16.1 KV Cache (`serving/kv_cache.py`)
 
 `KVCache` stores key-value tensors for each layer and sequence. `KVCacheConfig` sets max sequences, max seq length, and per-layer tensor shape.
 
 `KVCacheWrappedModel` wraps any model and automatically manages cache population/invalidation.
 
-### 15.2 Paged Attention (`serving/paged_attention.py`)
+### 16.2 Paged Attention (`serving/paged_attention.py`)
 
 `PagedKVCache` allocates KV storage in fixed-size blocks (`BLOCK_SIZE = 16` tokens). Each `SequenceState` holds a list of block indices. New blocks are allocated on demand; old blocks are freed when a sequence finishes. Enables 2× concurrency vs. a naive contiguous allocation scheme.
 
-### 15.3 Continuous Batching (`serving/continuous_batching.py`)
+### 16.3 Continuous Batching (`serving/continuous_batching.py`)
 
 `ContinuousBatchingEngine` maintains a request queue. On each iteration it collects all ready requests into a single padded batch, calls the model once, and returns outputs to individual waiters. `BatchingConfig` controls `max_batch_size` and `max_wait_ms`.
 
-### 15.4 Serving Server (`serving/server.py`)
+### 16.4 Serving Server (`serving/server.py`)
 
 FastAPI app with OpenAI-compatible `/v1/completions` and `/v1/chat/completions` endpoints. Launched via `memopt serve --model <path> --port 8080`.
 
@@ -736,9 +917,9 @@ The initialisation sequence is: `KernelCache → PortabilityLayer → JITGenerat
 
 ---
 
-## 16. Background Daemon
+## 17. Background Daemon
 
-### 16.1 Architecture (`daemon/`)
+### 17.1 Architecture (`daemon/`)
 
 ```
 MemoptDaemon
@@ -750,7 +931,7 @@ MemoptDaemon
 └── ControlPlaneReporter — pushes metrics to control plane REST API
 ```
 
-### 16.2 Usage
+### 17.2 Usage
 
 ```bash
 # Scan all running GPU processes
@@ -767,18 +948,18 @@ memopt apply --pid <PID> --mode turbo
 
 ---
 
-## 17. Centralized Control Plane
+## 18. Centralized Control Plane
 
 The control plane is a lightweight FastAPI server in `memopt/control_plane/server.py` that handles node reporting, cluster status queries, and serving engine registration. Fleet-wide alerts, gossip propagation, and eBPF endpoint hooks were removed in the current architecture.
 
-### 17.1 Database (`control_plane/database.py`)
+### 18.1 Database (`control_plane/database.py`)
 
 SQLite with WAL mode. Three tables:
 - `nodes` — node ID, hostname, GPU count, last heartbeat
 - `events` — optimization events with before/after metrics
 - `metrics` — time-series GPU utilisation and memory usage
 
-### 17.2 Server (`control_plane/server.py`)
+### 18.2 Server (`control_plane/server.py`)
 
 FastAPI with endpoints:
 - `GET /nodes` — list all registered nodes
@@ -788,7 +969,7 @@ FastAPI with endpoints:
 - `GET /` — HTML dashboard (vanilla JS, 30s auto-refresh)
 - `GET /health` — liveness probe
 
-### 17.3 CLI
+### 18.3 CLI
 
 ```bash
 memopt control-plane start --port 8765
@@ -799,9 +980,9 @@ memopt cluster events --last 24h
 
 ---
 
-## 18. REST API Server
+## 19. REST API Server
 
-### 18.1 `api/server.py`
+### 19.1 `api/server.py`
 
 FastAPI application with Prometheus metrics. Key endpoints:
 
@@ -809,7 +990,8 @@ FastAPI application with Prometheus metrics. Key endpoints:
 |--------|------|-------------|
 | `POST` | `/optimize` | Run full optimization pipeline on a model |
 | `GET` | `/profile` | Profile a model and return bottleneck report |
-| `GET` | `/metrics` | Prometheus text format |
+| `GET` | `/metrics` | Prometheus text format (Pillar 4 collector) |
+| `GET` | `/ledger` | Per-batch energy/CO₂/cost savings JSON (Pillar 4 ledger) |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/stats` | Aggregated optimization statistics |
 
@@ -820,55 +1002,54 @@ curl -X POST http://localhost:8080/optimize \
   -d '{"model": "bert-base-uncased", "target_speedup": 1.5}'
 ```
 
-Prometheus metrics include `memopt_speedup_ratio`, `memopt_optimizations_applied_total`, `memopt_rollbacks_total`, and `memopt_hbm_saved_bytes`.
+Prometheus metrics include `memopt_power_avg_watts`, `memopt_vmm_hbm_bytes`, `memopt_gkd_hit_rate_pct`, `memopt_kernel_cache_hit_rate_pct`, `memopt_speedup_ratio`, and `memopt_cluster_borrows_total`.
 
 ---
 
-## 19. API Key Authentication
+## 20. API Key Authentication
 
-### 19.1 `auth/api_key.py`
+### 20.1 `auth/api_key.py`
 
-Keys are 32-byte random hex strings prefixed with `memopt_`. Stored at `~/.memopt/api_key`.
+Keys are 32-byte random hex strings prefixed with `sk-memopt-`. Priority: `MEMOPT_API_KEY` env var > `~/.memopt/api_key` file. The env var is checked **before** any filesystem access — if set, the file is never read.
 
 ```python
-from memopt.auth import generate_key, verify_key
-key = generate_key()          # "memopt_<64 hex chars>"
-assert verify_key(key, key)   # True
+from memopt.auth.api_key import get_or_create_key, load_key, verify_key
+key = get_or_create_key()     # loads env var, or reads/creates ~/.memopt/api_key
+assert verify_key(key, key)   # constant-time hmac.compare_digest
 ```
 
-The REST API reads the key from the `X-API-Key` header and calls `verify_key()` against the stored key. Returns HTTP 401 on mismatch.
+**Atomic key storage** — `save_key()` uses `_secure_write()` which:
+1. Opens `path.tmp` with `O_CREAT | O_TRUNC | 0600` (restricted from creation)
+2. Writes the key
+3. `os.rename(path.tmp → path)` — atomic on POSIX; a crash mid-write cannot corrupt the existing file
+4. `os.chmod(path, 0600)` — hardens in case rename preserved wrong permissions
 
----
+**Permission enforcement** — `load_key()` checks `os.stat().st_mode & 0o777 == 0o600` and logs a `WARNING` if the file has wider permissions (e.g. `0644`). The operator is told to run `chmod 600 ~/.memopt/api_key`.
 
-## 20. License Validation
+**Production deployment** — inject via `MEMOPT_API_KEY` environment variable (Kubernetes secret, AWS SSM Parameter Store, HashiCorp Vault). When the env var is set, no file is created or read.
 
-### 20.1 `license/validator.py`
-
-`validate_license()` checks `MEMOPT_LICENSE_KEY` env var against the Keygen.sh API. Returns a `LicenseStatus` with:
-- `valid: bool`
-- `entitlements: List[str]` — e.g. `["gpu:4", "cluster:true"]`
-- `expires_at: datetime`
-- `grace_period_active: bool`
-
-`check_gpu_limit(n_gpus)` raises `LicenseError` if the deployment exceeds the licensed GPU count. `require_license()` is a decorator for gating features.
+The REST API reads the key from the `X-Memopt-API-Key` header and calls `verify_key()` against the stored key. Returns HTTP 401 on mismatch.
 
 ---
 
 ## 21. Grafana Dashboard
 
-`deploy/grafana/memopt_dashboard.json` — 9-panel Grafana dashboard:
+`deploy/grafana/memopt_dashboard.json` — 12-panel Grafana dashboard (9 original + 3 Pillar 4):
 
-| Panel | Metric |
-|-------|--------|
-| GPU Utilisation | `memopt_gpu_util_pct` |
-| HBM Used | `memopt_hbm_used_bytes` |
-| Speedup Distribution | `memopt_speedup_ratio` |
-| Optimizations/hour | `memopt_optimizations_applied_total` |
-| Rollbacks/hour | `memopt_rollbacks_total` |
-| HBM Saved (GKD) | `memopt_hbm_saved_bytes` |
-| GKD Hit Rate | `memopt_gkd_hit_rate_pct` |
-| Power (W) | `memopt_power_watts` |
-| Latency p99 | `memopt_inference_latency_p99_ms` |
+| Panel | Metric | Viz |
+|-------|--------|-----|
+| GPU Utilisation | `memopt_gpu_util_pct` | Time series |
+| HBM Used | `memopt_vmm_hbm_bytes` | Time series |
+| Speedup Distribution | `memopt_speedup_ratio` | Bar chart |
+| Optimizations/hour | `memopt_optimizations_applied_total` | Stat |
+| Rollbacks/hour | `memopt_rollbacks_total` | Stat |
+| HBM Saved (GKD) | `memopt_gkd_hbm_saved_bytes` | Time series |
+| GKD Hit Rate | `memopt_gkd_hit_rate_pct` | Gauge |
+| Power (W) | `memopt_power_avg_watts` | Time series |
+| Latency p99 | `memopt_inference_latency_p99_ms` | Time series |
+| VMM Virtual/Physical Ratio | `memopt_vmm_virtual_physical_ratio` | Stat |
+| Kernel Synthesis Outcomes | `memopt_kernel_synthesis_succeeded` | Pie chart |
+| Cross-Node Borrows Total | `memopt_cluster_borrows_total` | Stat |
 
 Auto-provisioned via `deploy/grafana/provisioning/datasources/prometheus.yml` and `deploy/grafana/provisioning/dashboards/memopt.yml`.
 
@@ -889,23 +1070,7 @@ Auto-provisioned via `deploy/grafana/provisioning/datasources/prometheus.yml` an
 
 ---
 
-## 23. Validation Suite
-
-### 23.1 `validation/hardware_validator.py`
-
-`HardwareValidator` runs a micro-benchmark suite and validates against expected values for the detected GPU. Uses Nsight Compute when available for precise counter validation.
-
-### 23.2 `validation/run_validation.py`
-
-`validate_optimization(model, original, optimized)` runs correctness and performance checks:
-- Output delta < `atol` vs unoptimised model
-- Speedup ≥ `min_speedup_threshold`
-
-Returns `ValidationReport` with pass/fail per check.
-
----
-
-## 24. CLI Reference
+## 23. CLI Reference
 
 ```bash
 # Profile a model
@@ -941,7 +1106,7 @@ memopt sessions show <id>
 
 ---
 
-## 25. Validated Real Numbers (A100)
+## 24. Validated Real Numbers (A100)
 
 All numbers from NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124, torchao 0.16.0.
 
@@ -987,7 +1152,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**77 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**97 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
@@ -998,5 +1163,6 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `cluster/tests/test_gkd.py` | 13 | 13 PASS |
 | `cluster/tests/test_cluster.py` | 14 | 14 PASS |
 | `cluster/tests/test_pillar2_twonode.py` | 8 | 6 PASS, 1 SKIP, 1 flaky* |
+| `observability/tests/test_observability.py` | 20 | 20 PASS |
 
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.
