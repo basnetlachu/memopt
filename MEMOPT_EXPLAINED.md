@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 83 tests (5 live-GPU Pillar 3 + 19 Pillar 3 unit + 40 Pillar 1/2 + VMM smoke + benchmarks), 0 failures
+**Test suite:** 92 tests (5 live-GPU Pillar 3 + 19 Pillar 3 unit + 9 serving-layer + 40 Pillar 1/2 + VMM smoke + benchmarks), 0 failures
 
 ---
 
@@ -115,11 +115,15 @@ memopt/
 │   └── tests/
 │       └── test_kernels.py          19 tests — all pass CPU-only, no API key required
 │
-├── serving/                         INFERENCE SERVING
+├── serving/                         INFERENCE SERVING + PILLAR 3 RUNTIME
 │   ├── kv_cache.py                  KVCache, KVCacheConfig, KVCacheEntry
 │   ├── paged_attention.py           PagedKVCache — fixed-size block allocator
 │   ├── continuous_batching.py       ContinuousBatchingEngine — N concurrent requests / 1 call
-│   └── server.py                    OpenAI-compatible FastAPI serving application
+│   ├── server.py                    OpenAI-compatible FastAPI serving application
+│   ├── auto_optimizer.py            AutoOptimizer — background synthesis scheduler + stall probe
+│   ├── kernel_hooks.py              apply_rope / apply_layer_norm_residual / apply_scaled_softmax
+│   └── tests/
+│       └── test_serving_kernels.py  9 tests — hooks, cache hit/miss, fallback telemetry, warm-up
 │
 ├── daemon/                          BACKGROUND DAEMON
 │   ├── daemon_service.py            MemoptDaemon, DaemonConfig — main service loop
@@ -318,6 +322,9 @@ Redis backend degrades gracefully to local if Redis is unreachable — inference
 
 When a CUDA kernel stalls on HBM access, the system automatically synthesises a replacement fused Triton kernel — without stopping inference. The pipeline runs entirely in daemon threads.
 
+There are two entry points into Pillar 3:
+
+**A — Direct detection path** (general ops via `BottleneckDetector`):
 ```
 inference thread
       │
@@ -346,13 +353,37 @@ inference thread
         PortabilityLayer.compile(source, hardware)
             │
             ▼
-        validate() — correctness vs PyTorch reference (atol=1e-3)
+        validate() — correctness vs PyTorch reference (dtype-aware tolerances)
             │
             ▼
         benchmark() — must be ≥ 1.05x faster
             │
             ▼
         KernelCache.put(key, module, event)
+```
+
+**B — Serving hook path** (three fixed ops wired directly into the serving runtime):
+```
+inference request
+      │
+      ▼
+  kernel_hooks.apply_rope() / apply_layer_norm_residual() / apply_scaled_softmax()
+      │
+      ├─ cache hit?  → run synthesised fused kernel (fused path)
+      │
+      └─ cache miss: → run unfused PyTorch (correctness guaranteed)
+                │         log reason: 'no_cache' | 'warmup' | 'no_run_kernel'
+                │
+                ▼
+          AutoOptimizer.notify(op_name, args)
+                │
+                └─ after WARM_UP_CALLS (default 50): fire synthesis in daemon thread
+                        │
+                        ▼
+                   _measure_stall_rate() — CUDA event probe on live tensors
+                        │
+                        ▼
+                   JITGenerator.handle(event)  → same pipeline as path A above
 ```
 
 ### 6.2 BottleneckDetector (`kernels/bottleneck_detector.py`)
@@ -370,9 +401,24 @@ Zero overhead when CUDA is not available — falls through immediately.
 
 ### 6.3 JITGenerator (`kernels/jit_generator.py`)
 
-Constructs a synthesis prompt containing op name, input shapes, dtype, hardware target, access pattern, and observed stall rate. Calls `claude-sonnet-4-20250514` via the `anthropic` SDK. API key from `ANTHROPIC_API_KEY`; if not set, logs a warning and returns — baseline kernel continues running, inference is never interrupted.
+Constructs a synthesis prompt containing op name, input shapes, dtype, hardware target, access pattern, and observed stall rate. Calls the Claude API via the `anthropic` SDK.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `ANTHROPIC_API_KEY` | — | Required for synthesis; if unset, logs warning and returns — inference never interrupted |
+| `MEMOPT_LLM_MODEL` | `claude-sonnet-4-20250514` | Override model snapshot without code changes |
 
 Deduplication: a set of `_in_flight` keys prevents synthesising the same (op, shapes, hardware) pair concurrently.
+
+**Code fence stripping** — Claude API responses are stripped of markdown code fences using exact-match sets (`{"```", "```python", "```triton", "```cuda"}`) before passing source to Triton. Only an exact ` ``` ` is treated as a closing fence — prevents truncating the last line of the kernel.
+
+**Validation tolerances** — correctness check uses dtype-aware `atol`/`rtol` via the module-level `_DTYPE_TOLERANCES` dict; both tensors are cast to `.float()` before comparison to avoid dtype mismatch errors:
+
+| Dtype | atol | rtol |
+|-------|------|------|
+| `float16` / `bfloat16` | 1e-2 | 1e-2 |
+| `float32` | 1e-5 | 1e-5 |
+| `float64` | 1e-8 | 1e-8 |
 
 ### 6.4 PortabilityLayer (`kernels/portability_layer.py`)
 
@@ -380,9 +426,9 @@ Routes compilation to the correct backend detected at runtime:
 
 | Target | Path | Mechanism |
 |--------|------|-----------|
-| `cuda` | NVIDIA | `exec()` Triton source — Triton JIT → PTX |
-| `rocm` | AMD | `exec()` Triton source — Triton JIT → AMDGCN |
-| `mlir` | Custom ASIC | Writes `.mlir` file to `MEMOPT_MLIR_OUT_DIR` |
+| `triton_cuda` | NVIDIA | Writes source to tempfile, imports via `importlib` — Triton `@jit` → PTX |
+| `triton_rocm` | AMD | Same as CUDA path + NaN/Inf smoke test before accepting kernel |
+| `mlir` | Custom ASIC | Writes `.mlir` file to `MEMOPT_MLIR_OUT_DIR` with `<timestamp>_<uuid8>.mlir` filename |
 | `cpu` | No GPU | Returns `None` immediately |
 
 Returns a `types.ModuleType` with a `run_kernel` callable, or `None` on any failure. Never raises.
@@ -395,12 +441,15 @@ Two levels:
 
 Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 
+**Integrity verification** — on `_write_to_disk`, a `source_sha256` field (SHA-256 of the kernel source) is stored alongside the entry. On `_load_from_disk`, the hash is verified before `exec()`. Entries that fail the check are deleted from disk and skipped — a corrupted or tampered cache file cannot execute arbitrary code silently.
+
 ### 6.6 Design Constraints
 
 - No top-level `torch` or `triton` imports — all lazy inside functions. Package imports cleanly on CPU-only machines.
 - All synthesis in daemon threads — inference never blocks.
-- Kernels written to disk only after passing both correctness (atol=1e-3 vs PyTorch reference) and benchmark (≥1.05x speedup) checks.
+- Kernels written to disk only after passing both correctness (dtype-aware tolerances — see 6.3) and benchmark (≥1.05x speedup) checks.
 - Triton not installed → `PortabilityLayer.compile()` returns `None`, logs a pip install hint.
+- Kernel cache files verified via SHA-256 on every reload — corrupted entries are deleted, not executed.
 
 ### 6.7 Test Coverage (19/19 pass — no GPU, no API key required)
 
@@ -411,6 +460,60 @@ Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 | PortabilityLayer | CPU returns None, bad source returns None, target detection |
 | JITGenerator | no API key skip, deduplication, stats keys, prompt content |
 | Integration | end-to-end CPU pipeline |
+
+### 6.9 Serving Integration (`serving/auto_optimizer.py` + `serving/kernel_hooks.py`)
+
+These two modules wire Pillar 3 into the live inference path. They are initialised once at server startup and run in the background for the process lifetime.
+
+#### AutoOptimizer (`serving/auto_optimizer.py`)
+
+Background scheduler that watches hook call frequency and fires synthesis when a hot op reaches steady state. Thread-safe via `threading.RLock`.
+
+| Constant | Default | Env override | Meaning |
+|----------|---------|-------------|---------|
+| `WARM_UP_CALLS` | 50 | — | Calls before triggering synthesis |
+| `SYNTHESIS_GAP_S` | 300.0 | — | Seconds between re-synthesis attempts per op |
+| `STALL_RATE_PROXY` | 0.65 | `MEMOPT_STALL_RATE_PROXY` | Fallback stall rate when CUDA measurement fails |
+
+**Real stall rate measurement** — `_measure_stall_rate(args)` uses a CUDA event pair to probe the actual HBM bandwidth on the live tensors before synthesis. Compares elapsed time to the theoretical minimum (`probe_bytes / peak_HBM_BW`). Falls back to `STALL_RATE_PROXY` on CPU or if the probe tensors are < 1 KiB.
+
+**Prompt routing** — `_build_prompt(event)` dispatches to op-specific prompt builders (the same validated prompts used in `test_pillar3_fused.py`) with shape validation. Unknown ops or shape mismatches log a `WARNING` and fall back to the JITGenerator's generic prompt builder.
+
+#### Kernel Hooks (`serving/kernel_hooks.py`)
+
+Three drop-in replacements for ops that are frequent in every transformer model:
+
+| Hook | Op replaced | Cache miss fallback |
+|------|-------------|---------------------|
+| `apply_rope(xq, xk, cos, sin)` | Rotary Position Embedding | `_rope_unfused()` |
+| `apply_layer_norm_residual(x, residual, w, b)` | Residual add + LayerNorm | `F.layer_norm(x + residual, ...)` |
+| `apply_scaled_softmax(scores, scale)` | Scale + Softmax | `F.softmax(scores * scale, dim=-1)` |
+
+Each hook:
+1. Calls `AutoOptimizer.notify()` — increments call count, fires synthesis after warmup.
+2. Checks `KernelCache` by `(op, shapes, hardware_arch)` key.
+3. On cache hit: calls `module.run_kernel(*args)` — the synthesised fused kernel.
+4. On cache miss: falls back to unfused PyTorch and logs the reason at `DEBUG` level (`no_cache` | `warmup` | `no_run_kernel`).
+5. On fused kernel error: calls `_record_fallback(op)` — thread-safe counter (TOCTOU-safe: count read inside lock, `logger.warning` fired outside lock).
+
+**Hardware-aware cache keys** — `_get_hardware()` includes both the CUDA arch name and device name in the key string (e.g. `cuda:ampere:NVIDIA A100-SXM4-80GB`). A kernel compiled for Blackwell (sm120) is never served to an Ampere node.
+
+**Server startup** — `server.py` promotes all four Pillar 3 objects to module-level globals (`_p3_kv_cache`, `_p3_portability`, `_p3_generator`, `_p3_optimizer`) before passing them to `kernel_hooks.init_hooks()`. This prevents the objects from being garbage-collected at function return, which would silently kill all fused kernel lookups.
+
+#### Test coverage (`serving/tests/test_serving_kernels.py` — 9 tests)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_rope_hook_fallback_no_cache` | Unfused path works without init |
+| `test_rope_hook_uses_cached_kernel` | Cache hit calls `run_kernel` exactly once |
+| `test_ln_hook_fallback_no_cache` | LN hook never raises |
+| `test_softmax_hook_fallback_no_cache` | Softmax hook never raises |
+| `test_hooks_stats_no_cache` | `stats()` returns correct shape when uninitialised |
+| `test_fallback_counter_increments_on_error` | Broken kernel → counter=1, unfused output returned |
+| `test_hardware_aware_cache_key_differs_by_arch` | Ampere ≠ Ada ≠ Blackwell cache keys |
+| `test_optimizer_does_not_fire_before_warmup` | No synthesis before 50 calls |
+| `test_optimizer_fires_after_warmup` | Synthesis fires after warmup threshold |
+| `test_optimizer_does_not_refire_within_gap` | At most one synthesis per `SYNTHESIS_GAP_S` |
 
 ### 6.8 Live GPU Proof (RTX PRO 6000 Blackwell, 2026-03-16)
 
@@ -655,6 +758,19 @@ report = sampler.report()
 ### 15.4 Serving Server (`serving/server.py`)
 
 FastAPI app with OpenAI-compatible `/v1/completions` and `/v1/chat/completions` endpoints. Launched via `memopt serve --model <path> --port 8080`.
+
+At startup, `_build_engine()` initialises the full Pillar 3 stack and stores it in four module-level globals that persist for the process lifetime:
+
+```python
+_p3_kv_cache    = KernelCache()
+_p3_portability = PortabilityLayer()
+_p3_generator   = JITGenerator(cache=_p3_kv_cache, portability=_p3_portability)
+_p3_optimizer   = AutoOptimizer(generator=_p3_generator, cache=_p3_kv_cache)
+_p3_optimizer.start()
+kernel_hooks.init_hooks(cache=_p3_kv_cache, optimizer=_p3_optimizer)
+```
+
+After this call, `apply_rope`, `apply_layer_norm_residual`, and `apply_scaled_softmax` use the fused path on every cache hit. Synthesis failures are non-fatal — the serving loop is never interrupted.
 
 ---
 
@@ -990,6 +1106,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | Suite | Tests | Result |
 |-------|-------|--------|
 | `kernels/tests/test_kernels.py` | 19 | 19 PASS |
+| `serving/tests/test_serving_kernels.py` | 9 | 9 PASS |
 | `vmm/tests/test_vmm_smoke.py` | 6 | 6 PASS |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
 | `cluster/tests/test_gkd.py` | 13 | 13 PASS |
