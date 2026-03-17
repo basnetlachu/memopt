@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 92 tests (5 live-GPU Pillar 3 + 19 Pillar 3 unit + 9 serving-layer + 40 Pillar 1/2 + VMM smoke + benchmarks), 0 failures
+**Test suite:** 77 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -24,20 +24,15 @@
 14. [Power Sampler](#14-power-sampler)
 15. [Serving Engine: KV Cache, PagedAttention, Continuous Batching](#15-serving-engine-kv-cache-pagedattention-continuous-batching)
 16. [Background Daemon](#16-background-daemon)
-17. [Fleet Intelligence Layer](#17-fleet-intelligence-layer)
-18. [Centralized Control Plane](#18-centralized-control-plane)
-19. [eBPF CUDA Kernel Interceptor](#19-ebpf-cuda-kernel-interceptor)
-20. [REST API Server](#20-rest-api-server)
-21. [Drift Alert System](#21-drift-alert-system)
-22. [ROI Calculator](#22-roi-calculator)
-23. [API Key Authentication](#23-api-key-authentication)
-24. [License Validation](#24-license-validation)
-25. [HTML + JSON Formatters](#25-html--json-formatters)
-26. [Grafana Dashboard](#26-grafana-dashboard)
-27. [HTTPS / TLS](#27-https--tls)
-28. [Validation Suite](#28-validation-suite)
-29. [CLI Reference](#29-cli-reference)
-30. [Validated Real Numbers (A100)](#30-validated-real-numbers-a100)
+17. [Centralized Control Plane](#17-centralized-control-plane)
+18. [REST API Server](#18-rest-api-server)
+19. [API Key Authentication](#19-api-key-authentication)
+20. [License Validation](#20-license-validation)
+21. [Grafana Dashboard](#21-grafana-dashboard)
+22. [HTTPS / TLS](#22-https--tls)
+23. [Validation Suite](#23-validation-suite)
+24. [CLI Reference](#24-cli-reference)
+25. [Validated Real Numbers (A100)](#25-validated-real-numbers-a100)
 
 ---
 
@@ -56,142 +51,92 @@ Beyond single-model optimization, memopt provides:
 - **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference.
 - **Background daemon** — zero-touch GPU process monitor via NVML.
 - **Serving runtime** — OpenAI-compatible HTTP interface with paged attention and continuous batching.
-- **Control plane** — centralized SQLite-backed cluster management with a web dashboard.
-- **eBPF interceptor** — uprobes on `cuLaunchKernel` and `cuMemcpyAsync` for kernel-level tracing.
+- **Control plane** — lightweight FastAPI server for cluster node reporting, status, and serving engine registration.
 
 ---
 
 ## 2. Repository Layout
 
 ```
-memopt/
-├── __init__.py                      Package root — BandwidthTracker, BandwidthMeasurement
-├── cli.py                           Main CLI entry point (memopt command)
-│
-├── profiler/                        PROFILING PIPELINE
-│   ├── hardware_counters.py         Phase 1: CUDA event + PyTorch profiler collection
-│   ├── ncu_profiler.py              NCUProfiler — Nsight Compute subprocess integration
-│   ├── bottleneck_classifier.py     5-way classification with confidence scores
-│   ├── phase1_profiler.py           Top-level profiler — ProfileReport, LiveDashboard
-│   ├── roofline.py                  Roofline model — ridge point, arithmetic intensity
-│   ├── gpu_specs.py                 GPU spec database (28+ GPUs)
-│   ├── access_pattern_analyzer.py   Phase 2: coalescing, redundant fetch, cache thrashing
-│   ├── traffic_attribution.py       TensorTracker — attribute HBM traffic to layers
-│   ├── power_sampler.py             NVML background-thread power polling
-│   ├── graph_analyzer.py            Computation graph structure analysis
-│   ├── hardware_metrics.py          Computed metric helpers
-│   └── continuous_profiler.py       Continuous profiling (legacy support)
-│
-├── vmm/                             PILLAR 1 — INFINITE CONTEXT VMM
-│   ├── __init__.py                  VMM top-level interface
-│   ├── hal.py                       Hardware Abstraction Layer (CUDA / ROCm / Unified)
-│   ├── page_table.py                GPU page table — PageTableEntry, mapping lifecycle
-│   ├── tier_manager.py              HBM → DRAM → NVMe tier management + eviction
-│   ├── prefetch_engine.py           Access-pattern learning + async prefetch
-│   ├── weight_manager.py            Model weight swapping across tiers
-│   ├── backends/
-│   │   ├── cuda_backend.py          NVIDIA: pinned DRAM, CUDA streams, GDS stubs
-│   │   ├── rocm_backend.py          AMD ROCm backend
-│   │   └── unified_backend.py       CPU-only / Apple Silicon fallback
-│   └── tests/
-│       ├── test_vmm_smoke.py        Allocation, fetch, free, prefetch (6 tests)
-│       └── test_vmm_benchmark.py    Tier capacity, prefetch hit rate, DMA bandwidth (7 tests)
-│
-├── cluster/                         PILLAR 2 — GLOBAL KV CACHE DEDUPLICATION
-│   ├── gkd_store.py                 GKDStore — LocalGKDBackend + RedisGKDBackend
-│   ├── hash_engine.py               SHA-256 content hash + fingerprint collision check
-│   ├── rdma_transport.py            TCPTransport — async tensor send/recv
-│   ├── hypervisor.py                MemoryHypervisor — cross-node borrow offers, ClusterMap
-│   └── tests/
-│       ├── test_gkd.py              Hash, lookup, register, invalidate, collision (13 tests)
-│       ├── test_cluster.py          Hypervisor, borrow routing, TCP transport (14 tests)
-│       └── test_pillar2_twonode.py  Two-node integration + A4000 PCIe proof (6 pass, 1 skip)
-│
-├── kernels/                         PILLAR 3 — SELF-SYNTHESIZING KERNELS
-│   ├── bottleneck_detector.py       HBM stall detection via CUDA event timing
-│   ├── jit_generator.py             Claude API synthesis → compile → validate → cache
-│   ├── portability_layer.py         NVIDIA PTX / AMD AMDGCN / MLIR routing via Triton
-│   ├── kernel_cache.py              Two-level cache: in-memory + ~/.memopt/kernel_cache/
-│   └── tests/
-│       └── test_kernels.py          19 tests — all pass CPU-only, no API key required
-│
-├── serving/                         INFERENCE SERVING + PILLAR 3 RUNTIME
-│   ├── kv_cache.py                  KVCache, KVCacheConfig, KVCacheEntry
-│   ├── paged_attention.py           PagedKVCache — fixed-size block allocator
-│   ├── continuous_batching.py       ContinuousBatchingEngine — N concurrent requests / 1 call
-│   ├── server.py                    OpenAI-compatible FastAPI serving application
-│   ├── auto_optimizer.py            AutoOptimizer — background synthesis scheduler + stall probe
-│   ├── kernel_hooks.py              apply_rope / apply_layer_norm_residual / apply_scaled_softmax
-│   └── tests/
-│       └── test_serving_kernels.py  9 tests — hooks, cache hit/miss, fallback telemetry, warm-up
-│
-├── daemon/                          BACKGROUND DAEMON
-│   ├── daemon_service.py            MemoptDaemon, DaemonConfig — main service loop
-│   ├── process_monitor.py           ProcessMonitor, GPUProcess, GPUState via NVML
-│   ├── scanner.py                   GPUScanner — zero-touch process discovery
-│   ├── process_inspector.py         ProcessInspector — 5s util sampling + bottleneck
-│   ├── scheduler.py                 SafeScheduler, OptimizationTask
-│   ├── reporter.py                  DashboardReporter, ControlPlaneReporter
-│   ├── report.py                    ScanReporter — colored terminal + JSON
-│   └── cli.py                       scan / apply / daemon subcommands
-│
-├── control_plane/                   CENTRALIZED CLUSTER MANAGEMENT
-│   ├── database.py                  SQLite WAL-mode: nodes, events, metrics tables
-│   ├── server.py                    FastAPI server — 9 REST endpoints + HTML dashboard
-│   └── cli.py                       memopt cluster status/nodes/events
-│
-├── fleet/                           FLEET INTELLIGENCE
-│   ├── intelligence.py              FleetIntelligence — drift detection, auto-remediation
-│   ├── gossip.py                    Node-to-node gossip protocol
-│   └── predictor.py                 ML workload predictor
-│
-├── ebpf/                            EBPF KERNEL INTERCEPTION
-│   ├── interceptor.py               CUDAKernelInterceptor — BCC uprobes + /proc fallback
-│   └── kernel_swapper.py            KernelSwapper — /dev/shm binary protocol
-│
-├── utils/
-│   ├── hardware_detector.py         detect_hardware(), HardwareProfile (arch, CC, caps)
-│   ├── input_handler.py             InputFormat, detect_input_format(), forward()
-│   ├── model_loader.py              load_large_model() — safe loading with OOM guard
-│   ├── multi_gpu.py                 FSDP / DDP wrappers
-│   └── multimodal.py                Vision + text input helpers
-│
-├── measurement/
-│   └── bandwidth_tracker.py         BandwidthTracker — CUDA event timing + memory snapshot
-│
-├── business/
-│   └── roi_calculator.py            ROICalculator — speedup % → monthly/annual savings
-│
-├── alerts/
-│   └── alert_store.py               AlertStore — SQLite drift alerts, DriftAlert
-│
-├── auth/
-│   └── api_key.py                   generate_key, verify_key, ~/.memopt/api_key storage
-│
-├── license/
-│   └── validator.py                 LicenseStatus, validate_license, GPU entitlements
-│
-├── formatters/
-│   ├── html_formatter.py            HTMLReportGenerator — professional web dashboard
-│   └── json_exporter.py             JSONExporter — machine-readable export
-│
-├── validation/
-│   ├── hardware_validator.py        HardwareValidator — Nsight Compute integration
-│   └── run_validation.py            validate_optimization(), ValidationReport
-│
+memopt/                        ← Python package root
+├── __init__.py
+├── cli.py                     ← memopt CLI entry point
 ├── api/
-│   └── server.py                    FastAPI REST server with Prometheus metrics
-│
-├── grafana/                         GRAFANA DASHBOARD
-│   ├── memopt_dashboard.json        9-panel dashboard (import or provision)
-│   └── provisioning/                Auto-provision datasources + dashboards
-│
-├── tls/                             TLS / HTTPS
-│   ├── nginx.conf.template          nginx TLS termination config
-│   └── setup_tls.sh                 Interactive setup (self-signed / Let's Encrypt)
-│
+│   └── server.py              ← REST API (FastAPI)
+├── auth/
+│   └── api_key.py             ← API key management
+├── cluster/
+│   ├── gkd_store.py           ← Global KV Dedup store
+│   ├── hashing.py             ← Content fingerprinting   [renamed from hash_engine.py]
+│   ├── hypervisor.py          ← Memory hypervisor
+│   ├── transport.py           ← TCP/RDMA transport layer [renamed from rdma_transport.py]
+│   └── tests/
+├── control_plane/
+│   ├── server.py              ← Control-plane FastAPI server
+│   ├── cli.py
+│   └── database.py
+├── daemon/
+│   ├── daemon_service.py
+│   ├── reporter.py
+│   ├── scanner.py
+│   └── scheduler.py
+├── kernels/
+│   ├── bottleneck_detector.py ← Pillar 3: HBM stall detection
+│   ├── jit_generator.py       ← Pillar 3: Claude-powered kernel synthesis
+│   ├── kernel_cache.py        ← Pillar 3: two-level kernel cache
+│   ├── portability_layer.py   ← Pillar 3: BackendStrategy (CUDA/ROCm/TorchCompile/MLIR)
+│   └── tests/
+├── measurement/
+│   └── bandwidth_tracker.py
+├── profiler/
+│   ├── profiler.py            ← Phase 1 profiler            [renamed from phase1_profiler.py]
+│   ├── classifier.py          ← Bottleneck classifier        [renamed from bottleneck_classifier.py]
+│   ├── access_analyzer.py     ← Access pattern analysis      [renamed from access_pattern_analyzer.py]
+│   ├── attribution.py         ← Traffic attribution          [renamed from traffic_attribution.py]
+│   ├── continuous_profiler.py
+│   ├── hardware_counters.py
+│   ├── hardware_metrics.py
+│   ├── ncu_profiler.py
+│   ├── power_sampler.py
+│   ├── roofline.py
+│   ├── graph_analyzer.py
+│   └── gpu_specs.py
+├── serving/
+│   ├── server.py              ← vLLM-style serving engine
+│   ├── auto_optimizer.py      ← Pillar 3: AutoOptimizer (stall-rate monitor)
+│   ├── kernel_hooks.py        ← Pillar 3: RoPE / LN / softmax hooks
+│   ├── kv_cache.py
+│   ├── paged_attention.py
+│   ├── continuous_batching.py
+│   └── tests/
+├── utils/
+│   ├── gpu_info.py            ← Shared CUDA/ROCm detection helper  [new]
+│   ├── hardware_detector.py   ← Rich HardwareProfile (ridge point, caps)
+│   ├── input_handler.py
+│   ├── model_loader.py
+│   └── multimodal.py
+├── vmm/
+│   ├── hal.py
+│   ├── page_table.py
+│   ├── prefetch_engine.py
+│   ├── tier_manager.py
+│   ├── weight_manager.py
+│   ├── backends/
+│   │   ├── cuda_backend.py
+│   │   ├── rocm_backend.py
+│   │   └── unified_backend.py
+│   └── tests/
 └── workflows/
-    └── analyze_workflow.py          AnalyzeWorkflow — end-to-end orchestration
+    └── analyze_workflow.py
+
+docs/
+├── architecture.md            ← this file
+deploy/                        ← deployment artifacts (not Python)
+├── grafana/                   ← Grafana dashboard JSON (Pillar 4)
+└── tls/                       ← nginx TLS config
+conftest.py                    ← root pytest fixtures
+pyproject.toml
+setup.py
 ```
 
 ---
@@ -280,7 +225,7 @@ incoming request
   GKDStore.register(token_ids, seq_len, block_ref, node_id)
 ```
 
-### 5.3 Hash + Collision Safety (`cluster/hash_engine.py`)
+### 5.3 Hash + Collision Safety (`cluster/hashing.py`)
 
 Every lookup runs a two-step check:
 1. `compute_hash(token_ids, seq_len)` — SHA-256 over the token list.
@@ -297,7 +242,7 @@ If a collision is detected, the entry is treated as a miss and an error is logge
 
 Redis backend degrades gracefully to local if Redis is unreachable — inference never crashes.
 
-### 5.5 Transport (`cluster/rdma_transport.py`)
+### 5.5 Transport (`cluster/transport.py`)
 
 `TCPTransport` wraps raw TCP sockets for async tensor send/recv between nodes. `make_transport()` returns the right transport for the environment.
 
@@ -428,7 +373,7 @@ Routes compilation to the correct backend detected at runtime:
 |--------|------|-----------|
 | `triton_cuda` | NVIDIA | Writes source to tempfile, imports via `importlib` — Triton `@jit` → PTX |
 | `triton_rocm` | AMD | Same as CUDA path + NaN/Inf smoke test before accepting kernel |
-| `mlir` | Custom ASIC | Writes `.mlir` file to `MEMOPT_MLIR_OUT_DIR` with `<timestamp>_<uuid8>.mlir` filename |
+| `mlir` | Custom ASIC | Writes `.mlir` file to `MEMOPT_MLIR_OUT_DIR` with `kernel_{ms}_{uuid8}.mlir` filename to prevent collisions when multiple kernels are emitted in the same millisecond |
 | `cpu` | No GPU | Returns `None` immediately |
 
 Returns a `types.ModuleType` with a `run_kernel` callable, or `None` on any failure. Never raises.
@@ -441,7 +386,7 @@ Two levels:
 
 Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 
-**Integrity verification** — on `_write_to_disk`, a `source_sha256` field (SHA-256 of the kernel source) is stored alongside the entry. On `_load_from_disk`, the hash is verified before `exec()`. Entries that fail the check are deleted from disk and skipped — a corrupted or tampered cache file cannot execute arbitrary code silently.
+**Integrity verification** — on `_write_to_disk`, a `source_sha256` field (SHA-256 of the kernel source) is stored alongside the entry. On `_load_from_disk`, the hash is verified before `exec()`. Entries that fail the check are deleted from disk rather than executed — a corrupted or tampered cache file cannot execute arbitrary code silently.
 
 ### 6.6 Design Constraints
 
@@ -450,8 +395,9 @@ Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 - Kernels written to disk only after passing both correctness (dtype-aware tolerances — see 6.3) and benchmark (≥1.05x speedup) checks.
 - Triton not installed → `PortabilityLayer.compile()` returns `None`, logs a pip install hint.
 - Kernel cache files verified via SHA-256 on every reload — corrupted entries are deleted, not executed.
+- **Module-level globals** — `KernelCache`, `PortabilityLayer`, `JITGenerator`, and `AutoOptimizer` are held as module-level globals in `serving/server.py` (`_p3_kv_cache`, `_p3_portability`, `_p3_generator`, `_p3_optimizer`) to prevent Python GC from collecting them while the server is running.
 
-### 6.7 Test Coverage (19/19 pass — no GPU, no API key required)
+### 6.7 Test Coverage (no GPU, no API key required)
 
 | Group | Tests |
 |-------|-------|
@@ -500,7 +446,7 @@ Each hook:
 
 **Server startup** — `server.py` promotes all four Pillar 3 objects to module-level globals (`_p3_kv_cache`, `_p3_portability`, `_p3_generator`, `_p3_optimizer`) before passing them to `kernel_hooks.init_hooks()`. This prevents the objects from being garbage-collected at function return, which would silently kill all fused kernel lookups.
 
-#### Test coverage (`serving/tests/test_serving_kernels.py` — 9 tests)
+#### Test coverage (`serving/tests/test_serving_kernels.py`)
 
 | Test | What it verifies |
 |------|-----------------|
@@ -568,7 +514,7 @@ metrics = collector.collect(model, sample_input)
 # metrics.stall_rate, metrics.l2_hit_rate, metrics.dram_bytes_read, ...
 ```
 
-### 7.2 Phase 1 Profiler (`profiler/phase1_profiler.py`)
+### 7.2 Phase 1 Profiler (`profiler/profiler.py`)
 
 `Phase1Profiler` wraps the collector and produces a `ProfileReport`:
 
@@ -585,7 +531,7 @@ report = profiler.profile(model, sample_input)
 
 `NCUProfiler` manages the Nsight Compute subprocess, parses counter CSV, and returns `NCUCounters`. Used by `HardwareCounterCollector` when available.
 
-### 7.4 Traffic Attribution (`profiler/traffic_attribution.py`)
+### 7.4 Traffic Attribution (`profiler/attribution.py`)
 
 `TrafficAttributor` hooks `nn.Module.forward` to attribute HBM bytes read/written to individual layers. `TensorTracker` records per-tensor access patterns. Output: per-layer `Attribution` with estimated traffic and `OptimizationCandidate` list.
 
@@ -593,7 +539,7 @@ report = profiler.profile(model, sample_input)
 
 ## 8. Bottleneck Classification
 
-### 8.1 Classifier (`profiler/bottleneck_classifier.py`)
+### 8.1 Classifier (`profiler/classifier.py`)
 
 `BottleneckClassifier` consumes `HardwareCounters` and applies a decision tree across five types:
 
@@ -621,7 +567,7 @@ Each classification returns:
 
 ## 9. Access Pattern Analysis
 
-### 9.1 Analyzers (`profiler/access_pattern_analyzer.py`)
+### 9.1 Analyzers (`profiler/access_analyzer.py`)
 
 Three specialized analyzers run in Phase 2:
 
@@ -683,6 +629,22 @@ class HardwareProfile:
 - `cnn` — ResNet / EfficientNet style
 
 Class-name matching runs first; structure fallback (checks for `conv2d` vs `MultiheadAttention` submodules) runs if no match.
+
+### 11.3 Shared GPU Info Helper (`utils/gpu_info.py`)
+
+`get_cuda_info()` returns a lightweight `CudaInfo` dataclass:
+
+```python
+@dataclass
+class CudaInfo:
+    device_name: str
+    compute_cap: tuple[int, int]
+    total_memory_gb: float
+    is_rocm: bool
+    is_available: bool
+```
+
+Both `hardware_detector.py` and `portability_layer.py` call `get_cuda_info()` for raw device identity instead of duplicating `torch.cuda` API calls. The two `HardwareProfile` types remain intentionally separate — `hardware_detector.py` serves the profiling/roofline contract while `portability_layer.py` serves the kernel compilation contract.
 
 ---
 
@@ -759,7 +721,7 @@ report = sampler.report()
 
 FastAPI app with OpenAI-compatible `/v1/completions` and `/v1/chat/completions` endpoints. Launched via `memopt serve --model <path> --port 8080`.
 
-At startup, `_build_engine()` initialises the full Pillar 3 stack and stores it in four module-level globals that persist for the process lifetime:
+At startup, `_build_engine()` initialises the full Pillar 3 stack in order and stores it in four module-level globals that persist for the process lifetime:
 
 ```python
 _p3_kv_cache    = KernelCache()
@@ -770,7 +732,7 @@ _p3_optimizer.start()
 kernel_hooks.init_hooks(cache=_p3_kv_cache, optimizer=_p3_optimizer)
 ```
 
-After this call, `apply_rope`, `apply_layer_norm_residual`, and `apply_scaled_softmax` use the fused path on every cache hit. Synthesis failures are non-fatal — the serving loop is never interrupted.
+The initialisation sequence is: `KernelCache → PortabilityLayer → JITGenerator → AutoOptimizer → kernel_hooks.init_hooks()`. After this call, `apply_rope`, `apply_layer_norm_residual`, and `apply_scaled_softmax` use the fused path on every cache hit. Synthesis failures are non-fatal — the serving loop is never interrupted.
 
 ---
 
@@ -805,35 +767,20 @@ memopt apply --pid <PID> --mode turbo
 
 ---
 
-## 17. Fleet Intelligence Layer
+## 17. Centralized Control Plane
 
-### 17.1 `fleet/intelligence.py`
+The control plane is a lightweight FastAPI server in `memopt/control_plane/server.py` that handles node reporting, cluster status queries, and serving engine registration. Fleet-wide alerts, gossip propagation, and eBPF endpoint hooks were removed in the current architecture.
 
-`FleetIntelligence` monitors multiple nodes simultaneously. It collects `NodeMetrics` via gossip and detects:
-- **Drift** — GPU utilisation drop > threshold over a sliding window → `DriftEvent`
-- **Memory pressure** — HBM approaching capacity → triggers GKD lookup to borrow from peers
-- **Auto-remediation** — schedules optimizations on drifting nodes
-
-`FleetSavingsReport` aggregates HBM saved, compute hours avoided, and dollar savings across the fleet.
-
-### 17.2 Gossip (`fleet/gossip.py`)
-
-Lightweight peer-to-peer gossip for distributing node metrics without a central broker. Each node broadcasts a metrics heartbeat; stale entries are evicted after a configurable TTL.
-
----
-
-## 18. Centralized Control Plane
-
-### 18.1 Database (`control_plane/database.py`)
+### 17.1 Database (`control_plane/database.py`)
 
 SQLite with WAL mode. Three tables:
 - `nodes` — node ID, hostname, GPU count, last heartbeat
 - `events` — optimization events with before/after metrics
 - `metrics` — time-series GPU utilisation and memory usage
 
-### 18.2 Server (`control_plane/server.py`)
+### 17.2 Server (`control_plane/server.py`)
 
-FastAPI with 9 endpoints:
+FastAPI with endpoints:
 - `GET /nodes` — list all registered nodes
 - `GET /events` — optimization event history
 - `POST /events` — record new optimization
@@ -841,7 +788,7 @@ FastAPI with 9 endpoints:
 - `GET /` — HTML dashboard (vanilla JS, 30s auto-refresh)
 - `GET /health` — liveness probe
 
-### 18.3 CLI
+### 17.3 CLI
 
 ```bash
 memopt control-plane start --port 8765
@@ -852,23 +799,9 @@ memopt cluster events --last 24h
 
 ---
 
-## 19. eBPF CUDA Kernel Interceptor
+## 18. REST API Server
 
-### 19.1 `ebpf/interceptor.py`
-
-`CUDAKernelInterceptor` attaches uprobes to `cuLaunchKernel` and `cuMemcpyAsync` in the CUDA driver via BCC. Records per-kernel launch counts, grid/block dimensions, and DMA transfer sizes without modifying the target process.
-
-**Fallback**: when BCC is not available (no root, non-Linux, missing kernel headers), falls back to polling `/proc/<pid>/status` + `nvidia-smi` — same data at lower resolution, same API surface.
-
-### 19.2 `ebpf/kernel_swapper.py`
-
-`KernelSwapper` uses a `/dev/shm` binary struct protocol to signal a running CUDA process to swap one kernel implementation for another. Used by Pillar 3 to hot-swap synthesised kernels without a process restart.
-
----
-
-## 20. REST API Server
-
-### 20.1 `api/server.py`
+### 18.1 `api/server.py`
 
 FastAPI application with Prometheus metrics. Key endpoints:
 
@@ -891,42 +824,9 @@ Prometheus metrics include `memopt_speedup_ratio`, `memopt_optimizations_applied
 
 ---
 
-## 21. Drift Alert System
+## 19. API Key Authentication
 
-### 21.1 `alerts/alert_store.py`
-
-`AlertStore` persists drift alerts to SQLite (`~/.memopt/alerts.db`). Each `DriftAlert` records:
-- `node_id`, `timestamp`
-- `metric` — what drifted (`gpu_util`, `memory_pressure`, `throughput`)
-- `before_value`, `after_value`, `delta_pct`
-- `resolved: bool`
-
-Alerts are queried by node, time range, or unresolved status. Used by the fleet intelligence layer and the control plane dashboard.
-
----
-
-## 22. ROI Calculator
-
-### 22.1 `business/roi_calculator.py`
-
-`ROICalculator` converts measured speedup into financial terms:
-
-```python
-calc = ROICalculator(
-    hourly_cost_usd=3.50,    # A100 on-demand ~$3.50/hr
-    gpu_count=8,
-    utilisation_pct=0.80,
-)
-report = calc.calculate(speedup=1.5)
-# report.monthly_savings_usd, report.annual_savings_usd
-# report.payback_months, report.roi_pct
-```
-
----
-
-## 23. API Key Authentication
-
-### 23.1 `auth/api_key.py`
+### 19.1 `auth/api_key.py`
 
 Keys are 32-byte random hex strings prefixed with `memopt_`. Stored at `~/.memopt/api_key`.
 
@@ -940,9 +840,9 @@ The REST API reads the key from the `X-API-Key` header and calls `verify_key()` 
 
 ---
 
-## 24. License Validation
+## 20. License Validation
 
-### 24.1 `license/validator.py`
+### 20.1 `license/validator.py`
 
 `validate_license()` checks `MEMOPT_LICENSE_KEY` env var against the Keygen.sh API. Returns a `LicenseStatus` with:
 - `valid: bool`
@@ -954,25 +854,9 @@ The REST API reads the key from the `X-API-Key` header and calls `verify_key()` 
 
 ---
 
-## 25. HTML + JSON Formatters
+## 21. Grafana Dashboard
 
-### 25.1 `formatters/html_formatter.py`
-
-`HTMLReportGenerator` produces a self-contained HTML file with:
-- GPU utilisation timeline (Chart.js)
-- Per-layer bottleneck heatmap
-- Optimization before/after comparison table
-- Power and bandwidth metrics
-
-### 25.2 `formatters/json_exporter.py`
-
-`JSONExporter` serialises any `ProfileReport`, `BandwidthReport`, or optimization result to a machine-readable JSON file for CI/CD pipelines.
-
----
-
-## 26. Grafana Dashboard
-
-`memopt/grafana/memopt_dashboard.json` — 9-panel Grafana dashboard:
+`deploy/grafana/memopt_dashboard.json` — 9-panel Grafana dashboard:
 
 | Panel | Metric |
 |-------|--------|
@@ -986,32 +870,32 @@ The REST API reads the key from the `X-API-Key` header and calls `verify_key()` 
 | Power (W) | `memopt_power_watts` |
 | Latency p99 | `memopt_inference_latency_p99_ms` |
 
-Auto-provisioned via `grafana/provisioning/datasources/prometheus.yml` and `grafana/provisioning/dashboards/memopt.yml`.
+Auto-provisioned via `deploy/grafana/provisioning/datasources/prometheus.yml` and `deploy/grafana/provisioning/dashboards/memopt.yml`.
 
 ---
 
-## 27. HTTPS / TLS
+## 22. HTTPS / TLS
 
-`memopt/tls/nginx.conf.template` — nginx TLS termination with:
+`deploy/tls/nginx.conf.template` — nginx TLS termination with:
 - TLS 1.2+ only
 - HSTS header
 - Mozilla Intermediate cipher suite
 - Proxy pass to FastAPI on `127.0.0.1:8080`
 
-`tls/setup_tls.sh` — interactive script supporting:
+`deploy/tls/setup_tls.sh` — interactive script supporting:
 1. Self-signed certificate (dev)
 2. Let's Encrypt via certbot (production)
 3. Existing certificate (bring-your-own)
 
 ---
 
-## 28. Validation Suite
+## 23. Validation Suite
 
-### 28.1 `validation/hardware_validator.py`
+### 23.1 `validation/hardware_validator.py`
 
 `HardwareValidator` runs a micro-benchmark suite and validates against expected values for the detected GPU. Uses Nsight Compute when available for precise counter validation.
 
-### 28.2 `validation/run_validation.py`
+### 23.2 `validation/run_validation.py`
 
 `validate_optimization(model, original, optimized)` runs correctness and performance checks:
 - Output delta < `atol` vs unoptimised model
@@ -1021,7 +905,7 @@ Returns `ValidationReport` with pass/fail per check.
 
 ---
 
-## 29. CLI Reference
+## 24. CLI Reference
 
 ```bash
 # Profile a model
@@ -1057,7 +941,7 @@ memopt sessions show <id>
 
 ---
 
-## 30. Validated Real Numbers (A100)
+## 25. Validated Real Numbers (A100)
 
 All numbers from NVIDIA A100-SXM4-80GB, PyTorch 2.6.0+cu124, torchao 0.16.0.
 
@@ -1102,6 +986,8 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | j/tok (512-token batch) | ~0.07–0.74 |
 
 ### Test Suite
+
+**77 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
