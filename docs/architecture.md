@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 106 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 113 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -600,15 +600,32 @@ text = registry.prometheus_text()  # "# HELP ... # TYPE ... metric{label=...} va
 
 ### 7.3 Optimization Ledger (`observability/ledger.py`)
 
-`OptimizationLedger` records per-batch economics in `~/.memopt/ledger.db` (SQLite, WAL mode):
+`OptimizationLedger` records per-batch economics in `~/.memopt/ledger.db` (SQLite, WAL mode).
+
+**Multi-tenant** — every entry carries a `tenant_id`. `record()` accepts an optional `tenant_id` parameter (default `"_default"`). `recent(n, tenant_id=None)` and `totals(tenant_id=None)` accept an optional filter; when supplied only that tenant's rows are returned.
+
+**Append-only** — the schema uses `INSERT` (never `INSERT OR REPLACE`). A duplicate `batch_id` raises `sqlite3.IntegrityError` which is caught and logged at `DEBUG` — the second write is silently dropped. Past records can never be overwritten.
+
+**Tamper-evident hash chain** — every entry stores `prev_hash` (the `entry_hash` of the preceding row) and `entry_hash` (SHA-256 of canonical fields + `prev_hash`). Modifying any past entry invalidates all subsequent hashes:
 
 ```python
-ledger.record(
-    tokens_processed=512,
-    actual_j_per_token=0.00042,
-    gkd_hit_rate=0.91,
-    speedup_ratio=1.44,
-)
+entry_hash = SHA256(json.dumps({
+    "prev_hash": prev_hash or "genesis",
+    "batch_id": ..., "timestamp": ..., "node_id": ...,
+    "tenant_id": ..., "tokens": ...,
+    "energy_kwh": ..., "co2_kg": ..., "cost_usd": ...,
+}, sort_keys=True, separators=(",", ":")))
+```
+
+`verify_chain(tenant_id=None)` walks entries in timestamp order and checks two things per row:
+1. Recomputed `entry_hash` matches stored `entry_hash` (hash chain integrity).
+2. `raw_json["tokens_generated"]` matches the SQL `tokens_generated` column (detects tampering that updates a SQL column without touching `raw_json`).
+
+```python
+ledger.record(tokens=512, tenant_id="acme", actual_j_per_token=0.00042)
+result = ledger.verify_chain()
+# {"ok": True, "entries_checked": N}
+# {"ok": False, "entries_checked": N, "first_bad_batch_id": "...", "reason": "hash_mismatch" | "column_mismatch"}
 ```
 
 `_compute_savings()` calculates from measured J/token values — never fabricates numbers:
@@ -618,7 +635,7 @@ ledger.record(
 
 Environment overrides: `MEMOPT_BASELINE_J_PER_TOKEN`, `MEMOPT_GRID_INTENSITY_KG_KWH`, `MEMOPT_ELECTRICITY_PRICE_USD`, `MEMOPT_GPU_PRICE_USD_HR`.
 
-`ledger.totals()` returns cumulative `energy_saved_kwh`, `co2_saved_kg`, `cost_saved_usd` for dashboards. Survives SQLite errors gracefully — writes are non-fatal, `totals()` returns zeros on DB failure.
+Survives SQLite errors gracefully — writes are non-fatal, `totals()` returns empty dict on DB failure.
 
 ### 7.4 Optimization Certificates (`observability/certificate.py`)
 
@@ -660,14 +677,23 @@ API keys (`RUNPOD_API_KEY`, `LAMBDA_API_KEY`) are optional — engine runs in mo
 
 ### 7.6 API Integration (`api/server.py`)
 
-Two endpoints added to the REST API server:
+Pillar 4 endpoints — all require authentication via `X-Memopt-Api-Key` header:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/metrics` | Prometheus text format (all Pillar 4 metrics) |
-| `GET` | `/ledger` | Recent ledger entries + cumulative totals (JSON) |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/metrics` | Admin | Prometheus text format (all Pillar 4 metrics) |
+| `GET` | `/ledger` | Any tenant | Recent entries + cumulative totals scoped to calling tenant; admins see all |
+| `POST` | `/tenants/{id}` | Admin | Create a new tenant; returns its API key |
+| `DELETE` | `/tenants/{id}` | Admin | Revoke a tenant's API key |
+| `GET` | `/tenants` | Admin | List all active tenants |
 
-Both endpoints degrade gracefully when the Pillar 4 collector or ledger failed to initialise (returns empty metrics / empty ledger rather than 500).
+Two FastAPI dependencies handle auth:
+- `get_tenant` — validates the key via `authenticate()`, returns `tenant_id` (401 on invalid key)
+- `require_admin` — calls `get_tenant` then checks `is_admin()` (403 if not admin)
+
+`/ledger` is tenant-scoped: non-admin callers see only their own entries; admin callers (`_admin`, `_default`) see all entries.
+
+Both `/metrics` and `/ledger` degrade gracefully when the Pillar 4 collector or ledger failed to initialise (returns empty metrics / empty ledger rather than 500).
 
 ### 7.7 Grafana Dashboard (`deploy/grafana/memopt_dashboard.json`)
 
@@ -681,7 +707,7 @@ The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3
 
 ### 7.8 Test Coverage (`observability/tests/test_observability.py`)
 
-20 CPU-only tests — no GPU, no API keys, no network required:
+27 CPU-only tests — no GPU, no API keys, no network required:
 
 | Group | Tests |
 |-------|-------|
@@ -690,6 +716,8 @@ The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3
 | Ledger | record/totals, precision (`< 1e-10`), DB-error survival |
 | Certificates | sign/verify round-trip, tamper detection, unsigned mode |
 | Arbitrage | No-keys startup, effective cost formula, threshold logic, dry-run |
+| Multi-tenant keys | create+authenticate, invalid tenant ID rejection, wrong-key returns None |
+| Append-only ledger | duplicate batch_id dropped, hash chain valid after 5 writes, hash chain detects SQL column tampering, tenant isolation in recent()/totals() |
 
 ---
 
@@ -1011,14 +1039,17 @@ memopt cluster events --last 24h
 
 FastAPI application with Prometheus metrics. Key endpoints:
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/optimize` | Run full optimization pipeline on a model |
-| `GET` | `/profile` | Profile a model and return bottleneck report |
-| `GET` | `/metrics` | Prometheus text format (Pillar 4 collector) |
-| `GET` | `/ledger` | Per-batch energy/CO₂/cost savings JSON (Pillar 4 ledger) |
-| `GET` | `/health` | Liveness probe |
-| `GET` | `/stats` | Aggregated optimization statistics |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/optimize` | Any | Run full optimization pipeline on a model |
+| `POST` | `/agent` | Any | Autonomous multi-round optimization |
+| `GET` | `/status/{job_id}` | Any | Poll job status |
+| `GET` | `/metrics` | Admin | Prometheus text format (Pillar 4 collector) |
+| `GET` | `/ledger` | Any (tenant-scoped) | Per-batch energy/CO₂/cost savings JSON |
+| `POST` | `/tenants/{id}` | Admin | Create tenant, returns API key |
+| `DELETE` | `/tenants/{id}` | Admin | Revoke tenant API key |
+| `GET` | `/tenants` | Admin | List active tenants |
+| `GET` | `/health` | — | Liveness probe (no auth required) |
 
 ```bash
 memopt serve-api --port 8080
@@ -1035,25 +1066,36 @@ Prometheus metrics include `memopt_power_avg_watts`, `memopt_vmm_hbm_bytes`, `me
 
 ### 20.1 `auth/api_key.py`
 
-Keys are 32-byte random hex strings prefixed with `sk-memopt-`. Priority: `MEMOPT_API_KEY` env var > `~/.memopt/api_key` file. The env var is checked **before** any filesystem access — if set, the file is never read.
+**Multi-tenant key format**: `memopt_{tenant_id}_{secret_hex}` where `tenant_id` is `[a-zA-Z0-9_-]{1,32}` and `secret_hex` is 64 hex chars (32 bytes of CSPRNG). The tenant is embedded in the key so `authenticate()` can identify the tenant in O(1) without scanning all key files.
+
+Key files are stored one-per-tenant at `~/.memopt/keys/{tenant_id}.key` (configurable via `MEMOPT_KEY_DIR`). Reserved tenants `_admin` and `_default` are never written to disk — `is_admin()` grants admin rights to them implicitly.
 
 ```python
-from memopt.auth.api_key import get_or_create_key, load_key, verify_key
-key = get_or_create_key()     # loads env var, or reads/creates ~/.memopt/api_key
-assert verify_key(key, key)   # constant-time hmac.compare_digest
+from memopt.auth.api_key import create_tenant, authenticate, is_admin, revoke_tenant
+
+key = create_tenant("acme")          # generates + stores memopt_acme_<hex>
+tenant = authenticate(key)           # → "acme"
+assert is_admin("_admin")            # → True
+assert is_admin("acme")              # → False
+revoke_tenant("acme")                # removes key file; ledger entries are preserved
 ```
 
-**Atomic key storage** — `save_key()` uses `_secure_write()` which:
+**Authentication priority**:
+1. `MEMOPT_API_KEY` env var → assigns tenant `"_default"` (single-key backwards compat)
+2. Parse `tenant_id` from key format → load `~/.memopt/keys/{tenant_id}.key` and compare with `hmac.compare_digest()`
+3. Neither matches → returns `None` (HTTP 401)
+
+**Backwards-compatible shims** — `generate_key()`, `load_key()`, `verify_key()`, `save_key()`, `get_or_create_key()`, `mask_key()` all retain their original signatures so existing server code continues to work unchanged.
+
+**Atomic key storage** — `_secure_write()`:
 1. Opens `path.tmp` with `O_CREAT | O_TRUNC | 0600` (restricted from creation)
 2. Writes the key
 3. `os.rename(path.tmp → path)` — atomic on POSIX; a crash mid-write cannot corrupt the existing file
 4. `os.chmod(path, 0600)` — hardens in case rename preserved wrong permissions
 
-**Permission enforcement** — `load_key()` checks `os.stat().st_mode & 0o777 == 0o600` and logs a `WARNING` if the file has wider permissions (e.g. `0644`). The operator is told to run `chmod 600 ~/.memopt/api_key`.
+**Permission enforcement** — `_secure_read()` checks `os.stat().st_mode & 0o777 == 0o600` and logs a `WARNING` if the file has wider permissions. The operator is told to run `chmod 600 <path>`.
 
-**Production deployment** — inject via `MEMOPT_API_KEY` environment variable (Kubernetes secret, AWS SSM Parameter Store, HashiCorp Vault). When the env var is set, no file is created or read.
-
-The REST API reads the key from the `X-Memopt-API-Key` header and calls `verify_key()` against the stored key. Returns HTTP 401 on mismatch.
+**Production deployment** — inject via `MEMOPT_API_KEY` (single-key mode) or `MEMOPT_KEY_DIR` pointing at a secrets volume. Admin operations (create/revoke tenant) should only be reachable from internal networks.
 
 ---
 
@@ -1177,17 +1219,17 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**106 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**113 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
 | `kernels/tests/test_kernels.py` | 19 | 19 PASS |
-| `serving/tests/test_serving_kernels.py` | 9 | 9 PASS |
+| `serving/tests/test_serving_kernels.py` | 10 | 10 PASS |
 | `vmm/tests/test_vmm_smoke.py` | 6 | 6 PASS |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
 | `cluster/tests/test_gkd.py` | 13 | 13 PASS |
 | `cluster/tests/test_cluster.py` | 19 | 19 PASS (5 new: AbstractTransport interface, TCP override, UCX fallback, interface completeness, stats keys) |
 | `cluster/tests/test_pillar2_twonode.py` | 8 | 6 PASS, 1 SKIP, 1 flaky* |
-| `observability/tests/test_observability.py` | 20 | 20 PASS |
+| `observability/tests/test_observability.py` | 27 | 27 PASS (7 new: multi-tenant keys, append-only ledger, hash chain, tenant isolation) |
 
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.
