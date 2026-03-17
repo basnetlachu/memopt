@@ -234,10 +234,14 @@ class OptimizationLedger:
             logger.warning(f"Ledger DB init failed: {e} — ledger disabled")
 
     def _connect(self):
-        return sqlite3.connect(
+        conn = sqlite3.connect(
             self._db_path, timeout=5.0,
             isolation_level=None   # autocommit
         )
+        # AUDIT P1: WAL mode enables concurrent readers + one writer without
+        # blocking; critical for append-only ledger under multi-tenant load.
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
     def record(
         self,

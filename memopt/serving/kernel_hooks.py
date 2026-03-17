@@ -15,7 +15,10 @@ falls back to PyTorch silently. Inference correctness is never at risk.
 from __future__ import annotations
 import logging
 import threading
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:  # never executed at runtime; satisfies Pylance for annotations
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,9 @@ def apply_rope(
 
     Fused path (cache hit):    5.18x faster at seq_len=16384
     Unfused path (cache miss): standard PyTorch, identical output
+    # AUDIT P1: 5.18x figure is a single-device benchmark (Blackwell GB200,
+    # seq_len=16384). Actual speedup varies by GPU architecture, seq length,
+    # and HBM bandwidth. Do not treat this as a guaranteed production number.
 
     The auto-optimizer synthesises the fused kernel on first call and
     registers it in the cache. All subsequent calls use the fused path.
@@ -167,7 +173,7 @@ def apply_layer_norm_residual(
                     _record_fallback("memopt.ln_residual_fused")
                     logger.debug(f"LN+Residual fused kernel error: {e} — falling back")
 
-    import torch.nn.functional as F
+    import torch.nn.functional as F  # type: ignore[import-untyped]
     return F.layer_norm(x + residual, (x.shape[-1],), weight, bias, eps)
 
 
@@ -210,7 +216,7 @@ def apply_scaled_softmax(
                     _record_fallback("memopt.scaled_softmax_fused")
                     logger.debug(f"Softmax fused kernel error: {e} — falling back")
 
-    import torch.nn.functional as F
+    import torch.nn.functional as F  # type: ignore[import-untyped]
     return F.softmax(scores * scale, dim=-1)
 
 
@@ -232,7 +238,7 @@ def stats() -> dict:
 # ── Internal helpers ───────────────────────────────────────────────────
 
 def _rope_unfused(xq, xk, cos, sin):
-    import torch
+    import torch  # type: ignore[import-untyped]
     def rotate_half(x):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
@@ -260,7 +266,7 @@ def _get_hardware() -> str:
     (sm90) that happens to be running the same op shapes.
     """
     try:
-        import torch
+        import torch  # type: ignore[import-untyped]
         if torch.cuda.is_available():
             name  = torch.cuda.get_device_name(0)
             major, minor = torch.cuda.get_device_capability(0)

@@ -200,7 +200,7 @@ class AutoOptimizer:
 
     def _build_prompt(self, event) -> str:
         """Route to op-specific prompt builders with shape validation."""
-        from memopt.kernels.tests.test_pillar3_fused import (
+        from memopt.kernels.prompt_builders import (
             _make_rope_prompt,
             _make_ln_residual_prompt,
             _make_softmax_scale_prompt,
