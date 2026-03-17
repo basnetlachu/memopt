@@ -15,7 +15,7 @@ falls back to PyTorch silently. Inference correctness is never at risk.
 from __future__ import annotations
 import logging
 import threading
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:  # never executed at runtime; satisfies Pylance for annotations
     import torch
@@ -141,7 +141,8 @@ def apply_layer_norm_residual(
     """
     Fused residual add + layer norm — fused or unfused depending on cache.
 
-    Fused path (cache hit):    1.30x faster
+    Fused path (cache hit):    1.30x faster (measured: seq_len=8192,
+                               hidden=4096, fp16, RTX PRO 6000 Blackwell)
     Unfused path (cache miss): standard PyTorch, identical output
     """
     if _optimizer is not None:
@@ -184,7 +185,9 @@ def apply_scaled_softmax(
     """
     Fused scale + softmax for attention scores — fused or unfused.
 
-    Fused path (cache hit):    1.32x faster
+    Fused path (cache hit):    1.32x faster (measured: batch=4,
+                               n_heads=32, seq_len=2048, fp16,
+                               RTX PRO 6000 Blackwell)
     Unfused path (cache miss): standard PyTorch, identical output
     """
     if _optimizer is not None:

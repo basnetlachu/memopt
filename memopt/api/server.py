@@ -588,7 +588,6 @@ def run_agent_job(job_id: str) -> None:
     """
     import json as _json
     import torch
-    from memopt.agent import MemoptAgent
 
     job = job_store[job_id]
     job.status     = JobStatus.RUNNING
@@ -812,34 +811,15 @@ async def agent_optimize(request: AgentRequest, _: str = Security(verify_api_key
       rounds_summary: JSON array of per-round results (bottleneck, committed,
                       rolled, cumulative speedup, stop reason if terminal).
     """
-    if not Path(request.model_path).exists():
-        raise HTTPException(404, f"Model not found: {request.model_path}")
-
-    job_id = str(uuid.uuid4())
-    job = OptimizationJob(
-        job_id         = job_id,
-        status         = JobStatus.QUEUED,
-        model_path     = request.model_path,
-        input_shape    = request.input_shape,
-        created_at     = time.time(),
-        target_speedup = request.target_speedup,
-        max_rounds     = request.max_rounds,
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error": "removed",
+            "message": "The /agent endpoint has been removed. "
+                       "Use /optimize or /profile instead.",
+        },
     )
-    job_store[job_id] = job
-    executor.submit(run_agent_job, job_id)
-
-    log.info(
-        "AgentJob %s QUEUED — model=%s shape=%s target=%.2fx rounds=%d",
-        job_id, request.model_path, request.input_shape,
-        request.target_speedup, request.max_rounds,
-    )
-    return {
-        "job_id":          job_id,
-        "status":          "queued",
-        "target_speedup":  request.target_speedup,
-        "max_rounds":      request.max_rounds,
-        "estimated_minutes": max(5, request.max_rounds * 2),
-    }
 
 
 # /metrics is served by the prometheus_client ASGI app (mounted below).

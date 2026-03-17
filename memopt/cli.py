@@ -186,58 +186,12 @@ def cmd_analyze(args):
 
 def cmd_agent(args):
     """Run autonomous multi-round optimization agent."""
-    import torch
-    from memopt.agent import MemoptAgent
-
-    print(f"Loading model from: {args.model}")
-    shape = [int(x) for x in args.input_shape.split(",")]
-
-    try:
-        model = torch.load(args.model, weights_only=False)
-    except Exception as e:
-        print(f"Failed to load model: {e}")
-        sys.exit(1)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
-
-    # Build sample input — reuse same strategy as server._build_sample_input()
-    sample_input = _agent_build_sample(model, shape, device)
-
-    agent = MemoptAgent(
-        target_speedup=args.target,
-        max_rounds=args.max_rounds,
-    )
-
-    print(f"\nStarting agent | target={args.target:.2f}x | max_rounds={args.max_rounds}")
-    report = agent.run(model, sample_input)
-
-    # Pretty output matching the spec
-    print("\n" + "=" * 64)
-    for r in report.rounds:
-        committed_str = ", ".join(r.candidates_committed)  or "-"
-        rolled_str    = ", ".join(r.candidates_rolled_back) or "-"
-        stop_str      = f"\n  STOP: {r.stop_reason}" if r.stop_reason else ""
-        print(
-            f"Round {r.round_number}: {r.bottleneck_type} (conf={r.confidence:.2f}) "
-            f"→ committed=[{committed_str}]  rolled=[{rolled_str}]  "
-            f"cumulative={r.cumulative_speedup:.2f}x{stop_str}"
-        )
-    print("=" * 64)
-    gap = abs(report.target_speedup - report.final_speedup)
     print(
-        f"\nFinal:  {report.final_speedup:.2f}x  |  "
-        f"Target: {report.target_speedup:.2f}x  |  "
-        f"Gap: {gap:.2f}x"
+        "error: The 'agent' subcommand has been removed. "
+        "Use 'memopt optimize' or 'memopt serve' instead.",
+        file=sys.stderr,
     )
-    print(f"Ceiling: {report.honest_ceiling}")
-
-    if report.optimized_model is not None:
-        out_path = args.output or (Path(args.model).stem + "_optimized.pt")
-        torch.save(report.optimized_model, out_path)
-        print(f"Optimized model saved to: {out_path}")
-    else:
-        print("No optimization committed — original model unchanged.")
+    sys.exit(2)
 
 
 def _agent_build_sample(model, shape, device):

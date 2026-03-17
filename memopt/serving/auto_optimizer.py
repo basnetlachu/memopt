@@ -118,10 +118,8 @@ class AutoOptimizer:
 
     def _fire_synthesis(self, op_name: str, args: tuple, hw: str) -> None:
         from memopt.kernels.bottleneck_detector import BottleneckEvent
-        shapes = self._extract_shapes(args)
-        dtype  = self._extract_dtype(args)
-
-        # Measure real stall rate if CUDA events are available
+        shapes     = self._extract_shapes(args)
+        dtype      = self._extract_dtype(args)
         stall_rate = self._measure_stall_rate(args)
 
         event = BottleneckEvent(
@@ -133,8 +131,12 @@ class AutoOptimizer:
             hardware=hw,
         )
 
+        # Build the prompt BEFORE touching _gen._build_prompt.
+        # Capture it in a closure so the lambda never recurses.
+        prompt         = self._build_prompt(event)
         original_build = self._gen._build_prompt
-        self._gen._build_prompt = lambda ev: self._build_prompt(ev)
+        # _p=prompt captures the string value, not a callable that recurses
+        self._gen._build_prompt = lambda ev, _p=prompt: _p
         try:
             self._gen.handle(event)
         finally:
@@ -205,7 +207,6 @@ class AutoOptimizer:
             _make_ln_residual_prompt,
             _make_softmax_scale_prompt,
         )
-        import math  # noqa: F401
 
         op = event.op_name
         s  = event.input_shapes
@@ -238,9 +239,12 @@ class AutoOptimizer:
                 f"— falling back to generic prompt"
             )
 
-        # Generic fallback — delegates to JITGenerator's own prompt builder
-        # Uses direct instance method call, not fragile __class__ lookup
-        return self._gen._build_prompt(event)
+        # Generic fallback — call JITGenerator._build_prompt as an unbound
+        # method directly on the class. This bypasses whatever may currently
+        # be set on self._gen._build_prompt (could be the lambda from
+        # _fire_synthesis), always reaching the real implementation.
+        from memopt.kernels.jit_generator import JITGenerator
+        return JITGenerator._build_prompt(self._gen, event)
 
     def _extract_shapes(self, args: tuple) -> list:
         try:

@@ -254,6 +254,43 @@ def test_optimizer_fires_after_warmup():
         assert opt.stats()["total_fired"] >= 1
 
 
+def test_auto_optimizer_unknown_op_no_recursion():
+    """
+    _build_prompt must not recurse for op names outside the three
+    known ops. Previously raised RecursionError via monkey-patch loop.
+    """
+    import tempfile
+    from memopt.kernels.kernel_cache import KernelCache
+    from memopt.kernels.portability_layer import PortabilityLayer
+    from memopt.kernels.jit_generator import JITGenerator
+    from memopt.serving.auto_optimizer import AutoOptimizer
+    from memopt.kernels.bottleneck_detector import BottleneckEvent
+
+    with tempfile.TemporaryDirectory() as d:
+        cache = KernelCache(cache_dir=d)
+        gen   = JITGenerator(cache=cache, portability=PortabilityLayer())
+        opt   = AutoOptimizer(generator=gen, cache=cache)
+
+        event = BottleneckEvent(
+            op_name="memopt.unknown_custom_op",
+            input_shapes=[[64, 64]],
+            dtype="float16",
+            access_pattern="sequential",
+            stall_rate=0.5,
+            hardware="cpu",
+        )
+
+        try:
+            prompt = opt._build_prompt(event)
+            assert isinstance(prompt, str) and len(prompt) > 0
+        except RecursionError:
+            pytest.fail(
+                "_build_prompt raised RecursionError for unknown op. "
+                "Fix: use JITGenerator._build_prompt(self._gen, event) "
+                "in the fallback, not self._gen._build_prompt(event)."
+            )
+
+
 def test_optimizer_does_not_refire_within_gap():
     """Synthesis must not re-fire within SYNTHESIS_GAP_S seconds."""
     import time
