@@ -5,7 +5,8 @@ All tests use TCPTransport and LocalGKDBackend. No hardware required.
 import time
 import threading
 import pytest
-from memopt.cluster.transport import TCPTransport, RemoteRegion
+import inspect
+from memopt.cluster.transport import TCPTransport, RemoteRegion, make_transport, AbstractTransport
 from memopt.cluster.hypervisor import MemoryHypervisor, ClusterMap, _estimate_latency_us
 from memopt.cluster.gkd_store import GKDStore
 
@@ -188,3 +189,70 @@ def test_hypervisor_exposes_gkd_stats():
     s = h.stats()
     assert s["gkd_stats"]["cache_hits"]   == 1
     assert s["gkd_stats"]["cache_misses"] == 1
+
+
+# ── AbstractTransport / UCXTransport tests ────────────────────────────
+
+def test_make_transport_returns_abstract_transport():
+    """make_transport() must always return an AbstractTransport subclass."""
+    t = make_transport()
+    assert isinstance(t, AbstractTransport), \
+        f"make_transport() returned {type(t)}, expected AbstractTransport subclass"
+    t.close()
+
+
+def test_make_transport_tcp_override():
+    """MEMOPT_TRANSPORT=tcp must force TCPTransport even if UCX available."""
+    import os
+    os.environ["MEMOPT_TRANSPORT"] = "tcp"
+    try:
+        t = make_transport()
+        assert isinstance(t, TCPTransport)
+        t.close()
+    finally:
+        del os.environ["MEMOPT_TRANSPORT"]
+
+
+def test_ucx_transport_skips_cleanly_without_ucxpy():
+    """
+    UCXTransport raises ImportError when ucx-py is not installed.
+    make_transport() must catch this and return TCPTransport.
+    """
+    from memopt.cluster.transport import UCXTransport
+    try:
+        import ucp
+        pytest.skip("ucx-py is installed — UCX path tested separately")
+    except ImportError:
+        pass
+
+    # ucx-py not installed — make_transport must fall back to TCP
+    t = make_transport(prefer_rdma=True)
+    assert isinstance(t, TCPTransport), \
+        "Without ucx-py, make_transport() must return TCPTransport"
+    t.close()
+
+
+def test_tcp_transport_implements_abstract_interface():
+    """TCPTransport must implement all AbstractTransport methods."""
+    abstract_methods = {
+        name for name, method in
+        inspect.getmembers(AbstractTransport, predicate=inspect.isfunction)
+        if getattr(method, "__isabstractmethod__", False)
+    }
+    tcp_methods = {
+        name for name, _ in
+        inspect.getmembers(TCPTransport, predicate=inspect.isfunction)
+    }
+    missing = abstract_methods - tcp_methods
+    assert not missing, \
+        f"TCPTransport is missing AbstractTransport methods: {missing}"
+
+
+def test_transport_stats_has_required_keys():
+    """stats() must return the required keys regardless of transport type."""
+    t = TCPTransport(listen_port=18540)
+    s = t.stats()
+    for key in ("transport", "bytes_sent", "bytes_recv",
+                "latency_us_p50", "latency_us_p99"):
+        assert key in s, f"stats() missing required key: {key}"
+    t.close()
