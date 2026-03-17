@@ -59,3 +59,43 @@ def test_backend_and_tiers_present():
     assert len(tiers) >= 2          # at minimum DRAM + NVMe
     assert len(tier_names) == len(tiers)
     assert all(isinstance(n, str) for n in tier_names)
+
+
+# ── Tenant isolation ───────────────────────────────────────────────────
+
+def test_tenant_owns_sequence_after_allocate():
+    """The first tenant to allocate a sequence_id becomes its owner."""
+    vmm = VMM()
+    vmm.allocate("seq_alpha", 0, 256, tenant_id="alice")
+    # Same tenant can allocate more blocks
+    vmm.allocate("seq_alpha", 1, 256, tenant_id="alice")
+    entry = vmm.fetch("seq_alpha", 0, tenant_id="alice")
+    assert entry is not None
+    vmm.free_sequence("seq_alpha", tenant_id="alice")
+
+
+def test_cross_tenant_allocate_raises():
+    """A second tenant must not be able to allocate into an existing sequence."""
+    vmm = VMM()
+    vmm.allocate("seq_shared", 0, 256, tenant_id="alice")
+    with pytest.raises(PermissionError):
+        vmm.allocate("seq_shared", 1, 256, tenant_id="bob")
+    vmm.free_sequence("seq_shared", tenant_id="alice")
+
+
+def test_cross_tenant_fetch_raises():
+    """A tenant must not fetch a sequence owned by another tenant."""
+    vmm = VMM()
+    vmm.allocate("seq_private", 0, 256, tenant_id="alice")
+    with pytest.raises(PermissionError):
+        vmm.fetch("seq_private", 0, tenant_id="bob")
+    vmm.free_sequence("seq_private", tenant_id="alice")
+
+
+def test_cross_tenant_free_raises():
+    """A tenant must not free a sequence owned by another tenant."""
+    vmm = VMM()
+    vmm.allocate("seq_locked", 0, 256, tenant_id="alice")
+    with pytest.raises(PermissionError):
+        vmm.free_sequence("seq_locked", tenant_id="bob")
+    vmm.free_sequence("seq_locked", tenant_id="alice")

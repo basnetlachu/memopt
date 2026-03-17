@@ -132,6 +132,7 @@ def test_savings_from_gkd_only():
 def test_ledger_record_and_recent():
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger._buffer._flush_batch_size = 1   # flush on every append
         entry  = ledger.record(
             tokens=1024,
             actual_j_per_token=0.0004,
@@ -150,6 +151,7 @@ def test_ledger_record_and_recent():
 def test_ledger_totals():
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger._buffer._flush_batch_size = 1   # flush on every append
         for _ in range(3):
             ledger.record(tokens=1000, actual_j_per_token=0.0004,
                           gkd_hit_rate_pct=90.0)
@@ -313,6 +315,7 @@ def test_ledger_append_only_rejects_duplicate_batch_id():
     """Writing the same batch_id twice must silently drop the second write."""
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger._buffer._flush_batch_size = 1   # flush on every append
         e = ledger.record(tokens=100, node_id="n1")
         # Manually call _write again with same batch_id — must not raise,
         # must not duplicate the row.
@@ -324,6 +327,7 @@ def test_hash_chain_valid_after_writes():
     """verify_chain must return ok=True after several normal writes."""
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger._buffer._flush_batch_size = 1   # flush on every append
         for i in range(5):
             ledger.record(tokens=100 * (i + 1), actual_j_per_token=0.0004)
         result = ledger.verify_chain()
@@ -335,6 +339,7 @@ def test_hash_chain_detects_tampering():
     """verify_chain must detect direct SQL column modification."""
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger._buffer._flush_batch_size = 1   # flush on every append
         ledger.record(tokens=200, actual_j_per_token=0.0004)
 
         # Tamper: update SQL column but not raw_json
@@ -350,6 +355,7 @@ def test_ledger_tenant_isolation():
     """recent() and totals() with tenant_id must only return that tenant's data."""
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+        ledger._buffer._flush_batch_size = 1   # flush on every append
         ledger.record(tokens=100, tenant_id="alpha")
         ledger.record(tokens=200, tenant_id="alpha")
         ledger.record(tokens=300, tenant_id="beta")
@@ -364,3 +370,48 @@ def test_ledger_tenant_isolation():
 
         all_totals = ledger.totals()
         assert all_totals["tokens_total"] == 600
+
+
+def test_ledger_buffer_flushes_on_batch_size():
+    """Buffer must flush to SQLite when FLUSH_BATCH_SIZE entries accumulate."""
+    import os
+    from memopt.observability.ledger import OptimizationLedger, FLUSH_BATCH_SIZE
+
+    with tempfile.TemporaryDirectory() as d:
+        ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+
+        # Patch FLUSH_BATCH_SIZE to something tiny so we don't need 100 entries
+        ledger._buffer._flush_batch_size = 3
+
+        for _ in range(3):
+            ledger.record(tokens=10)
+
+        # After 3 appends the buffer should have auto-flushed
+        assert ledger.pending_count() == 0
+        assert len(ledger.recent()) == 3
+
+
+def test_ledger_shutdown_flushes_remaining():
+    """shutdown() must flush any buffered entries that haven't hit batch size."""
+    from memopt.observability.ledger import OptimizationLedger
+
+    with tempfile.TemporaryDirectory() as d:
+        ledger = OptimizationLedger(db_path=f"{d}/ledger.db")
+
+        # Patch to huge batch size so auto-flush never fires
+        ledger._buffer._flush_batch_size = 10_000
+
+        ledger.record(tokens=42)
+        ledger.record(tokens=43)
+
+        # Not yet in DB
+        assert ledger.pending_count() == 2
+
+        ledger.shutdown()
+
+        # After shutdown all entries must be persisted
+        assert ledger.pending_count() == 0
+        recent = ledger.recent()
+        assert len(recent) == 2
+        tokens = {e["tokens_generated"] for e in recent}
+        assert tokens == {42, 43}

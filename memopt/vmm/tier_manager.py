@@ -29,14 +29,20 @@ class TierManager:
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def allocate(self, sequence_id: str, block_index: int, size_bytes: int) -> PageTableEntry:
+    def allocate(
+        self,
+        sequence_id: str,
+        block_index: int,
+        size_bytes: int,
+        tenant_id: str = "_default",
+    ) -> PageTableEntry:
         """
         Allocate a new block in the hottest available tier.
         Evicts LRU blocks first if tier is above the high watermark.
         """
         hot = tier_names[0]
         self._ensure_capacity(hot, size_bytes)
-        handle = backend.allocate(size_bytes, hot)
+        handle = backend.allocate(size_bytes, hot, tenant_id=tenant_id)
         return self.page_table.insert(sequence_id, block_index, hot, handle, size_bytes)
 
     def fetch(self, sequence_id: str, block_index: int) -> PageTableEntry:

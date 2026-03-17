@@ -691,6 +691,24 @@ app = FastAPI(
     version="1.1.0",
 )
 
+# ── GKD store — optional, registered by caller at startup ────────────────────
+# Set by register_gkd(); None means GKD is not configured.
+# /health returns 503 when _gkd_store.stats()["backend_degraded"] is True.
+_gkd_store: object = None
+
+
+def register_gkd(gkd) -> None:
+    """
+    Wire a GKDStore into the server so /health can probe its Redis backend.
+
+    Call once at startup:
+        from memopt.cluster.gkd_store import GKDStore
+        register_gkd(GKDStore(redis_url=os.environ["REDIS_URL"]))
+    """
+    global _gkd_store
+    _gkd_store = gkd
+
+
 # ── API key authentication ────────────────────────────────────────────────────
 # Key is loaded/created once at import time; the closure used by verify_api_key
 # captures the module-level _API_KEY string so it is always current.
@@ -883,12 +901,15 @@ async def list_tenants_endpoint(_admin: str = Depends(require_admin)):
 
 
 @app.get("/health")
-def health():
+async def health():
     """
     Liveness probe — always responds in <100 ms.
 
     Does NOT load models or run GPU code.  GPU name is queried from the
     already-cached CUDA context (negligible overhead).
+
+    Returns HTTP 503 (with status="degraded") when any registered
+    component is degraded (e.g. Redis backend unreachable).
     """
     try:
         import torch
@@ -899,12 +920,28 @@ def health():
         )
     except Exception:
         gpu = "unknown"
-    return {
-        "status": "ok",
+
+    degraded = False
+    if _gkd_store is not None:
+        try:
+            gkd_stats = _gkd_store.stats()
+            if gkd_stats.get("backend_degraded"):
+                degraded = True
+        except Exception:
+            degraded = True
+
+    body = {
+        "status": "degraded" if degraded else "ok",
         "gpu": gpu,
         "model_format": "torch.save(model, path) required — not state_dict()",
         "supported_architectures": "any nn.Module importable in server environment",
     }
+
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content=body,
+        status_code=503 if degraded else 200,
+    )
 
 
 # ── Prometheus /metrics — authenticated ──────────────────────────────────────

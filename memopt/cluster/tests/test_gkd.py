@@ -203,3 +203,31 @@ def test_benchmark_lookup_latency():
 
     print(f"\n  GKD lookup latency (local backend):  {avg_ms:.4f}ms avg over {N:,} calls")
     assert avg_ms < 1.0, f"Lookup too slow: {avg_ms:.4f}ms"
+
+
+# ── Redis degradation detection ────────────────────────────────────────
+
+def test_gkd_stats_has_backend_degraded_key():
+    """stats() must always include backend_degraded (bool) and backend_degraded_since."""
+    from memopt.cluster.gkd_store import GKDStore
+    gkd = GKDStore()   # local backend — never degraded
+    s   = gkd.stats()
+    assert "backend_degraded" in s, "stats() must expose backend_degraded"
+    assert s["backend_degraded"] is False
+    assert "backend_degraded_since" in s
+
+
+def test_redis_backend_degraded_on_unreachable_url():
+    """RedisGKDBackend must mark itself degraded when Redis is unreachable."""
+    from memopt.cluster.gkd_store import GKDStore
+    # Port 19999 is chosen to be unreachable on any CI host
+    gkd = GKDStore(redis_url="redis://localhost:19999")
+    # Trigger a lookup — this forces the backend to attempt a connection
+    try:
+        gkd.lookup([1, 2, 3], 3)
+    except Exception:
+        pass   # connection failure is expected; what matters is degraded flag
+    s = gkd.stats()
+    assert s["backend_degraded"] is True, (
+        "RedisGKDBackend must set degraded=True when Redis is unreachable"
+    )

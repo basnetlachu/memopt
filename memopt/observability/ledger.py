@@ -57,6 +57,9 @@ _LEDGER_DB_PATH        = os.path.expanduser(
     os.environ.get("MEMOPT_LEDGER_DB_PATH", "~/.memopt/ledger.db")
 )
 
+FLUSH_INTERVAL_S = float(os.environ.get("MEMOPT_LEDGER_FLUSH_S",    "60.0"))
+FLUSH_BATCH_SIZE  = int(os.environ.get("MEMOPT_LEDGER_BATCH_SIZE", "100"))
+
 
 @dataclass
 class LedgerEntry:
@@ -170,6 +173,75 @@ def _get_latest_hash(conn) -> Optional[str]:
     return row[0] if row else None
 
 
+class _WriteBuffer:
+    """
+    Batches LedgerEntry objects and flushes them to SQLite in one
+    transaction either when FLUSH_BATCH_SIZE entries accumulate or
+    FLUSH_INTERVAL_S seconds have elapsed — whichever comes first.
+
+    This reduces SQLite write frequency from one transaction per
+    token-batch (potentially thousands/second) to at most one
+    transaction per 60 s under steady-state load.
+
+    Thread-safe: all mutations hold self._lock.
+    The flush loop runs in a daemon thread started by start().
+    """
+
+    def __init__(self, write_fn, flush_interval: float, flush_batch_size: int):
+        self._write_fn         = write_fn        # OptimizationLedger._write
+        self._flush_interval   = flush_interval
+        self._flush_batch_size = flush_batch_size
+        self._lock             = threading.Lock()
+        self._pending: list    = []
+        self._stop_event       = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start the background flush loop. Safe to call once."""
+        self._thread = threading.Thread(
+            target=self._flush_loop, daemon=True, name="ledger-flush"
+        )
+        self._thread.start()
+
+    def append(self, entry) -> None:
+        """
+        Enqueue an entry. Flushes immediately if batch size reached.
+        Never raises.
+        """
+        flush_now = False
+        with self._lock:
+            self._pending.append(entry)
+            if len(self._pending) >= self._flush_batch_size:
+                flush_now = True
+        if flush_now:
+            self._flush()
+
+    def shutdown(self) -> None:
+        """Flush remaining entries and stop the background thread."""
+        self._stop_event.set()
+        self._flush()   # drain whatever is left
+
+    def pending_count(self) -> int:
+        """Return how many entries are buffered but not yet written."""
+        with self._lock:
+            return len(self._pending)
+
+    def _flush(self) -> None:
+        """Write all pending entries to SQLite. Never raises."""
+        with self._lock:
+            batch, self._pending = self._pending, []
+        for entry in batch:
+            try:
+                self._write_fn(entry)
+            except Exception as e:
+                logger.debug(f"Ledger buffer flush error: {e}")
+
+    def _flush_loop(self) -> None:
+        """Background thread: flush every FLUSH_INTERVAL_S seconds."""
+        while not self._stop_event.wait(timeout=self._flush_interval):
+            self._flush()
+
+
 class OptimizationLedger:
     """
     Appends LedgerEntry records to a SQLite database.
@@ -194,6 +266,12 @@ class OptimizationLedger:
         self._lock    = threading.RLock()
         self._batch_counter = 0
         self._init_db()
+        self._buffer = _WriteBuffer(
+            write_fn=self._write,
+            flush_interval=FLUSH_INTERVAL_S,
+            flush_batch_size=FLUSH_BATCH_SIZE,
+        )
+        self._buffer.start()
 
     def _init_db(self) -> None:
         try:
@@ -288,7 +366,7 @@ class OptimizationLedger:
             gpu_price_hr_used=_GPU_PRICE_HR,
         )
 
-        self._write(entry)
+        self._buffer.append(entry)
         return entry
 
     def _write(self, entry: LedgerEntry) -> None:
@@ -324,9 +402,20 @@ class OptimizationLedger:
         except Exception as e:
             logger.debug(f"Ledger write failed: {e}")
 
+    def shutdown(self) -> None:
+        """Flush the write buffer and stop the background flush thread.
+        Call at server shutdown to ensure no buffered entries are lost.
+        """
+        self._buffer.shutdown()
+
+    def pending_count(self) -> int:
+        """Return how many entries are buffered but not yet written to SQLite."""
+        return self._buffer.pending_count()
+
     def recent(self, n: int = 100, tenant_id: Optional[str] = None) -> List[dict]:
         """Return the n most recent ledger entries as dicts.
 
+        Note: entries buffered but not yet flushed will not appear here.
         If tenant_id is provided, returns only entries for that tenant.
         """
         try:
@@ -354,6 +443,7 @@ class OptimizationLedger:
         Returns sums of tokens, energy, CO₂, and cost saved.
         Fields are None if no entries with that measurement exist.
 
+        Note: entries buffered but not yet flushed will not appear here.
         If tenant_id is provided, aggregates only that tenant's entries.
         """
         try:

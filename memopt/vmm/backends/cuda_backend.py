@@ -11,6 +11,22 @@ import tempfile
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
+
+def _nvme_block_path(nvme_dir: str, tenant_id: str, sequence_id: str, block_index: int) -> str:
+    """
+    Return a deterministic, tenant-namespaced NVMe block file path.
+
+    Format: <nvme_dir>/<tenant_id>/<sequence_id>_<block_index>.vmm_block
+    The tenant subdirectory ensures blocks from different tenants never
+    share a path prefix, preventing path-traversal or accidental cross-
+    tenant reads even if sequence_id values collide across tenants.
+    """
+    safe_tenant = tenant_id.replace("/", "_").replace("..", "_")
+    tenant_dir  = os.path.join(nvme_dir, safe_tenant)
+    os.makedirs(tenant_dir, exist_ok=True)
+    safe_seq = sequence_id.replace("/", "_").replace("..", "_")
+    return os.path.join(tenant_dir, f"{safe_seq}_{block_index}.vmm_block")
+
 if TYPE_CHECKING:
     import torch  # only for type hints; not imported at runtime
 
@@ -48,10 +64,17 @@ class CUDABackend:
             MemoryTier("nvme", nvme_total,  latency_us=100_000.0, bandwidth_gbps=14.0),
         ]
 
-    def allocate(self, size_bytes: int, tier: str) -> Union["torch.Tensor", str]:
+    def allocate(
+        self,
+        size_bytes: int,
+        tier: str,
+        tenant_id: str = "_default",
+        sequence_id: str = "",
+        block_index: int = 0,
+    ) -> Union["torch.Tensor", str]:
         """
         Allocate size_bytes on the requested tier.
-        Returns a tensor for hbm/dram, or a file path string for nvme.
+        Returns a tensor for hbm/dram, or a tenant-namespaced file path for nvme.
         """
         import torch
         if tier == "hbm":
@@ -61,9 +84,19 @@ class CUDABackend:
         if tier == "nvme":
             # NVMe blocks are file-backed. Pinned memory is not applicable here.
             # Pinning is only needed for DRAM tensors that will be DMA'd to the GPU.
-            f = tempfile.NamedTemporaryFile(delete=False, suffix=".vmm_block")
+            if sequence_id:
+                path = _nvme_block_path(
+                    tempfile.gettempdir(), tenant_id, sequence_id, block_index
+                )
+                with open(path, "wb") as f:
+                    f.write(b"\x00" * size_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return path
+            # Fallback: anonymous temp file (no sequence context)
             # TODO Phase 2: replace with io_uring (liburing) for ~10 GB/s async NVMe
             # TODO Phase 2: replace with GPUDirect Storage (GDS) for direct NVMe→HBM DMA at 14 GB/s
+            f = tempfile.NamedTemporaryFile(delete=False, suffix=".vmm_block")
             f.write(b"\x00" * size_bytes)
             f.flush()
             os.fsync(f.fileno())   # ensure zero-fill reaches disk before returning

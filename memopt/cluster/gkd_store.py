@@ -38,6 +38,7 @@ from __future__ import annotations
 import time
 import logging
 import threading
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
@@ -285,6 +286,8 @@ class GKDStore:
         redis_password: Optional[str] = None,
         default_ttl_seconds: int = 3600,
         block_size_bytes: int = 131_072,
+        redis_url: Optional[str] = None,
+        node_id: str = "local",
     ):
         """
         Args:
@@ -296,7 +299,21 @@ class GKDStore:
                                  1 hour default. Popular prompts stay hot.
             block_size_bytes:    Default KV block size in bytes.
                                  Used to estimate HBM saved in stats().
+            redis_url:           Optional redis:// or rediss:// URL. When provided,
+                                 overrides redis_host/redis_port/redis_password and
+                                 forces backend="redis".
+            node_id:             Identifier for this node in stats and logs.
         """
+        self._node_id = node_id
+
+        if redis_url is not None:
+            # Parse redis[s]://[:password@]host[:port][/db]
+            parsed       = urllib.parse.urlparse(redis_url)
+            redis_host   = parsed.hostname or "localhost"
+            redis_port   = parsed.port or 6379
+            redis_password = parsed.password or redis_password
+            backend      = "redis"
+
         if backend == "redis":
             self._backend = RedisGKDBackend(
                 host=redis_host, port=redis_port, password=redis_password
