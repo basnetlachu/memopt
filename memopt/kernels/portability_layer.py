@@ -71,15 +71,15 @@ def detect_hardware() -> HardwareProfile:
       3. Apple M-series (MPS) → TorchCompile
       4. CPU / unknown → TorchCompile
     """
+    from memopt.utils.gpu_info import get_cuda_info
+    gpu = get_cuda_info(0)
+
     try:
         import torch
 
         # ── NVIDIA CUDA ──────────────────────────────────────────────
-        if torch.cuda.is_available() and not (
-            hasattr(torch.version, "hip") and torch.version.hip
-        ):
+        if gpu.is_available and not gpu.is_rocm:
             major, minor = torch.cuda.get_device_capability(0)
-            name         = torch.cuda.get_device_name(0)
             arch_name, max_blk, tm, tn, tk = _ARCH_PROFILES.get(
                 (major, minor),
                 _ARCH_PROFILES.get((major, 0), _DEFAULT_PROFILE),
@@ -88,8 +88,8 @@ def detect_hardware() -> HardwareProfile:
             return HardwareProfile(
                 backend        = "triton_cuda",
                 arch_name      = arch_name,
-                compute_cap    = f"{major}.{minor}",
-                device_name    = name,
+                compute_cap    = gpu.compute_cap,
+                device_name    = gpu.device_name,
                 max_block_size = max_blk,
                 safe_tile_m    = tm,
                 safe_tile_n    = tn,
@@ -98,14 +98,13 @@ def detect_hardware() -> HardwareProfile:
             )
 
         # ── AMD ROCm ─────────────────────────────────────────────────
-        if torch.cuda.is_available() and hasattr(torch.version, "hip") and torch.version.hip:
-            name = torch.cuda.get_device_name(0)
+        if gpu.is_available and gpu.is_rocm:
             has_triton = _triton_available()
             return HardwareProfile(
                 backend        = "triton_rocm",
                 arch_name      = "rocm_cdna",
                 compute_cap    = "",
-                device_name    = name,
+                device_name    = gpu.device_name,
                 max_block_size = 128,
                 safe_tile_m    = 64,
                 safe_tile_n    = 64,

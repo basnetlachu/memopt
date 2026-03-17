@@ -114,7 +114,7 @@ class BottleneckAnalysis:
                 f"impact={self.impact_score:.2f}, recoverable={self.recoverable_compute_pct:.1f}%)")
 
 
-from memopt.profiler.bottleneck_classifier import BottleneckClassifier  # noqa: F401
+from memopt.profiler.classifier import BottleneckClassifier  # noqa: F401
 # Retained for import compatibility — do not add new code here
 
 

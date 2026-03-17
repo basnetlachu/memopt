@@ -41,7 +41,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
-from .hash_engine import compute_hash, make_fingerprint, verify_fingerprint
+from .hashing import compute_hash, make_fingerprint, verify_fingerprint
 
 logger = logging.getLogger(__name__)
 

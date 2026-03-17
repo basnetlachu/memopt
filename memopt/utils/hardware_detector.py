@@ -72,10 +72,11 @@ def detect_hardware(device: int = 0) -> HardwareProfile:
     Returns:
         HardwareProfile with all fields populated.
     """
+    from memopt.utils.gpu_info import get_cuda_info
+    info = get_cuda_info(device)
+    if not info.is_available:
+        return _cpu_profile()
     try:
-        import torch
-        if not torch.cuda.is_available():
-            return _cpu_profile()
         return _detect_cuda_profile(device)
     except Exception:
         return _cpu_profile()

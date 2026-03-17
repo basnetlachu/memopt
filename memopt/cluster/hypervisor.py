@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 
-from .rdma_transport import TCPTransport, RemoteRegion, make_transport
+from .transport import TCPTransport, RemoteRegion, make_transport
 from .gkd_store import GKDStore
 
 logger = logging.getLogger(__name__)

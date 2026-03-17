@@ -10,6 +10,7 @@ from .input_handler import (
     InputFormat,
 )
 from .hardware_detector import detect_hardware, HardwareProfile
+from .gpu_info import get_cuda_info, CudaInfo
 
 __all__ = [
     "load_large_model",
@@ -23,6 +24,8 @@ __all__ = [
     "InputFormat",
     "detect_hardware",
     "HardwareProfile",
+    "get_cuda_info",
+    "CudaInfo",
     "detect_model_type",
     "get_applicable_optimizations",
     "MODEL_FAMILY_OPTIMIZATIONS",

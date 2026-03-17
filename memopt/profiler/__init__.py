@@ -55,7 +55,7 @@ from .ncu_profiler import (
 )
 
 # Phase 1: Bottleneck Classification
-from .bottleneck_classifier import (
+from .classifier import (
     BottleneckClassifier,
     BottleneckClassification,
     BottleneckType,
@@ -65,7 +65,7 @@ from .bottleneck_classifier import (
 )
 
 # Phase 1: Main Profiler
-from .phase1_profiler import (
+from .profiler import (
     Phase1Profiler,
     ProfileReport,
     LiveDashboard,
@@ -73,7 +73,7 @@ from .phase1_profiler import (
 )
 
 # Phase 2: Access Pattern Analysis
-from .access_pattern_analyzer import (
+from .access_analyzer import (
     AccessPatternAnalyzer,
     AccessPatternReport,
     AccessPattern,
@@ -96,14 +96,14 @@ from .continuous_profiler import (
     ProfilerSnapshot,
     profile_model_bottlenecks as legacy_profile_model_bottlenecks,
 )
-from .bottleneck_classifier import BottleneckClassifier as LegacyBottleneckClassifier
+from .classifier import BottleneckClassifier as LegacyBottleneckClassifier
 
 # Aliases for Phase 1 enhanced classes
 EnhancedBottleneckClassifier = BottleneckClassifier
 EnhancedBottleneckType = BottleneckType
 
 # Step 2: Traffic Attribution
-from .traffic_attribution import (
+from .attribution import (
     TrafficAttributor,
     Attribution,
     AttributionType,

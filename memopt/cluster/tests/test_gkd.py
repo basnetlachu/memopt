@@ -7,7 +7,7 @@ The benchmark tests print real numbers that can go directly into a pitch deck.
 import time
 import pytest
 from memopt.cluster.gkd_store import GKDStore, LocalGKDBackend
-from memopt.cluster.hash_engine import (
+from memopt.cluster.hashing import (
     compute_hash, make_fingerprint, verify_fingerprint
 )
 

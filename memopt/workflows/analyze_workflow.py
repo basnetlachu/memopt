@@ -338,15 +338,8 @@ class AnalyzeWorkflow:
         return tensor_info
 
     def _calculate_roi(self, phase2_report: Any, model_name: str) -> Any:
-        """Calculate ROI from Phase 2 report."""
-        from memopt.business import ROICalculator
-
-        calculator = ROICalculator(
-            gpu_cost_per_hour=self.gpu_cost_per_hour,
-            gpu_count=self.gpu_count
-        )
-
-        return calculator.calculate_from_phase2_report(phase2_report, model_name)
+        """ROI calculation removed — business module deleted."""
+        return None
 
     def _format_text(self, phase2_report: Any, roi_report: Any) -> str:
         """Format output as text."""
@@ -363,18 +356,13 @@ class AnalyzeWorkflow:
         return '\n'.join(parts)
 
     def _format_html(self, phase2_report: Any, roi_report: Any, model_name: str) -> str:
-        """Format output as HTML."""
-        from memopt.formatters import HTMLReportGenerator
-
-        generator = HTMLReportGenerator()
-        return generator.generate(phase2_report, roi_report, model_name)
+        """HTML formatting removed — formatters module deleted."""
+        return f"<h1>{model_name}</h1><pre>{phase2_report}</pre>"
 
     def _format_json(self, phase2_report: Any, roi_report: Any, model_name: str) -> str:
-        """Format output as JSON."""
-        from memopt.formatters import JSONExporter
-
-        exporter = JSONExporter(pretty=True)
-        return exporter.export(phase2_report, roi_report, model_name)
+        """JSON formatting removed — formatters module deleted."""
+        import json
+        return json.dumps({"model_name": model_name, "report": str(phase2_report)})
 
     def _save_output(self, result: AnalysisResult, output_format: str, output_path: str):
         """Save output to file."""

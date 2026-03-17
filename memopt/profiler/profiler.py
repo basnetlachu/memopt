@@ -42,7 +42,7 @@ from .hardware_counters import (
     get_gpu_spec,
     GPUSpec,
 )
-from .bottleneck_classifier import (
+from .classifier import (
     BottleneckClassifier,
     BottleneckClassification,
     BottleneckType,

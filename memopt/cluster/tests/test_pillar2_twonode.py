@@ -23,7 +23,7 @@ import torch
 from memopt.vmm import VMM
 from memopt.cluster.gkd_store import GKDStore
 from memopt.cluster.hypervisor import MemoryHypervisor
-from memopt.cluster.rdma_transport import TCPTransport, RemoteRegion
+from memopt.cluster.transport import TCPTransport, RemoteRegion
 
 BLOCK_SIZE = 131_072   # 128 KB — standard KV block
 GB         = 1024 ** 3

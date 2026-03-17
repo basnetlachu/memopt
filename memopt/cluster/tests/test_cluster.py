@@ -5,7 +5,7 @@ All tests use TCPTransport and LocalGKDBackend. No hardware required.
 import time
 import threading
 import pytest
-from memopt.cluster.rdma_transport import TCPTransport, RemoteRegion
+from memopt.cluster.transport import TCPTransport, RemoteRegion
 from memopt.cluster.hypervisor import MemoryHypervisor, ClusterMap, _estimate_latency_us
 from memopt.cluster.gkd_store import GKDStore
 
