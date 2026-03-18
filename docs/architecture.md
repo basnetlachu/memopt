@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 114 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 159 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -10,11 +10,13 @@
 
 1. [What memopt Does](#1-what-memopt-does)
 2. [Repository Layout](#2-repository-layout)
-3. [Four-Pillar Architecture](#3-four-pillar-architecture)
+3. [Six-Pillar Architecture](#3-six-pillar-architecture)
 4. [Pillar 1: Infinite Context VMM](#4-pillar-1-infinite-context-vmm)
 5. [Pillar 2: Global KV Cache Deduplication (GKD)](#5-pillar-2-global-kv-cache-deduplication-gkd)
 6. [Pillar 3: Self-Synthesizing Kernels](#6-pillar-3-self-synthesizing-kernels)
 7. [Pillar 4: Proof of Efficiency (Observability)](#7-pillar-4-proof-of-efficiency-observability)
+7a. [Pillar 5: Global Unified Memory (GUM)](#7a-pillar-5-global-unified-memory-gum)
+7b. [Pillar 6: Silicon Certification Suite](#7b-pillar-6-silicon-certification-suite)
 8. [Profiling Pipeline](#8-profiling-pipeline)
 9. [Bottleneck Classification](#9-bottleneck-classification)
 10. [Access Pattern Analysis](#10-access-pattern-analysis)
@@ -48,7 +50,9 @@ Beyond single-model optimization, memopt provides:
 - **Infinite Context VMM** — multi-tier (HBM → DRAM → NVMe) KV-block paging with predictive prefetch so long-context inference never OOMs.
 - **Global KV Cache Deduplication (GKD)** — cluster-wide content-addressed cache that eliminates redundant KV recomputation for shared prompt prefixes (90%+ hit rate in production).
 - **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference.
-- **Proof of Efficiency** — Prometheus metrics aggregator, per-batch energy/CO₂/cost savings ledger (SQLite), HMAC-signed optimization certificates, and GPU price arbitrage engine.
+- **Proof of Efficiency** — Prometheus metrics aggregator, per-batch energy/CO₂/cost savings ledger (SQLite, write-buffered), HMAC-signed optimization certificates, and GPU price arbitrage engine.
+- **Global Unified Memory (GUM)** — turns N independent GPU nodes into one logical memory space; NVMe-evicted blocks are content-addressed and fetchable from any peer over TCP via optimistic lease protocol.
+- **Silicon Certification Suite** — correctness and throughput battery (rope, layer_norm_residual, scaled_softmax + memcpy/GEMM benchmarks) producing a signed `SiliconCertificate` JSON that proves hardware behaviour before deployment.
 - **Background daemon** — zero-touch GPU process monitor via NVML.
 - **Serving runtime** — OpenAI-compatible HTTP interface with paged attention and continuous batching.
 - **Control plane** — lightweight FastAPI server for cluster node reporting, status, and serving engine registration.
@@ -70,6 +74,8 @@ memopt/                        ← Python package root
 │   ├── hashing.py             ← Content fingerprinting   [renamed from hash_engine.py]
 │   ├── hypervisor.py          ← Memory hypervisor
 │   ├── transport.py           ← TCP/RDMA transport layer [renamed from rdma_transport.py]
+│   ├── block_directory.py     ← Pillar 5: cluster-wide block location index (local + Redis)
+│   ├── remote_block.py        ← Pillar 5: cross-node block transfer protocol (TCP, stdlib only)
 │   └── tests/
 ├── control_plane/
 │   ├── server.py              ← Control-plane FastAPI server
@@ -85,6 +91,7 @@ memopt/                        ← Python package root
 │   ├── jit_generator.py       ← Pillar 3: Claude-powered kernel synthesis
 │   ├── kernel_cache.py        ← Pillar 3: two-level kernel cache
 │   ├── portability_layer.py   ← Pillar 3: BackendStrategy (CUDA/ROCm/TorchCompile/MLIR)
+│   ├── certification.py       ← Pillar 6: Silicon Certification Suite
 │   └── tests/
 ├── measurement/
 │   └── bandwidth_tracker.py
@@ -148,16 +155,18 @@ setup.py
 
 ---
 
-## 3. Four-Pillar Architecture
+## 3. Six-Pillar Architecture
 
-memopt's core is built around four pillars that address the main GPU memory bottlenecks in production LLM serving:
+memopt's core is built around six pillars that address the main GPU memory bottlenecks in production LLM serving:
 
 | Pillar | Module | Problem Solved |
 |--------|--------|---------------|
 | **1 — Infinite Context VMM** | `vmm/` | KV cache OOM for long contexts |
-| **2 — Global KV Deduplication** | `cluster/` | Redundant KV recomputation for shared prefixes |
+| **2 — Global KV Deduplication** | `cluster/gkd_store.py` | Redundant KV recomputation for shared prefixes |
 | **3 — Self-Synthesizing Kernels** | `kernels/` | HBM stall from unoptimised CUDA kernels |
 | **4 — Proof of Efficiency** | `observability/` | Measure, certify, and monetise every optimization |
+| **5 — Global Unified Memory** | `cluster/block_directory.py` + `cluster/remote_block.py` | Cross-node NVMe block sharing — N nodes act as one memory pool |
+| **6 — Silicon Certification** | `kernels/certification.py` | Signed hardware correctness + throughput proof before deployment |
 
 Each pillar is independent — deployable standalone or in combination.
 
@@ -208,9 +217,19 @@ All writes to NVMe-tier block files are crash-safe:
 
 The CUDA backend applies the same fsync-on-allocation and atomic-rename-on-eviction pattern.
 
-### 4.6 Test Coverage
+### 4.6 VMM Tenant Isolation (`vmm/__init__.py`)
 
-- `test_vmm_smoke.py`: allocate/fetch/free, stats, prefetch recording, multi-sequence isolation, error handling (6 tests)
+Every sequence is bound to the `tenant_id` that first allocated it. Cross-tenant access raises `PermissionError` — a tenant can never read, promote, or free another tenant's sequences.
+
+- `allocate(sequence_id, block_index, size_bytes, tenant_id="_default")` — registers ownership on first call; raises `PermissionError` if `sequence_id` already owned by a different tenant.
+- `fetch(sequence_id, block_index, tenant_id="_default")` — raises `PermissionError` on ownership mismatch.
+- `free_sequence(sequence_id, tenant_id="_default")` — removes ownership entry after freeing.
+
+NVMe block paths are also namespaced per tenant: `<nvme_dir>/<tenant_id>/<sequence_id>_<block_index>.vmm_block`, preventing filesystem-level cross-tenant collisions.
+
+### 4.7 Test Coverage
+
+- `test_vmm_smoke.py`: allocate/fetch/free, stats, prefetch recording, multi-sequence isolation, error handling, tenant isolation (10 tests)
 - `test_vmm_benchmark.py`: tier capacity, prefetch hit rate, promotion latency, DMA bandwidth + 2 CPU CI tests (9 tests, 3 GPU-only skips)
 
 ---
@@ -261,6 +280,8 @@ If a collision is detected, the entry is treated as a miss and an error is logge
 Redis backend degrades gracefully to local if Redis is unreachable — inference never crashes.
 
 **Degradation alerting** — when `RedisGKDBackend` falls back to local, it calls `_mark_degraded(reason)` which logs at `ERROR` level (not `DEBUG`) exactly once. This makes Redis connectivity problems immediately visible in log aggregators and alerting systems. The degradation state is exposed in `GKDStore.stats()` as `backend_degraded: bool` and `backend_degraded_since: float | None` so Grafana and the `/metrics` endpoint can surface it. A spike in `backend_degraded=True` with `hit_rate_pct` dropping to ~0% indicates a Redis outage silently consuming compute that GKD would otherwise eliminate.
+
+**`/health` 503 on Redis degradation** — `api/server.py` exposes a `register_gkd(gkd)` hook. When a `GKDStore` is registered, the `GET /health` endpoint reads `gkd_store.stats()["backend_degraded"]` and returns `HTTP 503` (body `{"status":"degraded"}`) when True. Kubernetes liveness probes and load balancers will route traffic away from a degraded node automatically.
 
 ### 5.5 Transport (`cluster/transport.py`)
 
@@ -430,7 +451,7 @@ Routes compilation to the correct backend detected at runtime:
 |--------|------|-----------|
 | `triton_cuda` | NVIDIA | Writes source to tempfile, imports via `importlib` — Triton `@jit` → PTX |
 | `triton_rocm` | AMD | Same as CUDA path + NaN/Inf smoke test before accepting kernel |
-| `mlir` | Custom ASIC | Writes `.mlir` file to `MEMOPT_MLIR_OUT_DIR` with `kernel_{ms}_{uuid8}.mlir` filename to prevent collisions when multiple kernels are emitted in the same millisecond |
+| `mlir` | Custom ASIC | Emits real MLIR text dialect (`module @name { func.func @run_kernel() -> () { return } }`) to `MEMOPT_MLIR_OUT_DIR`; Triton source embedded as comments for vendor toolchain reference; `kernel_{ms}_{uuid8}.mlir` filename prevents collisions |
 | `cpu` | No GPU | Returns `None` immediately |
 
 Returns a `types.ModuleType` with a `run_kernel` callable, or `None` on any failure. Never raises.
@@ -603,6 +624,8 @@ text = registry.prometheus_text()  # "# HELP ... # TYPE ... metric{label=...} va
 
 `OptimizationLedger` records per-batch economics in `~/.memopt/ledger.db` (SQLite, WAL mode).
 
+**Write buffer** — a `_WriteBuffer` daemon thread batches SQLite inserts to reduce lock contention under high throughput. Entries are flushed every `FLUSH_INTERVAL_S` seconds (default 60 s, `MEMOPT_LEDGER_FLUSH_S`) or when `FLUSH_BATCH_SIZE` entries accumulate (default 100, `MEMOPT_LEDGER_BATCH_SIZE`). `ledger.shutdown()` flushes all pending entries before the process exits. `ledger.pending_count()` returns how many entries are buffered but not yet written to disk.
+
 **Multi-tenant** — every entry carries a `tenant_id`. `record()` accepts an optional `tenant_id` parameter (default `"_default"`). `recent(n, tenant_id=None)` and `totals(tenant_id=None)` accept an optional filter; when supplied only that tenant's rows are returned.
 
 **Append-only** — the schema uses `INSERT` (never `INSERT OR REPLACE`). A duplicate `batch_id` raises `sqlite3.IntegrityError` which is caught and logged at `DEBUG` — the second write is silently dropped. Past records can never be overwritten.
@@ -719,6 +742,194 @@ The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3
 | Arbitrage | No-keys startup, effective cost formula, threshold logic, dry-run |
 | Multi-tenant keys | create+authenticate, invalid tenant ID rejection, wrong-key returns None |
 | Append-only ledger | duplicate batch_id dropped, hash chain valid after 5 writes, hash chain detects SQL column tampering, tenant isolation in recent()/totals() |
+
+---
+
+## 7a. Pillar 5: Global Unified Memory (GUM)
+
+### 7a.1 Overview
+
+GUM turns N independent GPU nodes into one logical memory pool. When a VMM node evicts a KV block to its local NVMe, it registers the block in a cluster-wide directory. Any peer that needs the same block (identified by SHA-256 content hash) can fetch it over TCP instead of recomputing it.
+
+```
+Node A (evicts block)          Block Directory           Node B (needs block)
+       │                            │                           │
+       │── ADVERTISE(hash) ────────▶│                           │
+       │                            │                           │
+       │                            │◀─── lookup(hash) ─────────│
+       │                            │─── entry(node=A) ─────────▶│
+       │                            │                           │
+       │◀─────────────── LEASE_ACQUIRE(hash) ──────────────────│
+       │─────────────── LEASE_ACK(granted=true) ───────────────▶│
+       │                            │                           │
+       │◀─────────────── REQUEST(hash) ────────────────────────│
+       │─────────────── TRANSFER(hash, data) ──────────────────▶│
+       │                            │                           │
+       │◀─────────────── LEASE_RELEASE(hash) ──────────────────│
+```
+
+### 7a.2 Block Directory (`cluster/block_directory.py`)
+
+`BlockEntry` dataclass: `content_hash`, `node_id`, `tier`, `path`, `size_bytes`, `registered_at`, `lease_count`.
+
+| Method | Behaviour |
+|--------|-----------|
+| `register(entry)` | Overwrites any existing entry for the same hash |
+| `lookup(hash)` | Returns entry or None (auto-deregisters expired entries) |
+| `acquire_lease(hash, requesting_node)` | Increments `lease_count`; returns False if not leasable |
+| `release_lease(hash, requesting_node)` | Decrements `lease_count`; safe if entry no longer exists |
+| `can_evict(hash)` | True only when `lease_count == 0` |
+| `deregister(hash)` | Removes entry |
+
+TTL: `MEMOPT_BLOCK_DIR_TTL_S` (default 3600 s). Only `tier="nvme"` blocks are leasable — HBM blocks are already in memory and need no cross-node transfer.
+
+Two backends:
+
+| Backend | Use case |
+|---------|----------|
+| `LocalBlockDirectory` | Single-node and all tests — in-process dict, no dependencies |
+| `RedisBlockDirectory` | Cluster-wide — write-through cache over Redis HSET; falls back to local on failure |
+
+`make_directory(node_id)` returns the best available backend based on `REDIS_URL` env var.
+
+### 7a.3 Remote Block Protocol (`cluster/remote_block.py`)
+
+Length-prefixed JSON frames over raw TCP (stdlib `socket` only — no ucx-py dependency).
+
+| Message | Direction | Payload |
+|---------|-----------|---------|
+| `REQUEST` | client → server | `content_hash`, `requesting_node` |
+| `TRANSFER` | server → client | `content_hash`, `size_bytes` + raw block bytes |
+| `LEASE_ACQUIRE` | client → server | `content_hash`, `requesting_node` |
+| `LEASE_RELEASE` | client → server | `content_hash`, `requesting_node` |
+| `LEASE_ACK` | server → client | `granted` / `released` |
+| `ERROR` | server → client | `content_hash`, `reason` |
+
+**`RemoteBlockServer`** — one daemon thread accept loop per node; spawns a handler thread per connection. Injects `block_directory` and `read_block_fn(path) → bytes | None` at construction — no direct VMM coupling.
+
+**`RemoteBlockClient`** — `fetch_block()` never raises; returns `None` on any failure (timeout, not found, read error). `acquire_lease()` / `release_lease()` are best-effort — if the server is unreachable, the caller proceeds without a lease (worst case: block evicted before transfer, `fetch_block` returns None → caller recomputes).
+
+Environment variables:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `MEMOPT_RBP_PORT` | 18516 | TCP port for `RemoteBlockServer` |
+| `MEMOPT_RBP_TIMEOUT_S` | 2.0 | Socket timeout for client operations |
+| `MEMOPT_RBP_MAX_BLOCK_MB` | 256.0 | Maximum accepted frame size |
+| `MEMOPT_NODE_HOSTS` | — | `"node-a:192.168.1.10,node-b:192.168.1.11"` — maps node IDs to IPs |
+
+### 7a.4 TierManager Integration (`vmm/tier_manager.py`)
+
+`TierManager._fetch_from_lower_tier()` accepts three optional kwargs added for GUM:
+
+```python
+tier_manager._fetch_from_lower_tier(
+    sequence_id, block_index,
+    content_hash="sha256...",
+    remote_client=RemoteBlockClient(...),
+    block_directory=make_directory(node_id),
+)
+```
+
+Existing callers that omit these kwargs get identical behaviour (returns None, no remote call). When all three are supplied and the directory has an entry on a different node, the method acquires a lease, fetches the block bytes, and releases the lease.
+
+### 7a.5 Test Coverage (`cluster/tests/test_pillar5_gum.py`)
+
+19 CPU-only tests — no GPU, no Redis required:
+
+| Group | Tests |
+|-------|-------|
+| BlockEntry | not-expired, expired-after-TTL, HBM-not-leasable |
+| LocalBlockDirectory | register/lookup, missing, expired, lease lifecycle, lease denied for missing, release safe on missing, multiple leases, deregister, stats, list_node_blocks, make_directory |
+| RemoteBlock | full round-trip with data integrity (SHA-256), not-found returns None, server unreachable returns None, lease round-trip, 5 concurrent clients |
+
+---
+
+## 7b. Pillar 6: Silicon Certification Suite
+
+### 7b.1 Overview
+
+Before deploying to a new hardware node, operators run `memopt certify` to validate that the silicon behaves correctly and measures its peak memory bandwidth. The result is a signed `SiliconCertificate` JSON stored on disk — a tamper-evident hardware passport.
+
+```bash
+memopt certify --node-id a100-prod-01 --output-dir /etc/memopt/certs
+```
+
+### 7b.2 `kernels/certification.py`
+
+**Dataclasses:**
+
+| Class | Fields |
+|-------|--------|
+| `TestResult` | `name`, `dtype`, `passed`, `max_err`, `atol`, `rtol`, `note` |
+| `ThroughputResult` | `name`, `achieved_gb_s`, `theoretical_gb_s`, `pct_of_peak`, `note` |
+| `SiliconCertificate` | all fields above + `device_name`, `compute_cap`, `node_id`, `issued_at`, `all_passed`, `signature`, `signature_status`, `certificate_hash` |
+
+**Correctness tests** — run on `float16` and `float32` (CPU uses float32 only):
+
+| Test | What it checks |
+|------|---------------|
+| `rope` | Rotary position embedding: with `cos=1, sin=0` output must equal input |
+| `layer_norm_residual` | Layer norm + residual add: deterministic recomputation matches reference |
+| `scaled_softmax` | Scaled dot-product softmax: two identical calls produce identical output |
+
+Tolerances from `_TOLERANCES` (same as `jit_generator._DTYPE_TOLERANCES`): float16/bfloat16 → `(1e-2, 1e-2)`, float32 → `(1e-5, 1e-5)`, float64 → `(1e-8, 1e-8)`.
+
+**Throughput benchmarks:**
+
+| Benchmark | Method | Metric |
+|-----------|--------|--------|
+| `memory_bandwidth` | 256 MB device-to-device copy, 20 timed iters | GB/s, % of theoretical peak |
+| `matmul_throughput` | 4096×4096 FP32 GEMM, 20 timed iters | GB/s equivalent, TFLOPS noted |
+
+**Theoretical peak bandwidth** — looks up `hardware_counters.GPU_SPECS` by device name first; falls back to an empirical 256 MB memcpy probe when the GPU is not in the database.
+
+**Signing** — HMAC-SHA256 over canonical JSON of the certificate payload. `MEMOPT_SIGNING_KEY` env var. When unset, `signature_status = "unsigned"`. `verify_certificate(cert_dict, key)` uses `hmac.compare_digest()`.
+
+**`run_certification(node_id)` never raises.** All test failures are captured in `TestResult.passed = False` with the exception in `note`.
+
+### 7b.3 CLI (`memopt certify`)
+
+```bash
+memopt certify \
+  --node-id    <str>   # embedded in certificate (default: empty)
+  --output-dir <path>  # save directory (default: /tmp/memopt_certs)
+  --no-save            # print results, do not write JSON to disk
+```
+
+Output example:
+```
+Running Silicon Certification Suite (node=a100-prod-01) ...
+
+Result: PASS
+Device: NVIDIA A100-SXM4-80GB  CC=8.0
+Cert hash: 4a7f2b9c1d3e...
+
+Correctness tests:
+  ✓ rope                           dtype=float32   max_err=0.00e+00
+  ✓ layer_norm_residual            dtype=float32   max_err=0.00e+00
+  ✓ scaled_softmax                 dtype=float32   max_err=0.00e+00
+
+Throughput tests:
+  memory_bandwidth                1842.3 GB/s  (54.9% of 3350 GB/s peak)
+  matmul_throughput                 96.4 GB/s  (2.9% of 3350 GB/s peak)  [tflops=12.97]
+
+Signature: signed
+Certificate saved: /tmp/memopt_certs/cert_4a7f2b9c1d3e_1742200000.json
+```
+
+### 7b.4 Test Coverage (`kernels/tests/test_certification.py`)
+
+18 CPU-only tests — no GPU, no API key, no triton required:
+
+| Group | Tests |
+|-------|-------|
+| Hardware info | `_get_hardware_info` returns required keys; device_name non-empty |
+| Theoretical peak | Returns float ≥ 0; H100 lookup hits GPU_SPECS |
+| Tolerances | All four dtypes covered with positive atol/rtol |
+| `run_certification` | Returns `SiliconCertificate`; never raises; has correctness/throughput tests; `all_passed` is bool; `certificate_hash` is 64-char hex |
+| Signing | Unsigned when no key; signed (64-char HMAC-SHA256) when key set |
+| Save + verify | File created; valid JSON; signature verifies; tamper detected; unsigned returns False |
 
 ---
 
@@ -1167,6 +1378,10 @@ memopt cluster status
 memopt cluster nodes
 memopt cluster events --last 24h
 
+# Silicon certification
+memopt certify --node-id node-a --output-dir /etc/memopt/certs
+memopt certify --no-save   # print-only, no JSON written
+
 # Sessions / history
 memopt sessions list
 memopt sessions show <id>
@@ -1220,17 +1435,19 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**114 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**159 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
-| `kernels/tests/test_kernels.py` | 19 | 19 PASS |
+| `kernels/tests/test_kernels.py` | 25 | 25 PASS |
+| `kernels/tests/test_certification.py` | 18 | 18 PASS (Pillar 6) |
 | `serving/tests/test_serving_kernels.py` | 11 | 11 PASS |
-| `vmm/tests/test_vmm_smoke.py` | 6 | 6 PASS |
+| `vmm/tests/test_vmm_smoke.py` | 10 | 10 PASS (4 new: tenant isolation) |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
-| `cluster/tests/test_gkd.py` | 13 | 13 PASS |
-| `cluster/tests/test_cluster.py` | 19 | 19 PASS (5 new: AbstractTransport interface, TCP override, UCX fallback, interface completeness, stats keys) |
+| `cluster/tests/test_gkd.py` | 15 | 15 PASS (2 new: backend_degraded key, Redis degradation) |
+| `cluster/tests/test_cluster.py` | 19 | 19 PASS |
 | `cluster/tests/test_pillar2_twonode.py` | 8 | 6 PASS, 1 SKIP, 1 flaky* |
-| `observability/tests/test_observability.py` | 27 | 27 PASS (7 new: multi-tenant keys, append-only ledger, hash chain, tenant isolation) |
+| `cluster/tests/test_pillar5_gum.py` | 19 | 19 PASS (Pillar 5 — all CPU/TCP, no GPU) |
+| `observability/tests/test_observability.py` | 29 | 29 PASS (2 new: write buffer flush, shutdown flush) |
 
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.
