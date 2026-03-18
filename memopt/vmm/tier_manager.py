@@ -11,6 +11,8 @@ Hardware-agnostic: all memory ops go through hal.backend.
 """
 from __future__ import annotations
 import logging
+import os
+from typing import Optional
 
 from .hal import backend, tiers, tier_names
 from .page_table import PageTable, PageTableEntry
@@ -131,6 +133,76 @@ class TierManager:
 
         if evicted:
             logger.info("Evicted %d blocks from %r to make room", evicted, tier)
+
+    def _fetch_from_lower_tier(
+        self,
+        sequence_id:    str,
+        block_index:    int,
+        content_hash:   str = "",
+        remote_client=  None,
+        block_directory=None,
+    ) -> Optional[bytes]:
+        """
+        Fetch a block from DRAM, local NVMe, or — if neither has it —
+        from a remote node via the Remote Block Protocol.
+
+        Remote fetch is attempted only when:
+          1. content_hash is provided (so the directory can be queried)
+          2. block_directory is provided and has an entry for this hash
+          3. The entry is on a different node (not local)
+          4. remote_client is provided
+
+        Returns None if the block cannot be found anywhere.
+        Caller is responsible for deciding what to do (recompute, error).
+        All existing callers that do not pass these kwargs get identical
+        behaviour to before (returns None, no remote call).
+        """
+        # GUM extension: try remote node before returning None
+        if content_hash and block_directory is not None \
+                and remote_client is not None:
+            entry = block_directory.lookup(content_hash)
+            if entry is not None and entry.node_id != getattr(
+                self, "_node_id", ""
+            ):
+                remote_host = self._get_node_host(entry.node_id)
+                if remote_host:
+                    leased = remote_client.acquire_lease(
+                        content_hash, remote_host
+                    )
+                    try:
+                        data = remote_client.fetch_block(
+                            content_hash, remote_host
+                        )
+                        if data is not None:
+                            logger.info(
+                                f"GUM: fetched block {content_hash[:16]}... "
+                                f"from {entry.node_id} "
+                                f"({len(data)} bytes)"
+                            )
+                            return data
+                    finally:
+                        if leased:
+                            remote_client.release_lease(
+                                content_hash, remote_host
+                            )
+
+        return None
+
+    def _get_node_host(self, node_id: str) -> Optional[str]:
+        """
+        Look up the hostname/IP for a node_id.
+        Reads from MEMOPT_NODE_HOSTS environment variable:
+          MEMOPT_NODE_HOSTS="node-a:192.168.1.10,node-b:192.168.1.11"
+        Returns None if node_id is not in the map.
+        """
+        hosts_env = os.environ.get("MEMOPT_NODE_HOSTS", "")
+        if not hosts_env:
+            return None
+        for pair in hosts_env.split(","):
+            parts = pair.strip().split(":")
+            if len(parts) == 2 and parts[0].strip() == node_id:
+                return parts[1].strip()
+        return None
 
     def _hot_tier(self) -> str:
         return tier_names[0]

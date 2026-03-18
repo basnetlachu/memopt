@@ -5,6 +5,12 @@ from .transport import (
     RemoteRegion, MemoryRegion,
 )
 from .hypervisor import MemoryHypervisor, BorrowOffer, ClusterMap
+from .block_directory import (
+    LocalBlockDirectory, BlockEntry, make_directory
+)
+from .remote_block import (
+    RemoteBlockServer, RemoteBlockClient
+)
 
 try:
     from .transport import UCXTransport
@@ -16,4 +22,6 @@ __all__ = [
     "compute_hash", "make_fingerprint", "verify_fingerprint",
     "TCPTransport", "AbstractTransport", "RemoteRegion", "MemoryRegion", "make_transport",
     "MemoryHypervisor", "BorrowOffer", "ClusterMap",
+    "LocalBlockDirectory", "BlockEntry", "make_directory",
+    "RemoteBlockServer", "RemoteBlockClient",
 ]
