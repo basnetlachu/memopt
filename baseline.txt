@@ -1,0 +1,3 @@
+FAILED memopt/kernels/tests/test_kernels.py::test_portability_layer_returns_correct_strategy
+FAILED memopt/kernels/tests/test_kernels.py::test_arch_aware_prompt_contains_block_size
+============= 8 failed, 158 passed, 6 skipped, 1 warning in 44.19s =============

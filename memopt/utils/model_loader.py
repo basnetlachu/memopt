@@ -8,15 +8,19 @@ import re
 import logging
 from typing import Optional
 
-import torch
-
 log = logging.getLogger("memopt.utils")
+
+
+def _torch():
+    """Lazy torch import — fails only when actually called, not at module load."""
+    import torch
+    return torch
 
 
 def load_large_model(
     model_name_or_path: str,
     device: str = "cuda:0",
-    dtype: torch.dtype = torch.float16,
+    dtype=None,
 ) -> "torch.nn.Module":
     """
     Load a large model safely for memopt optimization.
@@ -34,6 +38,10 @@ def load_large_model(
     Supports up to ~30B params on single 80GB GPU in FP16.
     For >30B: use 2+ GPUs or INT4 quantization (not memopt's scope).
     """
+    torch = _torch()
+    if dtype is None:
+        dtype = torch.float16
+
     try:
         from transformers import AutoModelForCausalLM
     except ImportError:
@@ -100,12 +108,15 @@ def load_large_model(
 
 def _estimate_model_gb(
     model_name: str,
-    dtype: torch.dtype = torch.float16,
+    dtype=None,
 ) -> Optional[float]:
     """
     Estimate model VRAM from name. Returns None if cannot estimate.
     FP16 = 2 bytes/param. FP32 = 4 bytes/param.
     """
+    torch = _torch()
+    if dtype is None:
+        dtype = torch.float16
     bytes_per_param = 2 if dtype == torch.float16 else 4
 
     # Extract param count from common naming patterns
