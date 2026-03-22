@@ -16,11 +16,14 @@ backend detection, which is free (a few os.path checks + one torch call).
 from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING, Optional
+import logging
+import os
 from .hal import backend, tiers, tier_names
 from .page_table import PageTable, PageTableEntry
 from .tier_manager import TierManager
-from .prefetch_engine import PrefetchEngine
 from .weight_manager import WeightManager
+
+_vmm_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from memopt.cluster import GKDStore
@@ -40,7 +43,22 @@ class VMM:
     def __init__(self, gkd: Optional["GKDStore"] = None) -> None:
         self.page_table   = PageTable()
         self.tier_manager = TierManager(self.page_table)
-        self.prefetch     = PrefetchEngine(self.tier_manager)
+        try:
+            from .speculative_prefetcher import SpeculativePrefetcher
+            self.prefetch = SpeculativePrefetcher(self.tier_manager)
+            _vmm_logger.info(
+                "VMM: speculative prefetcher active "
+                "(k=%s warmup=%s)",
+                os.environ.get("MEMOPT_PREFETCH_K", "4"),
+                os.environ.get("MEMOPT_PREFETCH_WARMUP", "10"),
+            )
+        except Exception as exc:
+            _vmm_logger.warning(
+                "VMM: speculative prefetcher failed (%s), "
+                "using EWMA fallback", exc
+            )
+            from .prefetch_engine import PrefetchEngine
+            self.prefetch = PrefetchEngine(self.tier_manager)
         self.gkd          = gkd   # None = GKD disabled (backwards compatible)
         self._sequence_owners: dict = {}          # sequence_id → tenant_id
         self._owner_lock = threading.RLock()
