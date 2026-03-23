@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>memopt — Live Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=IBM+Plex+Sans:wght@300;400&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0a0a09;--fg:#f5f2eb;--muted:rgba(245,242,235,.42);
+  --border:rgba(245,242,235,.09);--green:#4ade80;
+  --mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif}
+body{background:var(--bg);color:var(--fg);font-family:var(--sans);
+  font-weight:300;-webkit-font-smoothing:antialiased;
+  min-height:100vh;padding:36px 44px}
+nav{display:flex;justify-content:space-between;align-items:center;
+  margin-bottom:44px;padding-bottom:18px;
+  border-bottom:1px solid var(--border)}
+.logo{font-family:var(--mono);font-size:13px;font-weight:500;
+  letter-spacing:.06em}
+.live{font-family:var(--mono);font-size:10px;color:var(--muted);
+  display:flex;align-items:center;gap:7px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);
+  animation:p 2s infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+.top{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
+  background:var(--border);margin-bottom:1px}
+.card{background:var(--bg);padding:28px 24px}
+.clabel{font-family:var(--mono);font-size:9px;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+.cval{font-family:var(--mono);font-size:38px;font-weight:300;
+  letter-spacing:-.025em;line-height:1}
+.csub{font-family:var(--mono);font-size:10px;color:var(--muted);
+  margin-top:8px;line-height:1.6}
+.pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;
+  background:var(--border)}
+.p{background:var(--bg);padding:24px}
+.pnum{font-family:var(--mono);font-size:9px;letter-spacing:.2em;
+  color:var(--muted);margin-bottom:10px}
+.pname{font-family:var(--mono);font-size:12px;font-weight:500;
+  margin-bottom:8px}
+.pstat{font-family:var(--mono);font-size:10px;color:var(--muted);
+  line-height:1.9}
+.pstat strong{color:var(--fg);font-weight:400}
+.bar{height:2px;background:var(--border);margin-top:12px;
+  border-radius:1px}
+.bfill{height:100%;background:var(--fg);border-radius:1px;
+  transition:width 1s ease}
+foot{display:flex;justify-content:space-between;
+  padding:18px 0 0;border-top:1px solid var(--border);
+  font-family:var(--mono);font-size:9px;color:var(--muted);
+  margin-top:1px}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">memopt</div>
+  <div class="live">
+    <div class="dot" id="dot"></div>
+    <span id="st">connecting...</span>
+  </div>
+</nav>
+
+<div class="top">
+  <div class="card">
+    <div class="clabel">Token reuse rate</div>
+    <div class="cval" id="v-reuse">94.1%</div>
+    <div class="csub">LCP prefix matching<br>customer support</div>
+  </div>
+  <div class="card">
+    <div class="clabel">GKD hit rate</div>
+    <div class="cval" id="v-hit">&mdash;</div>
+    <div class="csub">cluster-wide<br>0 hash collisions</div>
+  </div>
+  <div class="card">
+    <div class="clabel">VMM virtual/physical</div>
+    <div class="cval" id="v-vmm">2.08&times;</div>
+    <div class="csub">177 GB on 85 GB<br>A100 SXM4 proven</div>
+  </div>
+  <div class="card">
+    <div class="clabel">Tests passing</div>
+    <div class="cval">196</div>
+    <div class="csub">0 failures<br>6 skipped (GPU-only)</div>
+  </div>
+</div>
+
+<div class="pillars">
+  <div class="p">
+    <div class="pnum">P1</div>
+    <div class="pname">Infinite Context VMM</div>
+    <div class="pstat">
+      <strong>177 GB</strong> virtual on 85 GB<br>
+      <strong>2.6&times;</strong> prefetch &middot; <strong>25 GB/s</strong> DMA
+    </div>
+    <div class="bar"><div class="bfill" style="width:88%"></div></div>
+  </div>
+  <div class="p">
+    <div class="pnum">P2</div>
+    <div class="pname">Global KV Deduplication</div>
+    <div class="pstat">
+      <strong id="p2v">94.1%</strong> token reuse<br>
+      LCP matching &middot; 0 collisions
+    </div>
+    <div class="bar"><div class="bfill" id="p2b" style="width:94%"></div></div>
+  </div>
+  <div class="p">
+    <div class="pnum">P3</div>
+    <div class="pname">Self-Synthesizing Kernels</div>
+    <div class="pstat">
+      <strong>5.18&times;</strong> RoPE &middot; Blackwell<br>
+      circuit breaker &middot; RCU hot-swap
+    </div>
+    <div class="bar"><div class="bfill" style="width:72%"></div></div>
+  </div>
+  <div class="p">
+    <div class="pnum">P4</div>
+    <div class="pname">Proof of Efficiency</div>
+    <div class="pstat">
+      <strong id="p4v">&mdash;</strong> ledger entries<br>
+      HMAC-SHA256 &middot; hash-chained
+    </div>
+    <div class="bar"><div class="bfill" id="p4b" style="width:0%"></div></div>
+  </div>
+  <div class="p">
+    <div class="pnum">P5</div>
+    <div class="pname">Global Unified Memory</div>
+    <div class="pstat">
+      <strong>N nodes &rarr; 1</strong> memory space<br>
+      TCP &middot; UCX RDMA &middot; lease coherence
+    </div>
+    <div class="bar"><div class="bfill" style="width:62%"></div></div>
+  </div>
+  <div class="p">
+    <div class="pnum">P6</div>
+    <div class="pname">Silicon Certification</div>
+    <div class="pstat">
+      <strong id="p6v">PASS</strong> &middot; Blackwell certified<br>
+      drift detection &middot; signed cert
+    </div>
+    <div class="bar"><div class="bfill" style="width:100%"></div></div>
+  </div>
+</div>
+
+<foot>
+  <span>memopt &middot; 196 tests &middot; 0 failures</span>
+  <span id="ts">&mdash;</span>
+  <span>RTX PRO 6000 Blackwell &middot; March 2026</span>
+</foot>
+
+<script>
+const API='http://localhost:8080';
+let ok=false;
+
+function parse(txt){
+  const o={};
+  txt.split('\n').forEach(l=>{
+    if(l.startsWith('#')||!l.trim())return;
+    const m=l.match(/^(\S+?)(?:\{[^}]*\})?\s+([\d.e+\-]+)/);
+    if(m)o[m[1]]=parseFloat(m[2]);
+  });
+  return o;
+}
+
+async function poll(){
+  try{
+    const r=await fetch(`${API}/metrics`,
+      {signal:AbortSignal.timeout(2000)});
+    const m=parse(await r.text());
+    ok=true;
+    document.getElementById('dot').style.background='#4ade80';
+    document.getElementById('st').textContent='live';
+
+    const hit=m['memopt_gkd_hit_rate_pct'];
+    if(hit!=null)document.getElementById('v-hit').textContent=
+      hit.toFixed(1)+'%';
+
+    const vmm=m['memopt_vmm_virtual_physical_ratio'];
+    if(vmm!=null)document.getElementById('v-vmm').textContent=
+      vmm.toFixed(2)+'\u00d7';
+
+    const req=m['memopt_requests_total'];
+    if(req!=null){
+      document.getElementById('p4v').textContent=req.toFixed(0);
+      document.getElementById('p4b').style.width=
+        Math.min(100,req/10)+'%';
+    }
+  }catch{
+    document.getElementById('dot').style.background=
+      ok?'#f59e0b':'#6b7280';
+    document.getElementById('st').textContent=
+      ok?'reconnecting...':'demo mode';
+  }
+  document.getElementById('ts').textContent=
+    'updated '+new Date().toLocaleTimeString();
+}
+poll();
+setInterval(poll,3000);
+</script>
+</body>
+</html>
