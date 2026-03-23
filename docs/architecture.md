@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 159 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 196 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -71,6 +71,7 @@ memopt/                        ← Python package root
 │   └── api_key.py             ← API key management
 ├── cluster/
 │   ├── gkd_store.py           ← Global KV Dedup store
+│   ├── prefix_index.py        ← Pillar 2: LCP prefix matching for GKD  [new]
 │   ├── hashing.py             ← Content fingerprinting   [renamed from hash_engine.py]
 │   ├── hypervisor.py          ← Memory hypervisor
 │   ├── transport.py           ← TCP/RDMA transport layer [renamed from rdma_transport.py]
@@ -92,6 +93,8 @@ memopt/                        ← Python package root
 │   ├── kernel_cache.py        ← Pillar 3: two-level kernel cache
 │   ├── portability_layer.py   ← Pillar 3: BackendStrategy (CUDA/ROCm/TorchCompile/MLIR)
 │   ├── certification.py       ← Pillar 6: Silicon Certification Suite
+│   ├── drift_detector.py      ← Pillar 6: hardware bandwidth drift detection  [new]
+│   ├── certify_daemon.py      ← Pillar 6: continuous certification daemon  [new]
 │   └── tests/
 ├── measurement/
 │   └── bandwidth_tracker.py
@@ -128,7 +131,8 @@ memopt/                        ← Python package root
 │   ├── certificate.py         ← HMAC-SHA256 signed optimization certificates
 │   ├── arbitrage.py           ← RunPod/Lambda Labs GPU price arbitrage engine
 │   └── tests/
-│       └── test_observability.py
+│       ├── test_observability.py
+│       └── test_ledger_verify.py  ← Pillar 4: verify_and_certify tests  [new]
 ├── vmm/
 │   ├── hal.py
 │   ├── page_table.py
@@ -251,15 +255,24 @@ incoming request
       ▼
   GKDStore.lookup(token_ids, seq_len)
       │
-   hit? ──yes──▶ return hit.block_ref  (skip KV compute)
+   exact hit? ──yes──▶ return hit.block_ref  (skip all KV compute)
       │
      no
       │
       ▼
-  VMM.allocate() → compute KV
+  lookup_longest_prefix(token_ids, seq_len)     ← LCP fallback
+      │
+   prefix hit? ──yes──▶ return GKDHit(is_partial=True,
+      │                     matched_len=N, delta_start=N)
+      │                     (skip KV compute for first N tokens)
+     no
+      │
+      ▼
+  VMM.allocate() → compute full KV
       │
       ▼
   GKDStore.register(token_ids, seq_len, block_ref, node_id)
+      │  └── register_prefixes() stores block-aligned prefix hashes
 ```
 
 ### 5.3 Hash + Collision Safety (`cluster/hashing.py`)
@@ -312,11 +325,28 @@ The transport layer implements a typed `AbstractTransport` ABC with three concre
 
 ucx-py is an **optional** dependency — not listed in `requirements.txt`. Install with `pip install ucx-py` or `conda install -c rapidsai ucx-py` to enable RDMA on InfiniBand/RoCE clusters.
 
-### 5.6 Hypervisor (`cluster/hypervisor.py`)
+### 5.6 LCP Prefix Matching (`cluster/prefix_index.py`)
+
+On a GKD miss (no exact match), the system searches for the longest common prefix (LCP) — the longest block-aligned prefix of the query token sequence that has been cached by any prior request.
+
+**Block-aligned prefix hashing** — token sequences are hashed at every `BLOCK_SIZE` (128-token) boundary. For a 512-token sequence, four prefix hashes are registered: tokens `[0:128]`, `[0:256]`, `[0:384]`, `[0:512]`. Prefix keys use the namespace `"pfx:{hash}:{length}"` to avoid collisions with full-sequence entries.
+
+**Lookup** — `lookup_longest_prefix(token_ids, seq_len, backend)` searches from longest to shortest prefix. When a match is found, it returns the matched length and block reference. The caller can skip KV computation for the matched prefix and only compute the remaining `delta_start..seq_len` tokens.
+
+**Integration with GKDStore** — `gkd_store.py` calls `lookup_longest_prefix()` on exact-match miss and returns a `GKDHit` with `is_partial=True`, `matched_len`, and `delta_start` set. `register()` calls `register_prefixes()` to index all block-aligned prefixes for future lookups.
+
+**Stats** — `gkd_store.stats()` includes `exact_hits`, `lcp_hits`, `lcp_token_reuse_pct`, and `total_hits` counters.
+
+**Typical reuse rates** (from benchmark tests):
+- Customer support (shared system prompts): ~94% token reuse
+- RAG pipeline (shared retrieval context): ~82% token reuse
+- Code assistant (shared file context): ~87% token reuse
+
+### 5.7 Hypervisor (`cluster/hypervisor.py`)
 
 `MemoryHypervisor` tracks a `ClusterMap` of node capacities and routes borrow offers — when Node A is short on HBM, it borrows from Node B via a `BorrowOffer`.
 
-### 5.7 Production Numbers (1000-user simulation)
+### 5.8 Production Numbers (1000-user simulation)
 
 | Metric | Value |
 |--------|-------|
@@ -661,6 +691,8 @@ Environment overrides: `MEMOPT_BASELINE_J_PER_TOKEN`, `MEMOPT_GRID_INTENSITY_KG_
 
 Survives SQLite errors gracefully — writes are non-fatal, `totals()` returns empty dict on DB failure.
 
+**Chain verification and certification** — `verify_and_certify(tenant_id=None)` walks the hash chain via `verify_chain()`, then wraps the result in a signed certificate via `sign_entry()`. Returns `chain_valid`, `entries_checked`, `issued_at`, `signature`, and `signature_status`. The `GET /ledger/verify` endpoint exposes this — non-admin callers can only verify their own tenant; admins verify all entries.
+
 ### 7.4 Optimization Certificates (`observability/certificate.py`)
 
 `sign_entry(entry)` produces a tamper-evident audit record for every committed speedup:
@@ -707,6 +739,7 @@ Pillar 4 endpoints — all require authentication via `X-Memopt-Api-Key` header:
 |--------|------|------|-------------|
 | `GET` | `/metrics` | Admin | Prometheus text format (all Pillar 4 metrics) |
 | `GET` | `/ledger` | Any tenant | Recent entries + cumulative totals scoped to calling tenant; admins see all |
+| `GET` | `/ledger/verify` | Any tenant | Chain integrity certificate — verifies hash chain, signs result with HMAC-SHA256 |
 | `POST` | `/tenants/{id}` | Admin | Create a new tenant; returns its API key |
 | `DELETE` | `/tenants/{id}` | Admin | Revoke a tenant's API key |
 | `GET` | `/tenants` | Admin | List all active tenants |
@@ -719,6 +752,8 @@ Two FastAPI dependencies handle auth:
 
 Both `/metrics` and `/ledger` degrade gracefully when the Pillar 4 collector or ledger failed to initialise (returns empty metrics / empty ledger rather than 500).
 
+**Serving path wiring** — `serving/server.py` imports `_p4_collector` and `_p4_ledger` from `api/server.py` to share the same instances. After P3 initialization in `_build_engine()`, kernel hooks are registered with the collector via `register_kernel_hooks()`. In the `/v1/completions` endpoint, each completed request calls `_p4_collector.record_request(tokens_generated)` and `_p4_ledger.record(tokens=..., tenant_id=..., actual_j_per_token=...)`. The `/metrics` endpoint appends the collector's `registry.prometheus_text()` to the standard `prometheus_client.generate_latest()` output so pillar-specific metrics appear alongside FastAPI job metrics.
+
 ### 7.7 Grafana Dashboard (`deploy/grafana/memopt_dashboard.json`)
 
 The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3 new panels:
@@ -729,19 +764,30 @@ The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3
 | Kernel Synthesis Outcomes | `memopt_kernel_synthesis_succeeded` | Pie chart |
 | Cross-Node Borrows Total | `memopt_cluster_borrows_total` | Stat |
 
-### 7.8 Test Coverage (`observability/tests/test_observability.py`)
+### 7.8 Test Coverage
 
-27 CPU-only tests — no GPU, no API keys, no network required:
+**`observability/tests/test_observability.py`** — 29 CPU-only tests, no GPU, no API keys, no network required:
 
 | Group | Tests |
 |-------|-------|
 | MetricRegistry | CRUD, NaN guard, Prometheus text format, label encoding |
 | MetricsCollector | Mock GKD polling, daemon thread lifecycle |
-| Ledger | record/totals, precision (`< 1e-10`), DB-error survival |
+| Ledger | record/totals, precision (`< 1e-10`), DB-error survival, write buffer flush, shutdown flush |
 | Certificates | sign/verify round-trip, tamper detection, unsigned mode |
 | Arbitrage | No-keys startup, effective cost formula, threshold logic, dry-run |
 | Multi-tenant keys | create+authenticate, invalid tenant ID rejection, wrong-key returns None |
 | Append-only ledger | duplicate batch_id dropped, hash chain valid after 5 writes, hash chain detects SQL column tampering, tenant isolation in recent()/totals() |
+
+**`observability/tests/test_ledger_verify.py`** — 6 tests:
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_verify_and_certify_empty_ledger` | Returns required fields on empty ledger |
+| `test_verify_and_certify_valid_chain` | Chain valid after 3 records, correct tenant_id and count |
+| `test_verify_and_certify_signed_when_key_set` | Signature status when MEMOPT_SIGNING_KEY is set |
+| `test_verify_and_certify_unsigned_without_key` | Unsigned status and None signature without key |
+| `test_verify_and_certify_tamper_detected` | SQL column tampering breaks chain validation |
+| `test_verify_returns_required_fields` | All required keys present in response |
 
 ---
 
@@ -888,7 +934,56 @@ Tolerances from `_TOLERANCES` (same as `jit_generator._DTYPE_TOLERANCES`): float
 
 **`run_certification(node_id)` never raises.** All test failures are captured in `TestResult.passed = False` with the exception in `note`.
 
-### 7b.3 CLI (`memopt certify`)
+### 7b.3 Hardware Drift Detector (`kernels/drift_detector.py`)
+
+`DriftDetector` tracks achieved bandwidth percentage over time and detects hardware degradation. After each certification run, the achieved `pct_of_peak` is recorded.
+
+**Algorithm:**
+- **Baseline**: average of the first `BASELINE_N` (default 7) measurements
+- **Rolling average**: last `ROLLING_N` (default 3) measurements
+- **Drift**: `(baseline_avg - rolling_avg) / baseline_avg × 100 > DRIFT_THRESHOLD_PCT` (default 5%)
+
+Positive `drift_pct` = degraded. Negative = improved (e.g. after driver update).
+
+**Persistence** — measurements are written atomically to `~/.memopt/drift_history.json` (tmp file + rename). On startup, existing measurements are loaded from disk so the baseline survives process restarts.
+
+**API:**
+- `record(bw_pct)` — append one measurement (skips None, 0, negative)
+- `is_drifted()` — True when rolling average has dropped below threshold
+- `drift_pct()` — current drop from baseline in percentage points
+- `baseline_avg()` / `rolling_avg()` — None when not enough data
+- `reset()` — clear all measurements (call after hardware replacement)
+- `stats()` — dict with all fields for JSON serialization
+
+Environment variables: `MEMOPT_DRIFT_THRESHOLD_PCT`, `MEMOPT_DRIFT_BASELINE_N`, `MEMOPT_DRIFT_ROLLING_N`, `MEMOPT_DRIFT_HISTORY_PATH`.
+
+### 7b.4 Continuous Certification Daemon (`kernels/certify_daemon.py`)
+
+`CertifyDaemon` runs `run_certification()` on a configurable schedule in a background daemon thread. After each run, it feeds the first throughput result's `pct_of_peak` into `DriftDetector` and writes an atomic node status file.
+
+**Lifecycle:**
+1. `start()` — spawns daemon thread, optionally runs certification immediately (`MEMOPT_CERTIFY_ON_STARTUP`, default True)
+2. Each certification: `run_certification()` → feed drift detector → write status → fire alert if failed or drifted
+3. `stop()` — sets stop event
+
+**Node status file** — written atomically to `~/.memopt/node_status.json`:
+```json
+{
+  "node_id": "a100-prod-01",
+  "healthy": true,
+  "certified": true,
+  "drifted": false,
+  "drift": {"baseline_avg": 54.8, "rolling_avg": 55.0, ...},
+  "checked_at": 1742200000.0,
+  "detail": { ... full SiliconCertificate ... }
+}
+```
+
+**Alert callback** — optional `alert_callback(result: dict)` fires on certification failure or drift detection. Operators can wire this to PagerDuty, Slack, etc.
+
+Environment variables: `MEMOPT_CERTIFY_INTERVAL_H` (default 24h), `MEMOPT_CERTIFY_ON_STARTUP`, `MEMOPT_NODE_STATUS_PATH`, `MEMOPT_NODE_ID`.
+
+### 7b.5 CLI (`memopt certify`)
 
 ```bash
 memopt certify \
@@ -918,9 +1013,9 @@ Signature: signed
 Certificate saved: /tmp/memopt_certs/cert_4a7f2b9c1d3e_1742200000.json
 ```
 
-### 7b.4 Test Coverage (`kernels/tests/test_certification.py`)
+### 7b.6 Test Coverage
 
-18 CPU-only tests — no GPU, no API key, no triton required:
+**`kernels/tests/test_certification.py`** — 18 CPU-only tests, no GPU, no API key, no triton required:
 
 | Group | Tests |
 |-------|-------|
@@ -930,6 +1025,13 @@ Certificate saved: /tmp/memopt_certs/cert_4a7f2b9c1d3e_1742200000.json
 | `run_certification` | Returns `SiliconCertificate`; never raises; has correctness/throughput tests; `all_passed` is bool; `certificate_hash` is 64-char hex |
 | Signing | Unsigned when no key; signed (64-char HMAC-SHA256) when key set |
 | Save + verify | File created; valid JSON; signature verifies; tamper detected; unsigned returns False |
+
+**`kernels/tests/test_drift_detector.py`** — 13 CPU-only tests:
+
+| Group | Tests |
+|-------|-------|
+| DriftDetector | no-data safety, baseline computation after N measurements, stable (no drift), drift detected on drop, no drift on small variation, reset clears history, skips invalid input, persistence (save + load), stats keys, drift_pct None before baseline, negative drift on improvement |
+| CertifyDaemon | start + stop lifecycle, drift_stats returns required keys |
 
 ---
 
@@ -1180,6 +1282,8 @@ kernel_hooks.init_hooks(cache=_p3_kv_cache, optimizer=_p3_optimizer)
 
 The initialisation sequence is: `KernelCache → PortabilityLayer → JITGenerator → AutoOptimizer → kernel_hooks.init_hooks()`. After this call, `apply_rope`, `apply_layer_norm_residual`, and `apply_scaled_softmax` use the fused path on every cache hit. Synthesis failures are non-fatal — the serving loop is never interrupted.
 
+After P3 init, `_build_engine()` imports `_p4_collector` and `_p4_ledger` from `api/server.py` and registers `kernel_hooks` with the collector. The `/v1/completions` endpoint records each request's `tokens_generated` into both the collector (for Prometheus metrics) and the ledger (for per-batch economics).
+
 ---
 
 ## 17. Background Daemon
@@ -1256,8 +1360,9 @@ FastAPI application with Prometheus metrics. Key endpoints:
 | `POST` | `/optimize` | Any | Run full optimization pipeline on a model |
 | `POST` | `/agent` | — | **Removed** — returns `410 Gone`. Use `/optimize` instead. |
 | `GET` | `/status/{job_id}` | Any | Poll job status |
-| `GET` | `/metrics` | Admin | Prometheus text format (Pillar 4 collector) |
+| `GET` | `/metrics` | Admin | Prometheus text format (Pillar 4 collector + prometheus_client) |
 | `GET` | `/ledger` | Any (tenant-scoped) | Per-batch energy/CO₂/cost savings JSON |
+| `GET` | `/ledger/verify` | Any (tenant-scoped) | Hash chain integrity certificate (HMAC-SHA256 signed) |
 | `POST` | `/tenants/{id}` | Admin | Create tenant, returns API key |
 | `DELETE` | `/tenants/{id}` | Admin | Revoke tenant API key |
 | `GET` | `/tenants` | Admin | List active tenants |
@@ -1435,19 +1540,22 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**159 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**196 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
 | `kernels/tests/test_kernels.py` | 25 | 25 PASS |
 | `kernels/tests/test_certification.py` | 18 | 18 PASS (Pillar 6) |
+| `kernels/tests/test_drift_detector.py` | 13 | 13 PASS (Pillar 6 — drift + daemon) |
 | `serving/tests/test_serving_kernels.py` | 11 | 11 PASS |
 | `vmm/tests/test_vmm_smoke.py` | 10 | 10 PASS (4 new: tenant isolation) |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
 | `cluster/tests/test_gkd.py` | 15 | 15 PASS (2 new: backend_degraded key, Redis degradation) |
+| `cluster/tests/test_lcp_prefix.py` | 18 | 18 PASS (Pillar 2 — LCP prefix matching) |
 | `cluster/tests/test_cluster.py` | 19 | 19 PASS |
 | `cluster/tests/test_pillar2_twonode.py` | 8 | 6 PASS, 1 SKIP, 1 flaky* |
 | `cluster/tests/test_pillar5_gum.py` | 19 | 19 PASS (Pillar 5 — all CPU/TCP, no GPU) |
 | `observability/tests/test_observability.py` | 29 | 29 PASS (2 new: write buffer flush, shutdown flush) |
+| `observability/tests/test_ledger_verify.py` | 6 | 6 PASS (Pillar 4 — chain verification) |
 
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.

@@ -139,6 +139,20 @@ if _HAS_FASTAPI:
         else:
             text = " ".join(str(t) for t in result.output_ids[0].tolist())
 
+        # Pillar 4 — record metrics and ledger entry
+        try:
+            from memopt.api.server import _p4_collector, _p4_ledger
+            if _p4_collector is not None:
+                _p4_collector.record_request(result.tokens_generated)
+            if _p4_ledger is not None:
+                _p4_ledger.record(
+                    tokens=result.tokens_generated,
+                    tenant_id="default",
+                    actual_j_per_token=0.0,
+                )
+        except Exception:
+            pass
+
         return CompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex[:8]}",
             model=request.model,
@@ -196,6 +210,17 @@ def _build_engine(
         _logging.getLogger(__name__).warning(
             f"Auto-optimizer startup failed: {e} — serving without kernel optimisation"
         )
+
+    # Pillar 4 — wire MetricsCollector to data sources
+    try:
+        from memopt.api.server import _p4_collector, _p4_ledger
+        if _p4_collector is not None:
+            if _p3_kv_cache is not None:
+                from memopt.serving import kernel_hooks as _kh
+                _p4_collector.register_kernel_hooks(_kh)
+            log.info("MetricsCollector: data sources registered")
+    except Exception as e:
+        log.debug("MetricsCollector wiring skipped: %s", e)
 
     # Self-register with control plane if configured
     cp = os.getenv("MEMOPT_CONTROL_PLANE", "")

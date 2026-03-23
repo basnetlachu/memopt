@@ -987,4 +987,11 @@ async def metrics(_admin: str = Depends(require_admin)):
     Prometheus text exposition — admin key required.
     Scrape with: curl -H 'X-Memopt-Api-Key: <admin_key>' http://localhost:8080/metrics
     """
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    body = generate_latest()
+    # Append Pillar 4 collector metrics (VMM, GKD, kernel hooks, etc.)
+    if _p4_collector is not None:
+        try:
+            body += _p4_collector.registry.prometheus_text().encode()
+        except Exception:
+            pass
+    return Response(body, media_type=CONTENT_TYPE_LATEST)
