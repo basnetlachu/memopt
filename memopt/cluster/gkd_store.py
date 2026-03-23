@@ -62,10 +62,13 @@ class GKDEntry:
 @dataclass
 class GKDHit:
     """Returned by lookup() on a cache hit."""
-    block_ref:  str
-    node_id:    str
-    size_bytes: int
-    hit_count:  int
+    block_ref:   str
+    node_id:     str
+    size_bytes:  int           = 0
+    hit_count:   int           = 0
+    matched_len: Optional[int] = None   # tokens matched (None = full)
+    delta_start: Optional[int] = None   # recompute from here
+    is_partial:  bool          = False  # True = LCP match
 
 
 class LocalGKDBackend:
@@ -331,6 +334,10 @@ class GKDStore:
         self._bytes_saved          = 0
         self._collision_checks     = 0
         self._collision_detections = 0
+        self._exact_hits:        int = 0
+        self._lcp_hits:          int = 0
+        self._lcp_tokens_reused: int = 0
+        self._lcp_tokens_total:  int = 0
 
     # ── Primary API ────────────────────────────────────────────────────
 
@@ -364,6 +371,30 @@ class GKDStore:
         raw = self._backend.get(content_hash)
 
         if raw is None:
+            # LCP fallback — only reached on exact miss
+            try:
+                from memopt.cluster.prefix_index import lookup_longest_prefix
+                result = lookup_longest_prefix(
+                    token_ids, sequence_length, self._backend
+                )
+                if result is not None:
+                    block_ref, node_id, matched_len = result
+                    with self._lock:
+                        self._cache_hits        += 1
+                        self._lcp_hits          += 1
+                        self._lcp_tokens_reused += matched_len
+                        self._lcp_tokens_total  += sequence_length
+                    return GKDHit(
+                        block_ref   = block_ref,
+                        node_id     = node_id,
+                        hit_count   = 1,
+                        matched_len = matched_len,
+                        delta_start = matched_len,
+                        is_partial  = True,
+                    )
+            except Exception as exc:
+                logger.debug("GKD LCP lookup failed: %s", exc)
+
             with self._lock:
                 self._cache_misses += 1
             return None
@@ -386,6 +417,7 @@ class GKDStore:
         # Genuine hit
         with self._lock:
             self._cache_hits += 1
+            self._exact_hits += 1
             self._bytes_saved += raw.get("size_bytes", self._block_size_bytes)
 
         self._backend.increment_hit(content_hash)
@@ -436,6 +468,14 @@ class GKDStore:
 
         self._backend.set(content_hash, entry, ttl_seconds=ttl_seconds or self._ttl)
         logger.debug("GKD registered: hash=%s... node=%s ref=%s", content_hash[:16], node_id, block_ref)
+
+        try:
+            from memopt.cluster.prefix_index import register_prefixes
+            register_prefixes(
+                token_ids, sequence_length, block_ref, node_id, self._backend
+            )
+        except Exception as exc:
+            logger.debug("GKD prefix registration failed: %s", exc)
 
     def invalidate(self, token_ids: List[int], sequence_length: int):
         """
@@ -490,6 +530,12 @@ class GKDStore:
             "collision_detections_total":  col_dets,
             "backend_degraded":            getattr(self._backend, "degraded", False),
             "backend_degraded_since":      getattr(self._backend, "degraded_since", None),
+            "exact_hits":                  self._exact_hits,
+            "lcp_hits":                    self._lcp_hits,
+            "lcp_token_reuse_pct":         round(
+                self._lcp_tokens_reused / self._lcp_tokens_total * 100, 1
+            ) if self._lcp_tokens_total > 0 else 0.0,
+            "total_hits":                  hits,
         }
 
     def reset_stats(self):
