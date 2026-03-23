@@ -76,9 +76,6 @@ class LocalGKDBackend:
     All data is lost when the process exits — this is intentional.
     Production deployments use RedisGKDBackend for persistence and
     cross-node sharing.
-
-    Uses FastLookupTable (C++ hash map) when libgkd_map.so is built,
-    falls back to Python dict otherwise.
     """
 
     def __init__(self):

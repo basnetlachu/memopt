@@ -19,21 +19,6 @@ from .page_table import PageTable, PageTableEntry
 
 logger = logging.getLogger(__name__)
 
-
-def _load_fast_io():
-    """
-    Lazy loader for hardware-accelerated I/O.
-    Returns (fast_read_fn, status_fn) or (None, None).
-    Never raises — fast I/O is always optional.
-    """
-    try:
-        from memopt.vmm.io import fast_read_block, status
-        return fast_read_block, status
-    except Exception:
-        return None, None
-
-_fast_read_block, _fast_io_status = _load_fast_io()
-
 _EVICT_HIGH = 0.90
 _EVICT_LOW  = 0.75
 

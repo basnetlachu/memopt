@@ -78,11 +78,6 @@ class KernelCache:
         with self._lock:
             self._memory[key] = (module, entry)
         self._write_to_disk(entry)
-        try:
-            from memopt.kernels.kernel_shm import register_key
-            register_key(key)
-        except Exception:
-            pass   # shm is always optional
 
     def get(self, key: str) -> Optional[types.ModuleType]:
         """Return compiled module, or None if not cached."""
@@ -124,14 +119,6 @@ class KernelCache:
             data["source_sha256"] = hashlib.sha256(
                 entry.source.encode()
             ).hexdigest()
-            # Hardware fingerprint for architecture mismatch detection
-            try:
-                from memopt.kernels.kernel_archive import current_hardware_fingerprint
-                hw_fp = current_hardware_fingerprint(data["source_sha256"])
-                if hw_fp:
-                    data["hw_fingerprint"] = hw_fp
-            except Exception:
-                pass
             with open(path, "w") as f:
                 json.dump(data, f)
         except Exception as e:
@@ -163,23 +150,6 @@ class KernelCache:
                         except Exception:
                             pass
                         continue
-                # Hardware fingerprint verification
-                try:
-                    from memopt.kernels.kernel_archive import verify_entry
-                    verify_data = dict(data)
-                    if stored_hash:
-                        verify_data["source_sha256"] = stored_hash
-                    if not verify_entry(verify_data):
-                        logger.info(
-                            "KernelCache: rejecting %s (hardware mismatch)", fname
-                        )
-                        try:
-                            os.remove(path)
-                        except Exception:
-                            pass
-                        continue
-                except Exception:
-                    pass  # archive module unavailable — skip check
                 if now - entry.created_at > TTL_S:
                     os.remove(path)
                     continue

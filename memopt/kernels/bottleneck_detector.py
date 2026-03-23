@@ -94,12 +94,6 @@ class BottleneckDetector:
 
         try:
             import torch
-        except ImportError:
-            with self._lock:
-                self._total_profiled += 1
-            return op(*args, **kwargs)
-
-        try:
             if not torch.cuda.is_available():
                 with self._lock:
                     self._total_profiled += 1
