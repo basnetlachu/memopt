@@ -864,6 +864,41 @@ async def ledger_entries(n: int = 100, tenant_id: str = Depends(get_tenant)):
     }
 
 
+@app.get("/ledger/verify")
+async def ledger_verify(
+    tenant_id: Optional[str] = None,
+    tenant: str = Depends(get_tenant),
+):
+    """
+    Verify ledger chain integrity and return a signed certificate.
+
+    Query params:
+        tenant_id: which tenant to verify (admin only for others)
+                   omit to verify the calling tenant
+
+    Returns a signed JSON document suitable for audit submission.
+    """
+    # Non-admin tenants can only verify their own chain
+    if not is_admin(tenant):
+        if tenant_id is not None and tenant_id != tenant:
+            raise HTTPException(
+                status_code=403,
+                detail="Non-admin tenants can only verify their own chain"
+            )
+        tenant_id = tenant
+
+    if _p4_ledger is None:
+        return {
+            "tenant_id":       tenant_id or "_all",
+            "chain_valid":     None,
+            "entries_checked": 0,
+            "error":           "ledger not initialised",
+            "signature_status":"unsigned",
+        }
+
+    return _p4_ledger.verify_and_certify(tenant_id=tenant_id)
+
+
 # ── Tenant management (admin only) ───────────────────────────────────────────
 
 @app.post("/tenants/{new_tenant_id}", status_code=201)

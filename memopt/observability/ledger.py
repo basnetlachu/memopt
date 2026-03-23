@@ -485,6 +485,55 @@ class OptimizationLedger:
             logger.debug(f"Ledger totals failed: {e}")
             return {}
 
+    def verify_and_certify(self,
+                           tenant_id: Optional[str] = None) -> dict:
+        """
+        Verify the hash chain for tenant_id and return a signed
+        certificate of chain integrity.
+
+        This is the auditor-facing method: one call produces a
+        document that proves the ledger has not been tampered with.
+
+        Returns a dict with:
+            tenant_id:        str
+            chain_valid:      bool
+            entries_checked:  int
+            first_bad_batch:  str | None
+            issued_at:        float
+            signature:        str | None
+            signature_status: str  "signed" | "unsigned"
+
+        Never raises — errors are captured in the result.
+        """
+        try:
+            result = self.verify_chain(tenant_id=tenant_id)
+        except Exception as exc:
+            result = {
+                "ok":             False,
+                "entries_checked": 0,
+                "reason":         str(exc),
+            }
+
+        payload = {
+            "tenant_id":       tenant_id or "_all",
+            "chain_valid":     result.get("ok", False),
+            "entries_checked": result.get("entries_checked", 0),
+            "first_bad_batch": result.get("first_bad_batch_id"),
+            "issued_at":       time.time(),
+        }
+
+        # Sign with existing certificate infrastructure
+        try:
+            from memopt.observability.certificate import sign_entry
+            cert = sign_entry(payload)
+            payload["signature"]        = cert.get("signature")
+            payload["signature_status"] = cert.get("signature_status", "unsigned")
+        except Exception:
+            payload["signature"]        = None
+            payload["signature_status"] = "unsigned"
+
+        return payload
+
     def verify_chain(self, tenant_id: Optional[str] = None) -> dict:
         """
         Verify the tamper-evident hash chain.
