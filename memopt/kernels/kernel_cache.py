@@ -66,18 +66,38 @@ class KernelCache:
         os.makedirs(self._dir, exist_ok=True)
         self._load_from_disk()
 
-    def put(self, key: str, module: types.ModuleType, event) -> None:
-        """Store a compiled kernel module and its source."""
-        source = getattr(module, "__source__", "")
-        entry  = CacheEntry(
-            key=key,
-            op_name=event.op_name,
-            hardware=event.hardware,
-            source=source,
-        )
+    def put(self, key: str = None, module=None, event=None, *,
+            cache_key: str = None, kernel_obj=None,
+            metadata: Optional[dict] = None) -> None:
+        """Store a compiled kernel module and its source.
+
+        Supports two calling conventions:
+          put(key, module, event)           — original (from _synthesise)
+          put(cache_key=..., kernel_obj=..., metadata=...)  — new (feedback loop)
+        """
+        key    = key or cache_key
+        module = module or kernel_obj
+
+        if event is not None:
+            source = getattr(module, "__source__", "")
+            entry  = CacheEntry(
+                key=key,
+                op_name=event.op_name,
+                hardware=event.hardware,
+                source=source,
+            )
+        else:
+            source = getattr(module, "__source__", "") if module else ""
+            entry  = CacheEntry(
+                key=key,
+                op_name=metadata.get("op_name", "") if metadata else "",
+                hardware=metadata.get("hardware", "") if metadata else "",
+                source=source,
+            )
+
         with self._lock:
             self._memory[key] = (module, entry)
-        self._write_to_disk(entry)
+        self._write_to_disk(entry, metadata=metadata)
 
     def get(self, key: str) -> Optional[types.ModuleType]:
         """Return compiled module, or None if not cached."""
@@ -111,7 +131,46 @@ class KernelCache:
                 "cache_dir":         self._dir,
             }
 
-    def _write_to_disk(self, entry: CacheEntry) -> None:
+    def get_metadata(self, op_name: str) -> Optional[dict]:
+        """
+        Return the metadata from the most recent synthesis attempt
+        for op_name. Reads from the disk cache so this survives
+        process restarts. Returns None if no previous attempt exists.
+        Never raises.
+        """
+        try:
+            if not self._dir or not os.path.isdir(self._dir):
+                return None
+
+            matches = []
+            for fname in os.listdir(self._dir):
+                if not fname.endswith('.json'):
+                    continue
+                fpath = os.path.join(self._dir, fname)
+                try:
+                    with open(fpath) as f:
+                        data = json.load(f)
+                    meta = data.get('metadata')
+                    if meta and meta.get('op_name') == op_name:
+                        matches.append((
+                            meta.get('timestamp', data.get('created_at', 0)),
+                            meta,
+                        ))
+                except Exception:
+                    continue
+
+            if not matches:
+                return None
+
+            matches.sort(key=lambda x: x[0], reverse=True)
+            return matches[0][1]
+
+        except Exception as exc:
+            logger.debug("KernelCache.get_metadata: %s", exc)
+            return None
+
+    def _write_to_disk(self, entry: CacheEntry,
+                       metadata: Optional[dict] = None) -> None:
         path = os.path.join(self._dir, f"{entry.key}.json")
         try:
             data = asdict(entry)
@@ -119,6 +178,8 @@ class KernelCache:
             data["source_sha256"] = hashlib.sha256(
                 entry.source.encode()
             ).hexdigest()
+            if metadata is not None:
+                data["metadata"] = metadata
             with open(path, "w") as f:
                 json.dump(data, f)
         except Exception as e:

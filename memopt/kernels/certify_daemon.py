@@ -34,6 +34,131 @@ _STATUS_PATH = Path(os.path.expanduser(
 ))
 
 
+def make_drift_resynthesis_callback(
+    jit_generator=None,
+    kernel_cache=None,
+) -> Callable[[dict], None]:
+    """
+    Returns a callback that re-synthesises active kernels
+    when hardware drift is detected.
+
+    The three active kernels are:
+      - apply_rope
+      - apply_layer_norm_residual
+      - apply_scaled_softmax
+
+    On drift detection:
+      1. Log which kernels will be re-synthesised
+      2. For each kernel: call JITGenerator.generate() with
+         previous_attempt context from KernelCache
+      3. Log before/after speedup for each kernel
+      4. Never raises — failures are logged at WARNING
+    """
+    ACTIVE_KERNELS = [
+        "apply_rope",
+        "apply_layer_norm_residual",
+        "apply_scaled_softmax",
+    ]
+
+    def callback(alert_result: dict) -> None:
+        # Only re-synthesise on drift, not on cert failure
+        if not alert_result.get("drift_detected"):
+            logger.info(
+                "drift_resynthesis: skipping — "
+                "alert is cert failure, not drift"
+            )
+            return
+
+        drift_pct = alert_result.get("drift_pct", 0)
+        logger.warning(
+            "drift_resynthesis: hardware drift %.1f%% detected — "
+            "re-synthesising %d active kernels",
+            drift_pct or 0,
+            len(ACTIVE_KERNELS),
+        )
+
+        try:
+            from memopt.kernels.jit_generator import JITGenerator
+            from memopt.kernels.kernel_cache import KernelCache
+
+            gen   = jit_generator or JITGenerator()
+            cache = kernel_cache  or KernelCache()
+
+        except Exception as exc:
+            logger.warning(
+                "drift_resynthesis: failed to load components: %s",
+                exc
+            )
+            return
+
+        hw = None
+        try:
+            from memopt.kernels.portability_layer import PortabilityLayer
+            pl = PortabilityLayer()
+            hw = pl._hw
+        except Exception:
+            pass
+
+        for op_name in ACTIVE_KERNELS:
+            try:
+                prev = cache.get_metadata(op_name)
+                prev_speedup = prev.get('speedup') if prev else None
+
+                logger.info(
+                    "drift_resynthesis: re-synthesising %s "
+                    "(previous speedup: %s)",
+                    op_name,
+                    f"{prev_speedup:.2f}x" if prev_speedup else "none",
+                )
+
+                result = gen.generate(
+                    op_name=op_name,
+                    hardware_profile=hw,
+                    source_context=(
+                        f"Hardware drift of {drift_pct:.1f}% "
+                        f"detected. Re-synthesising to restore "
+                        f"performance baseline."
+                    ),
+                    previous_attempt=prev,
+                )
+
+                if result is None:
+                    logger.warning(
+                        "drift_resynthesis: %s — synthesis returned None",
+                        op_name,
+                    )
+                    continue
+
+                new_speedup = getattr(result, 'speedup', None)
+
+                if new_speedup and prev_speedup:
+                    if new_speedup >= prev_speedup * 0.95:
+                        logger.info(
+                            "drift_resynthesis: %s — "
+                            "new kernel %.2fx vs previous %.2fx — "
+                            "updating cache",
+                            op_name, new_speedup, prev_speedup,
+                        )
+                    else:
+                        logger.warning(
+                            "drift_resynthesis: %s — "
+                            "new kernel %.2fx worse than previous %.2fx "
+                            "on drifted hardware — keeping previous",
+                            op_name, new_speedup, prev_speedup,
+                        )
+
+            except Exception as exc:
+                logger.warning(
+                    "drift_resynthesis: %s failed: %s",
+                    op_name, exc,
+                )
+                continue
+
+        logger.info("drift_resynthesis: complete")
+
+    return callback
+
+
 class CertifyDaemon:
     """
     Background daemon: runs certification on schedule,
@@ -51,7 +176,16 @@ class CertifyDaemon:
         import socket
         self._interval   = interval_hours * 3600
         self._on_startup = on_startup
-        self._alert      = alert_callback
+        if alert_callback is not None:
+            self._alert = alert_callback
+        else:
+            try:
+                self._alert = make_drift_resynthesis_callback()
+                logger.debug(
+                    "CertifyDaemon: drift re-synthesis callback active"
+                )
+            except Exception:
+                self._alert = None
         self._status     = status_path
         self._node_id    = node_id or os.environ.get(
             "MEMOPT_NODE_ID", socket.gethostname()

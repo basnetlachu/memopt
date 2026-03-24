@@ -68,6 +68,105 @@ class JITGenerator:
         self._total_failed     = 0
         self._total_discarded  = 0
 
+    def generate(self, op_name: str, hardware_profile=None,
+                 source_context: str = "",
+                 previous_attempt: Optional[dict] = None):
+        """
+        Generate a Triton kernel for op_name with feedback loop.
+
+        previous_attempt: metadata dict from KernelCache.get_metadata().
+        If provided, injects performance history into the prompt so each
+        synthesis attempt can improve on the last.
+
+        Returns the compiled module, or None on failure.
+        """
+        # Auto-load previous attempt from cache if not provided
+        if previous_attempt is None:
+            try:
+                from memopt.kernels.kernel_cache import KernelCache
+                cache = KernelCache()
+                previous_attempt = cache.get_metadata(op_name)
+                if previous_attempt:
+                    logger.info(
+                        "JITGenerator: found previous attempt for %s "
+                        "(speedup=%.2fx, memory_bound=%s)",
+                        op_name,
+                        previous_attempt.get('speedup', 0),
+                        previous_attempt.get('is_memory_bound', '?'),
+                    )
+            except Exception:
+                pass
+
+        # Build previous attempt context for the prompt
+        prev_context = ""
+        if previous_attempt:
+            speedup      = previous_attempt.get('speedup')
+            is_mem_bound = previous_attempt.get('is_memory_bound')
+            tiling       = previous_attempt.get('tiling_config')
+            stall_rate   = previous_attempt.get('stall_rate')
+
+            prev_context = "\n\nPREVIOUS SYNTHESIS ATTEMPT:\n"
+
+            if speedup is not None:
+                prev_context += f"- Achieved speedup: {speedup:.2f}x\n"
+
+            if is_mem_bound is not None:
+                bound_type = (
+                    "memory-bandwidth bound" if is_mem_bound
+                    else "compute bound"
+                )
+                prev_context += f"- Bottleneck: {bound_type}\n"
+
+            if tiling:
+                prev_context += f"- Tiling used: {tiling}\n"
+
+            if stall_rate is not None:
+                prev_context += f"- HBM stall rate: {stall_rate:.1%}\n"
+
+            prev_context += (
+                "\nIMPROVEMENT DIRECTIVE:\n"
+                "Based on the above, synthesise a better kernel.\n"
+            )
+
+            if is_mem_bound:
+                prev_context += (
+                    "The previous kernel was memory-bandwidth bound. "
+                    "Try: larger tiles to increase arithmetic intensity, "
+                    "vectorised loads (float4), software prefetch, "
+                    "or shared memory tiling to reduce global memory traffic.\n"
+                )
+            else:
+                prev_context += (
+                    "The previous kernel was compute bound. "
+                    "Try: improved register reuse, "
+                    "reduced synchronisation barriers, "
+                    "or pipeline parallelism between memory and compute.\n"
+                )
+
+        # Build architecture context
+        arch_name = "unknown"
+        if hardware_profile is not None:
+            arch_name = getattr(hardware_profile, 'arch_name', 'unknown')
+
+        prompt = textwrap.dedent(f"""\
+            Synthesise a fused Triton kernel for: {op_name}
+            Architecture: {arch_name}
+            Context: {source_context}
+            {prev_context}
+        """).strip()
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        kernel_source = self._call_api(prompt, api_key)
+        if kernel_source is None:
+            return None
+
+        # Compile via portability layer if available
+        if self._portability:
+            compiled = self._portability.compile(kernel_source, "")
+            return compiled
+
+        return None
+
     def handle(self, event) -> None:
         """
         Entry point called by BottleneckDetector (in a daemon thread).
