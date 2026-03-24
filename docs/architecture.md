@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 196 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 206 tests pass, 6 skipped (GPU-only tests require CUDA device)
 
 ---
 
@@ -49,7 +49,7 @@ Beyond single-model optimization, memopt provides:
 
 - **Infinite Context VMM** — multi-tier (HBM → DRAM → NVMe) KV-block paging with predictive prefetch so long-context inference never OOMs.
 - **Global KV Cache Deduplication (GKD)** — cluster-wide content-addressed cache that eliminates redundant KV recomputation for shared prompt prefixes (90%+ hit rate in production).
-- **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference.
+- **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference. Feedback loop: each re-synthesis reads the previous attempt's speedup, bottleneck type, and tiling config to produce a better kernel. Hardware drift triggers automatic re-synthesis of active kernels.
 - **Proof of Efficiency** — Prometheus metrics aggregator, per-batch energy/CO₂/cost savings ledger (SQLite, write-buffered), HMAC-signed optimization certificates, and GPU price arbitrage engine.
 - **Global Unified Memory (GUM)** — turns N independent GPU nodes into one logical memory space; NVMe-evicted blocks are content-addressed and fetchable from any peer over TCP via optimistic lease protocol.
 - **Silicon Certification Suite** — correctness and throughput battery (rope, layer_norm_residual, scaled_softmax + memcpy/GEMM benchmarks) producing a signed `SiliconCertificate` JSON that proves hardware behaviour before deployment.
@@ -94,8 +94,9 @@ memopt/                        ← Python package root
 │   ├── portability_layer.py   ← Pillar 3: BackendStrategy (CUDA/ROCm/TorchCompile/MLIR)
 │   ├── certification.py       ← Pillar 6: Silicon Certification Suite
 │   ├── drift_detector.py      ← Pillar 6: hardware bandwidth drift detection  [new]
-│   ├── certify_daemon.py      ← Pillar 6: continuous certification daemon  [new]
+│   ├── certify_daemon.py      ← Pillar 6: continuous certification daemon + drift re-synthesis callback
 │   └── tests/
+│       ├── test_feedback_loop.py  ← Pillar 3: feedback loop + drift re-synthesis tests  [new]
 ├── measurement/
 │   └── bandwidth_tracker.py
 ├── profiler/
@@ -167,7 +168,7 @@ memopt's core is built around six pillars that address the main GPU memory bottl
 |--------|--------|---------------|
 | **1 — Infinite Context VMM** | `vmm/` | KV cache OOM for long contexts |
 | **2 — Global KV Deduplication** | `cluster/gkd_store.py` | Redundant KV recomputation for shared prefixes |
-| **3 — Self-Synthesizing Kernels** | `kernels/` | HBM stall from unoptimised CUDA kernels |
+| **3 — Self-Synthesizing Kernels** | `kernels/` | HBM stall from unoptimised CUDA kernels; feedback loop + drift-triggered re-synthesis |
 | **4 — Proof of Efficiency** | `observability/` | Measure, certify, and monetise every optimization |
 | **5 — Global Unified Memory** | `cluster/block_directory.py` + `cluster/remote_block.py` | Cross-node NVMe block sharing — N nodes act as one memory pool |
 | **6 — Silicon Certification** | `kernels/certification.py` | Signed hardware correctness + throughput proof before deployment |
@@ -363,6 +364,10 @@ On a GKD miss (no exact match), the system searches for the longest common prefi
 
 When a CUDA kernel stalls on HBM access, the system automatically synthesises a replacement fused Triton kernel — without stopping inference. The pipeline runs entirely in daemon threads.
 
+**Feedback loop** — each synthesis attempt reads the previous attempt's metadata (speedup, bottleneck type, tiling config) from `KernelCache` and injects it into the prompt. The LLM uses this history to generate a better kernel on each iteration.
+
+**Drift-triggered re-synthesis** — when `CertifyDaemon` (Pillar 6) detects hardware bandwidth drift, it automatically re-synthesises the three active serving kernels (`apply_rope`, `apply_layer_norm_residual`, `apply_scaled_softmax`) with feedback context, restoring performance without operator intervention.
+
 There are two entry points into Pillar 3:
 
 **A — Direct detection path** (general ops via `BottleneckDetector`):
@@ -385,8 +390,11 @@ inference thread
       └─ cache miss:
             │
             ▼
-        build_prompt(event)
+        KernelCache.get_metadata(op_name) → previous attempt (if any)
             │
+            ▼
+        build_prompt(event) + previous attempt context
+            │  (speedup, bottleneck type, tiling, improvement directive)
             ▼
         Claude API → Triton source
             │
@@ -400,7 +408,32 @@ inference thread
         benchmark() — must be ≥ 1.05x faster
             │
             ▼
-        KernelCache.put(key, module, event)
+        KernelCache.put(key, module, event, metadata={speedup, is_memory_bound, ...})
+```
+
+**C — Drift re-synthesis path** (triggered by Pillar 6 drift detection):
+```
+CertifyDaemon._run_once()
+      │
+      ▼
+  DriftDetector.is_drifted() → True
+      │
+      ▼
+  make_drift_resynthesis_callback()(alert_result)
+      │
+      ├─ drift_detected=False? → skip (cert failure, not performance)
+      │
+      └─ drift_detected=True:
+            │
+            ▼
+        for each active kernel (rope, layer_norm_residual, scaled_softmax):
+            │
+            ├─ KernelCache.get_metadata(op_name) → previous attempt
+            │
+            └─ JITGenerator.generate(op_name, hw, context, previous_attempt)
+                    │  (same feedback-enriched prompt as path A)
+                    ▼
+                compile → validate → cache (if faster)
 ```
 
 **B — Serving hook path** (three fixed ops wired directly into the serving runtime):
@@ -443,6 +476,19 @@ Zero overhead when CUDA is not available — falls through immediately.
 ### 6.3 JITGenerator (`kernels/jit_generator.py`)
 
 Constructs a synthesis prompt containing op name, input shapes, dtype, hardware target, access pattern, and observed stall rate. Calls the Claude API via the `anthropic` SDK.
+
+**Two entry points:**
+- `handle(event)` — called by `BottleneckDetector` (path A). Checks cache, deduplicates, runs full synthesis pipeline.
+- `generate(op_name, hardware_profile, source_context, previous_attempt=None)` — called by drift re-synthesis callback (path C) and any caller that wants feedback-aware synthesis. Builds a prompt with previous attempt context and calls the API directly.
+
+**Feedback loop** — `generate()` accepts an optional `previous_attempt` dict (from `KernelCache.get_metadata()`). When provided, the prompt includes:
+- Previous speedup achieved (e.g. `2.10x`)
+- Bottleneck classification (`memory-bandwidth bound` or `compute bound`)
+- Tiling configuration used (e.g. `32x64`)
+- HBM stall rate
+- An **improvement directive** tailored to the bottleneck type: memory-bound kernels get guidance on larger tiles, vectorised loads, and shared memory tiling; compute-bound kernels get guidance on register reuse and pipeline parallelism.
+
+If `previous_attempt` is not provided, `generate()` automatically queries `KernelCache.get_metadata(op_name)` to find the most recent attempt from disk.
 
 | Env var | Default | Effect |
 |---------|---------|--------|
@@ -496,6 +542,12 @@ Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 
 **Integrity verification** — on `_write_to_disk`, a `source_sha256` field (SHA-256 of the kernel source) is stored alongside the entry. On `_load_from_disk`, the hash is verified before `exec()`. Entries that fail the check are deleted from disk rather than executed — a corrupted or tampered cache file cannot execute arbitrary code silently.
 
+**Metadata storage** — `put()` accepts an optional `metadata` dict (containing speedup, `is_memory_bound`, `tiling_config`, `stall_rate`, etc.) which is persisted alongside the cache entry JSON on disk. Two calling conventions are supported:
+- `put(key, module, event)` — original path from `_synthesise()`
+- `put(cache_key=..., kernel_obj=..., metadata=...)` — new path for feedback-loop and test callers
+
+**`get_metadata(op_name)`** — scans disk cache for the most recent entry matching `op_name` and returns its metadata dict. Survives process restarts (reads from disk, not memory). Returns `None` if no previous attempt exists. Never raises — all exceptions are caught and logged at `DEBUG`.
+
 ### 6.6 Design Constraints
 
 - No top-level `torch` or `triton` imports — all lazy inside functions. Package imports cleanly on CPU-only machines.
@@ -516,6 +568,8 @@ Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 | PortabilityLayer | CPU returns None, bad source returns None, target detection |
 | JITGenerator | no API key skip, deduplication, stats keys, prompt content, circuit breaker state |
 | Integration | end-to-end CPU pipeline |
+| Feedback loop (`test_feedback_loop.py`) | get_metadata returns None when empty, get_metadata returns previous attempt after put, generate() accepts previous_attempt, previous attempt injected into prompt context |
+| Drift re-synthesis (`test_feedback_loop.py`) | make_drift_resynthesis_callback returns callable, callback skips non-drift alerts, callback triggers re-synthesis for all 3 kernels on drift, callback never raises on failure, CertifyDaemon has default drift callback, custom callback not overridden |
 
 ### 6.9 Serving Integration (`serving/auto_optimizer.py` + `serving/kernel_hooks.py`)
 
@@ -979,7 +1033,19 @@ Environment variables: `MEMOPT_DRIFT_THRESHOLD_PCT`, `MEMOPT_DRIFT_BASELINE_N`, 
 }
 ```
 
-**Alert callback** — optional `alert_callback(result: dict)` fires on certification failure or drift detection. Operators can wire this to PagerDuty, Slack, etc.
+**Alert callback** — optional `alert_callback(result: dict)` fires on certification failure or drift detection. When no custom callback is provided, `CertifyDaemon` uses `make_drift_resynthesis_callback()` as the default — automatically re-synthesising active kernels when drift is detected.
+
+**`make_drift_resynthesis_callback(jit_generator=None, kernel_cache=None)`** — factory that returns a callback for use as `alert_callback`. On drift detection (`alert_result["drift_detected"] == True`), it:
+
+1. Iterates over the three active serving kernels: `apply_rope`, `apply_layer_norm_residual`, `apply_scaled_softmax`
+2. For each kernel: reads previous attempt metadata from `KernelCache.get_metadata()`
+3. Calls `JITGenerator.generate()` with the feedback context (previous speedup, bottleneck type, tiling)
+4. Logs before/after speedup comparison
+5. Skips certification failures (correctness issues need human review, not re-synthesis)
+
+The callback never raises — individual kernel failures are logged at `WARNING` and the next kernel is still attempted. Optional `jit_generator` and `kernel_cache` parameters allow dependency injection for testing.
+
+This bridges Pillar 3 (self-synthesising kernels) and Pillar 6 (silicon certification): drift detection feeds back into kernel synthesis automatically, closing the performance loop.
 
 Environment variables: `MEMOPT_CERTIFY_INTERVAL_H` (default 24h), `MEMOPT_CERTIFY_ON_STARTUP`, `MEMOPT_NODE_STATUS_PATH`, `MEMOPT_NODE_ID`.
 
@@ -1032,6 +1098,7 @@ Certificate saved: /tmp/memopt_certs/cert_4a7f2b9c1d3e_1742200000.json
 |-------|-------|
 | DriftDetector | no-data safety, baseline computation after N measurements, stable (no drift), drift detected on drop, no drift on small variation, reset clears history, skips invalid input, persistence (save + load), stats keys, drift_pct None before baseline, negative drift on improvement |
 | CertifyDaemon | start + stop lifecycle, drift_stats returns required keys |
+| Drift re-synthesis (`test_feedback_loop.py`) | callback returns callable, skips non-drift alerts, triggers re-synthesis for 3 kernels, never raises, default callback wired into CertifyDaemon, custom callback preserved |
 
 ---
 
