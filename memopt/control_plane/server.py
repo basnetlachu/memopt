@@ -222,6 +222,37 @@ def record_event(
     return {"ok": True}
 
 
+@app.post("/api/v1/nodes/{node_name}/status")
+def update_node_status(node_name: str, payload: dict, _: str = Security(verify_api_key)):
+    """
+    Update degradation status for a node.
+    Called by CertifyDaemon when drift or certification failure is detected.
+    """
+    try:
+        drift_pct = float(payload.get("drift_pct", 0.0))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="drift_pct must be numeric")
+
+    try:
+        db.update_node_status(
+            node_name=node_name,
+            healthy=bool(payload.get("healthy", True)),
+            degraded=bool(payload.get("degraded", False)),
+            drift_pct=drift_pct,
+            reason=str(payload.get("reason", "")),
+        )
+        return {"ok": True, "node": node_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/nodes/degraded")
+def list_degraded_nodes(_: str = Security(verify_api_key)):
+    """Return all nodes currently flagged as degraded."""
+    nodes = db.get_degraded_nodes()
+    return {"degraded_nodes": nodes, "total": len(nodes)}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": time.time()}

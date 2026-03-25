@@ -159,6 +159,85 @@ def make_drift_resynthesis_callback(
     return callback
 
 
+def make_control_plane_callback(
+    control_plane_url: str = None,
+    jit_generator=None,
+    kernel_cache=None,
+) -> Callable[[dict], None]:
+    """
+    Combined callback: flags node DEGRADED in control plane
+    AND triggers Pillar 3 kernel re-synthesis.
+
+    On drift detection:
+      1. Run re-synthesis (Pillar 3) to adapt kernels
+      2. POST degraded status to control plane so load balancer
+         routes traffic away from this node
+
+    On cert failure (not drift):
+      Only re-synthesis runs. Cert failures need human review.
+
+    Never raises.
+    """
+    import urllib.request
+
+    cp_url  = control_plane_url or os.environ.get(
+        "MEMOPT_CONTROL_PLANE_URL", ""
+    )
+    node_id = os.environ.get("MEMOPT_NODE_ID", "unknown")
+    api_key = os.environ.get("MEMOPT_API_KEY", "")
+    resynth = make_drift_resynthesis_callback(jit_generator, kernel_cache)
+
+    def _callback(alert_result: dict) -> None:
+        # Always run re-synthesis first
+        try:
+            resynth(alert_result)
+        except Exception as exc:
+            logger.warning(
+                "control_plane_callback: re-synthesis error: %s", exc
+            )
+
+        if not alert_result.get("drift_detected"):
+            return   # cert failure — needs human review, not auto-flag
+
+        if not cp_url:
+            logger.debug(
+                "control_plane_callback: MEMOPT_CONTROL_PLANE_URL not set, "
+                "skipping status update"
+            )
+            return
+
+        payload = json.dumps({
+            "node_id":     node_id,
+            "healthy":     False,
+            "degraded":    True,
+            "drift_pct":   alert_result.get("drift_pct", 0),
+            "checked_at":  alert_result.get("checked_at", time.time()),
+            "reason":      "HBM bandwidth drift exceeded threshold",
+        }).encode()
+
+        try:
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["X-Memopt-API-Key"] = api_key
+            req = urllib.request.Request(
+                f"{cp_url}/api/v1/nodes/{node_id}/status",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+            logger.info(
+                "control_plane_callback: node %s flagged DEGRADED", node_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "control_plane_callback: could not reach control plane: %s",
+                exc,
+            )
+
+    return _callback
+
+
 class CertifyDaemon:
     """
     Background daemon: runs certification on schedule,

@@ -88,6 +88,9 @@ class Database:
                     dollar_saved_total REAL DEFAULT 0,
                     status TEXT DEFAULT 'online',
                     current_workloads TEXT DEFAULT '[]',
+                    is_degraded INTEGER DEFAULT 0,
+                    degraded_since REAL,
+                    drift_pct REAL DEFAULT 0,
                     updated_at REAL NOT NULL
                 );
 
@@ -112,6 +115,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_events_status
                     ON events(status);
 
+                CREATE INDEX IF NOT EXISTS idx_nodes_degraded
+                    ON nodes(is_degraded);
+
                 CREATE TABLE IF NOT EXISTS metrics (
                     hour_bucket INTEGER NOT NULL,
                     node_name TEXT NOT NULL,
@@ -121,6 +127,17 @@ class Database:
                     PRIMARY KEY (hour_bucket, node_name)
                 );
             """)
+        # Migrate existing databases — add degradation columns if absent
+        with self._connect() as conn:
+            for col, defn in [
+                ("is_degraded", "INTEGER DEFAULT 0"),
+                ("degraded_since", "REAL"),
+                ("drift_pct", "REAL DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {defn}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
         log.info(f"Database initialized: {self.db_path}")
 
     def upsert_node(self, record: NodeRecord):
@@ -245,3 +262,67 @@ class Database:
             "dollar_saved_total": round(total_saved_all, 2),
             "dollar_saved_per_year_estimate": round(total_saved * 365, 2),
         }
+
+    def update_node_status(
+        self,
+        node_name: str,
+        healthy: bool,
+        degraded: bool,
+        drift_pct: float = 0.0,
+        reason: str = "",
+    ) -> bool:
+        """
+        Update degradation status for a node.
+        Creates the node if it doesn't exist (with minimal fields).
+        Returns True if the update succeeded.
+        """
+        now = time.time()
+        status = "online" if healthy else ("degraded" if degraded else "offline")
+        degraded_since = now if degraded else None
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT node_name FROM nodes WHERE node_name=?", (node_name,)
+            ).fetchone()
+
+            if existing:
+                conn.execute("""
+                    UPDATE nodes SET
+                        status=?,
+                        is_degraded=?,
+                        degraded_since=CASE WHEN ? THEN COALESCE(degraded_since, ?) ELSE NULL END,
+                        drift_pct=?,
+                        updated_at=?
+                    WHERE node_name=?
+                """, (
+                    status,
+                    1 if degraded else 0,
+                    degraded,
+                    degraded_since,
+                    drift_pct,
+                    now,
+                    node_name,
+                ))
+            else:
+                conn.execute("""
+                    INSERT INTO nodes (
+                        node_name, last_seen, gpu_count, total_vram_gb,
+                        active_processes, optimizations_applied,
+                        dollar_saved_today, dollar_saved_total,
+                        status, current_workloads,
+                        is_degraded, degraded_since, drift_pct,
+                        updated_at
+                    ) VALUES (?,?,0,0,0,0,0,0,?,?,?,?,?,?)
+                """, (
+                    node_name, now, status, "[]",
+                    1 if degraded else 0, degraded_since, drift_pct, now,
+                ))
+        return True
+
+    def get_degraded_nodes(self) -> List[dict]:
+        """Return all nodes currently flagged as degraded."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM nodes WHERE is_degraded = 1 ORDER BY degraded_since DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
