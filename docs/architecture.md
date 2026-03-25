@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 206 tests pass, 6 skipped (GPU-only tests require CUDA device)
+**Test suite:** 177 tests pass, 6 skipped on CPU-only (206 pass with torch + CUDA installed; 8 require torch)
 
 ---
 
@@ -338,10 +338,10 @@ On a GKD miss (no exact match), the system searches for the longest common prefi
 
 **Stats** — `gkd_store.stats()` includes `exact_hits`, `lcp_hits`, `lcp_token_reuse_pct`, and `total_hits` counters.
 
-**Typical reuse rates** (from benchmark tests):
-- Customer support (shared system prompts): ~94% token reuse
-- RAG pipeline (shared retrieval context): ~82% token reuse
-- Code assistant (shared file context): ~87% token reuse
+**Typical reuse rates** (from benchmark tests — measures cache hit rate: % of tokens in cache-hitting requests that matched a prefix, not compute elimination):
+- Customer support (shared system prompts): ~94% prefix-match rate
+- RAG pipeline (shared retrieval context): ~82% prefix-match rate
+- Code assistant (shared file context): ~87% prefix-match rate
 
 ### 5.7 Hypervisor (`cluster/hypervisor.py`)
 
@@ -1607,7 +1607,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**196 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**206 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
@@ -1624,5 +1624,6 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `cluster/tests/test_pillar5_gum.py` | 19 | 19 PASS (Pillar 5 — all CPU/TCP, no GPU) |
 | `observability/tests/test_observability.py` | 29 | 29 PASS (2 new: write buffer flush, shutdown flush) |
 | `observability/tests/test_ledger_verify.py` | 6 | 6 PASS (Pillar 4 — chain verification) |
+| `kernels/tests/test_feedback_loop.py` | 10 | 10 PASS (Pillar 3 — feedback loop + drift re-synthesis) |
 
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.

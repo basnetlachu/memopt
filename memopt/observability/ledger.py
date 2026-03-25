@@ -402,6 +402,13 @@ class OptimizationLedger:
         except Exception as e:
             logger.debug(f"Ledger write failed: {e}")
 
+    def flush(self) -> None:
+        """Write all buffered entries to SQLite immediately.
+        Use this in tests or when you need entries visible to verify_chain()
+        before shutdown.
+        """
+        self._buffer._flush()
+
     def shutdown(self) -> None:
         """Flush the write buffer and stop the background flush thread.
         Call at server shutdown to ensure no buffered entries are lost.

@@ -87,11 +87,8 @@ def apply_rope(
     """
     Rotary Position Embedding — fused or unfused depending on cache.
 
-    Fused path (cache hit):    5.18x faster at seq_len=16384
+    Fused path (cache hit):    synthesised kernel (benchmark result: 5.18x on Blackwell GB200, seq_len=16384 — actual speedup varies by GPU, seq length, and HBM bandwidth)
     Unfused path (cache miss): standard PyTorch, identical output
-    # AUDIT P1: 5.18x figure is a single-device benchmark (Blackwell GB200,
-    # seq_len=16384). Actual speedup varies by GPU architecture, seq length,
-    # and HBM bandwidth. Do not treat this as a guaranteed production number.
 
     The auto-optimizer synthesises the fused kernel on first call and
     registers it in the cache. All subsequent calls use the fused path.

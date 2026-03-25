@@ -1,5 +1,9 @@
 # memopt/utils — utility helpers for loading and preparing models
-from .model_loader import load_large_model, _estimate_model_gb
+try:
+    from .model_loader import load_large_model, _estimate_model_gb
+except ImportError:
+    load_large_model = None      # type: ignore[assignment]
+    _estimate_model_gb = None    # type: ignore[assignment]
 from .input_handler import (
     detect_input_format,
     forward,
