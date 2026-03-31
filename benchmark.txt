@@ -34,3 +34,9 @@ lcp: scenario=code_assistant exact=0 lcp=20 reuse_pct=86.6
 lcp: scenario=customer_support exact=0 lcp=20 reuse_pct=94.1
 lcp: scenario=rag_pipeline exact=0 lcp=20 reuse_pct=82.3
 lcp: scenario=code_assistant exact=0 lcp=20 reuse_pct=86.6
+lcp: scenario=customer_support exact=0 lcp=20 reuse_pct=94.1
+lcp: scenario=rag_pipeline exact=0 lcp=20 reuse_pct=82.3
+lcp: scenario=code_assistant exact=0 lcp=20 reuse_pct=86.6
+lcp: scenario=customer_support exact=0 lcp=20 reuse_pct=94.1
+lcp: scenario=rag_pipeline exact=0 lcp=20 reuse_pct=82.3
+lcp: scenario=code_assistant exact=0 lcp=20 reuse_pct=86.6

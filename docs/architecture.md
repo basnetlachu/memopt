@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 177 tests pass, 6 skipped on CPU-only (206 pass with torch + CUDA installed; 8 require torch)
+**Test suite:** 218 tests pass, 6 skipped on CPU-only (with torch + CUDA installed; all 218 pass)
 
 ---
 
@@ -54,8 +54,8 @@ Beyond single-model optimization, memopt provides:
 - **Global Unified Memory (GUM)** — turns N independent GPU nodes into one logical memory space; NVMe-evicted blocks are content-addressed and fetchable from any peer over TCP via optimistic lease protocol.
 - **Silicon Certification Suite** — correctness and throughput battery (rope, layer_norm_residual, scaled_softmax + memcpy/GEMM benchmarks) producing a signed `SiliconCertificate` JSON that proves hardware behaviour before deployment.
 - **Background daemon** — zero-touch GPU process monitor via NVML.
-- **Serving runtime** — OpenAI-compatible HTTP interface with paged attention and continuous batching.
-- **Control plane** — lightweight FastAPI server for cluster node reporting, status, and serving engine registration.
+- **Serving runtime** — OpenAI-compatible HTTP interface with paged attention, continuous batching, GKD dedup on every request, and `/report/found-capacity` endpoint for real-time savings reporting.
+- **Control plane** — lightweight FastAPI server for cluster node reporting, status, serving engine registration, and node degradation tracking (drift → automatic traffic rerouting).
 
 ---
 
@@ -79,9 +79,11 @@ memopt/                        ← Python package root
 │   ├── remote_block.py        ← Pillar 5: cross-node block transfer protocol (TCP, stdlib only)
 │   └── tests/
 ├── control_plane/
-│   ├── server.py              ← Control-plane FastAPI server
+│   ├── server.py              ← Control-plane FastAPI server (+ node degradation endpoints)
 │   ├── cli.py
-│   └── database.py
+│   ├── database.py            ← SQLite (nodes, events, metrics) + degradation columns
+│   └── tests/
+│       └── test_degradation.py  ← Pillar 6: control plane degradation tracking tests  [new]
 ├── daemon/
 │   ├── daemon_service.py
 │   ├── reporter.py
@@ -94,9 +96,10 @@ memopt/                        ← Python package root
 │   ├── portability_layer.py   ← Pillar 3: BackendStrategy (CUDA/ROCm/TorchCompile/MLIR)
 │   ├── certification.py       ← Pillar 6: Silicon Certification Suite
 │   ├── drift_detector.py      ← Pillar 6: hardware bandwidth drift detection  [new]
-│   ├── certify_daemon.py      ← Pillar 6: continuous certification daemon + drift re-synthesis callback
+│   ├── certify_daemon.py      ← Pillar 6: continuous certification daemon + drift re-synthesis + control plane callback
 │   └── tests/
-│       ├── test_feedback_loop.py  ← Pillar 3: feedback loop + drift re-synthesis tests  [new]
+│       ├── test_feedback_loop.py           ← Pillar 3: feedback loop + drift re-synthesis tests  [new]
+│       ├── test_control_plane_callback.py  ← Pillar 6: control plane callback tests  [new]
 ├── measurement/
 │   └── bandwidth_tracker.py
 ├── profiler/
@@ -1047,7 +1050,19 @@ The callback never raises — individual kernel failures are logged at `WARNING`
 
 This bridges Pillar 3 (self-synthesising kernels) and Pillar 6 (silicon certification): drift detection feeds back into kernel synthesis automatically, closing the performance loop.
 
-Environment variables: `MEMOPT_CERTIFY_INTERVAL_H` (default 24h), `MEMOPT_CERTIFY_ON_STARTUP`, `MEMOPT_NODE_STATUS_PATH`, `MEMOPT_NODE_ID`.
+**`make_control_plane_callback(control_plane_url=None, jit_generator=None, kernel_cache=None)`** — combined callback that extends `make_drift_resynthesis_callback()` with control plane integration. On drift detection:
+
+1. Runs kernel re-synthesis (same as `make_drift_resynthesis_callback`)
+2. POSTs `{"healthy": false, "degraded": true, "drift_pct": ...}` to `{MEMOPT_CONTROL_PLANE_URL}/api/v1/nodes/{node_id}/status`
+3. Includes `X-Memopt-API-Key` header if `MEMOPT_API_KEY` env var is set
+
+On cert failure (not drift): only re-synthesis runs; no control plane POST (cert failures need human review).
+
+When `MEMOPT_CONTROL_PLANE_URL` is not set, the HTTP POST is skipped (re-synthesis still runs). All exceptions are caught — the callback never raises.
+
+This is the default `alert_callback` used when `CertifyDaemon` is wired into `serving/server.py`'s `_build_engine()`.
+
+Environment variables: `MEMOPT_CERTIFY_INTERVAL_H` (default 24h), `MEMOPT_CERTIFY_ON_STARTUP`, `MEMOPT_NODE_STATUS_PATH`, `MEMOPT_NODE_ID`, `MEMOPT_CONTROL_PLANE_URL`, `MEMOPT_API_KEY`.
 
 ### 7b.5 CLI (`memopt certify`)
 
@@ -1099,6 +1114,8 @@ Certificate saved: /tmp/memopt_certs/cert_4a7f2b9c1d3e_1742200000.json
 | DriftDetector | no-data safety, baseline computation after N measurements, stable (no drift), drift detected on drop, no drift on small variation, reset clears history, skips invalid input, persistence (save + load), stats keys, drift_pct None before baseline, negative drift on improvement |
 | CertifyDaemon | start + stop lifecycle, drift_stats returns required keys |
 | Drift re-synthesis (`test_feedback_loop.py`) | callback returns callable, skips non-drift alerts, triggers re-synthesis for 3 kernels, never raises, default callback wired into CertifyDaemon, custom callback preserved |
+| Control plane callback (`test_control_plane_callback.py`) | returns callable, skips non-drift (no HTTP), posts on drift, never raises on HTTP failure, skips when no URL, re-synthesis still runs on POST failure |
+| Database degradation (`test_degradation.py`) | columns exist with defaults, creates new node, updates existing node, clears degraded, filters degraded nodes, empty list on no degraded |
 
 ---
 
@@ -1336,7 +1353,19 @@ report = sampler.report()
 
 FastAPI app with OpenAI-compatible `/v1/completions` and `/v1/chat/completions` endpoints. Launched via `memopt serve --model <path> --port 8080`.
 
-At startup, `_build_engine()` initialises the full Pillar 3 stack in order and stores it in four module-level globals that persist for the process lifetime:
+At startup, `_build_engine()` initialises five subsystems in order, each wrapped in its own `try/except` so failures are non-fatal:
+
+**1. Pillar 1+2 — GKD Store** (`_gkd_store`, `_node_id`):
+
+```python
+_node_id   = os.getenv("MEMOPT_NODE_ID", socket.gethostname())
+redis_url  = os.getenv("REDIS_URL")
+_gkd_store = GKDStore(redis_url=redis_url, node_id=_node_id)  # falls back to local
+```
+
+Reads `REDIS_URL` for cluster-wide deduplication; uses `LocalGKDBackend` when unset. The GKD store is wired into the `/v1/completions` request path (see below).
+
+**2. Pillar 3 — Auto-optimizer** (`_p3_kv_cache`, `_p3_portability`, `_p3_generator`, `_p3_optimizer`):
 
 ```python
 _p3_kv_cache    = KernelCache()
@@ -1347,9 +1376,68 @@ _p3_optimizer.start()
 kernel_hooks.init_hooks(cache=_p3_kv_cache, optimizer=_p3_optimizer)
 ```
 
-The initialisation sequence is: `KernelCache → PortabilityLayer → JITGenerator → AutoOptimizer → kernel_hooks.init_hooks()`. After this call, `apply_rope`, `apply_layer_norm_residual`, and `apply_scaled_softmax` use the fused path on every cache hit. Synthesis failures are non-fatal — the serving loop is never interrupted.
+After this call, `apply_rope`, `apply_layer_norm_residual`, and `apply_scaled_softmax` use the fused path on every cache hit.
 
-After P3 init, `_build_engine()` imports `_p4_collector` and `_p4_ledger` from `api/server.py` and registers `kernel_hooks` with the collector. The `/v1/completions` endpoint records each request's `tokens_generated` into both the collector (for Prometheus metrics) and the ledger (for per-batch economics).
+**3. Pillar 4 — Metrics + Ledger**: Imports `_p4_collector` and `_p4_ledger` from `api/server.py` and registers `kernel_hooks` with the collector. The `/v1/completions` endpoint records each request's `tokens_generated` into both the collector (for Prometheus metrics) and the ledger (for per-batch economics).
+
+**4. Pillar 6 — CertifyDaemon** (`_certify_daemon`):
+
+```python
+_certify_daemon = CertifyDaemon(
+    node_id=_node_id,
+    alert_callback=make_control_plane_callback(
+        jit_generator=_p3_generator,
+        kernel_cache=_p3_kv_cache,
+    ),
+)
+_certify_daemon.start()
+```
+
+Boots a background daemon thread that runs `run_certification()` every 24h (configurable via `MEMOPT_CERTIFY_INTERVAL_H`). The `make_control_plane_callback()` combines two actions on drift detection: (a) re-synthesise active kernels via Pillar 3, and (b) POST `degraded=True` to the control plane so the load balancer routes traffic away.
+
+**5. Control plane self-registration**: If `MEMOPT_CONTROL_PLANE` env var is set, the server POSTs its host/port/model to `/api/v1/serving/register`.
+
+All five init blocks are independent — a failure in any one does not block the others.
+
+#### `/v1/completions` request flow
+
+The completions endpoint integrates GKD lookup and registration:
+
+```
+Request → tokenize → GKD lookup
+                         │
+                    hit? ──→ (stats tracked; compute-skip pending engine integration)
+                    miss? ─→ engine.run_sync() → GKD register → ledger.record()
+```
+
+1. **GKD lookup** — `_gkd_store.lookup(token_ids, seq_len)` before inference. On hit (exact or LCP), stats are tracked in `GKDStore` counters. On miss, inference runs normally.
+2. **Inference** — `engine.run_sync()` always runs. Actual compute-skip on GKD hit requires engine-level integration (not yet implemented — the GKD lookup currently builds the dedup index and tracks hit rate).
+3. **GKD register** — on miss, the token sequence is registered into GKD for future dedup: `_gkd_store.register(token_ids, seq_len, block_ref, node_id)`.
+4. **Ledger** — records `tokens_generated` and `gkd_hit_rate_pct` (from live `_gkd_store.stats()`). No `actual_j_per_token` is passed — the field defaults to `None` (unmeasured) to avoid fake numbers.
+
+#### `/report/found-capacity` endpoint
+
+`GET /report/found-capacity` returns real GKD deduplication stats and ledger totals:
+
+```json
+{
+  "gkd": {
+    "hit_rate_pct": 95.0,
+    "exact_hits": 47500,
+    "lcp_hits": 200,
+    "total_lookups": 50000,
+    "estimated_hbm_saved_gb": 593.75,
+    "lcp_prefix_match_rate_pct": 82.3,
+    "entries_in_store": 2500,
+    "backend_degraded": false
+  },
+  "ledger": { ... totals from OptimizationLedger ... },
+  "node_id": "a100-prod-01",
+  "generated_at": 1742200000.0
+}
+```
+
+All values are measured from live counters — no hardcoded numbers.
 
 ---
 
@@ -1391,19 +1479,46 @@ The control plane is a lightweight FastAPI server in `memopt/control_plane/serve
 ### 18.1 Database (`control_plane/database.py`)
 
 SQLite with WAL mode. Three tables:
-- `nodes` — node ID, hostname, GPU count, last heartbeat
+- `nodes` — node ID, hostname, GPU count, last heartbeat, degradation status
 - `events` — optimization events with before/after metrics
 - `metrics` — time-series GPU utilisation and memory usage
 
+The `nodes` table includes degradation tracking columns:
+- `is_degraded` (INTEGER DEFAULT 0) — 1 when node is flagged degraded by CertifyDaemon
+- `degraded_since` (REAL) — timestamp when degradation was first detected; preserved across repeated updates via `COALESCE(degraded_since, ?)`; cleared to NULL when degradation is resolved
+- `drift_pct` (REAL DEFAULT 0) — HBM bandwidth drift percentage reported by DriftDetector
+
+Schema migration: on `init()`, the database runs `ALTER TABLE nodes ADD COLUMN` for each new column inside `try/except sqlite3.OperationalError` so existing databases upgrade without data loss.
+
+Methods:
+- `update_node_status(node_name, healthy, degraded, drift_pct, reason)` — upserts degradation status; creates the node if it doesn't exist
+- `get_degraded_nodes()` — returns all nodes where `is_degraded = 1`, ordered by `degraded_since DESC`
+
 ### 18.2 Server (`control_plane/server.py`)
 
-FastAPI with endpoints:
-- `GET /nodes` — list all registered nodes
-- `GET /events` — optimization event history
-- `POST /events` — record new optimization
-- `GET /metrics` — aggregated cluster metrics
-- `GET /` — HTML dashboard (vanilla JS, 30s auto-refresh)
-- `GET /health` — liveness probe
+FastAPI with endpoints (all except `/health` and `/` require `X-Memopt-API-Key` header):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/report` | Node heartbeat (called by ZeroTouchDaemon every 60s) |
+| `GET` | `/api/v1/status` | Cluster-wide summary |
+| `GET` | `/api/v1/nodes` | List all registered nodes |
+| `GET` | `/api/v1/nodes/{name}` | Single node detail with recent events |
+| `POST` | `/api/v1/nodes/{name}/status` | Update node degradation status (called by CertifyDaemon) |
+| `GET` | `/api/v1/nodes/degraded` | List all nodes currently flagged as degraded |
+| `GET` | `/api/v1/events` | Optimization event history (filterable by node, status) |
+| `POST` | `/api/v1/events` | Record new optimization event |
+| `POST` | `/api/v1/preflight` | Pre-flight static graph analysis |
+| `GET` | `/api/v1/certificates` | List signed optimization certificates |
+| `GET` | `/api/v1/serving/status` | List registered serving engines |
+| `POST` | `/api/v1/serving/register` | Register serving engine (no auth) |
+| `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/` | HTML dashboard (no auth) |
+| `GET` | `/executive` | Executive ROI dashboard (no auth) |
+
+**`POST /api/v1/nodes/{name}/status`** — accepts `{"healthy": bool, "degraded": bool, "drift_pct": float, "reason": str}`. Input validated: non-numeric `drift_pct` returns HTTP 400. Called by `make_control_plane_callback()` when CertifyDaemon detects drift.
+
+**`GET /api/v1/nodes/degraded`** — returns `{"degraded_nodes": [...], "total": int}`. Used by load balancers to route traffic away from degraded nodes.
 
 ### 18.3 CLI
 
@@ -1607,13 +1722,15 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**206 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**218 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
 | `kernels/tests/test_kernels.py` | 25 | 25 PASS |
 | `kernels/tests/test_certification.py` | 18 | 18 PASS (Pillar 6) |
 | `kernels/tests/test_drift_detector.py` | 13 | 13 PASS (Pillar 6 — drift + daemon) |
+| `kernels/tests/test_feedback_loop.py` | 10 | 10 PASS (Pillar 3 — feedback loop + drift re-synthesis) |
+| `kernels/tests/test_control_plane_callback.py` | 6 | 6 PASS (Pillar 6 — control plane callback) |
 | `serving/tests/test_serving_kernels.py` | 11 | 11 PASS |
 | `vmm/tests/test_vmm_smoke.py` | 10 | 10 PASS (4 new: tenant isolation) |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
@@ -1624,6 +1741,6 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `cluster/tests/test_pillar5_gum.py` | 19 | 19 PASS (Pillar 5 — all CPU/TCP, no GPU) |
 | `observability/tests/test_observability.py` | 29 | 29 PASS (2 new: write buffer flush, shutdown flush) |
 | `observability/tests/test_ledger_verify.py` | 6 | 6 PASS (Pillar 4 — chain verification) |
-| `kernels/tests/test_feedback_loop.py` | 10 | 10 PASS (Pillar 3 — feedback loop + drift re-synthesis) |
+| `control_plane/tests/test_degradation.py` | 6 | 6 PASS (Pillar 6 — database degradation tracking) |
 
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.

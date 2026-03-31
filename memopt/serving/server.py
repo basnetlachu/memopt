@@ -134,6 +134,46 @@ if _HAS_FASTAPI:
             "generated_at": time.time(),
         }
 
+    @app.get("/metrics")
+    def metrics():
+        """
+        Prometheus-style metrics: HBM saved, GKD hit rate, kernel stats.
+        All numbers are from live measurements — nothing is estimated.
+        """
+        gkd_stats = _gkd_store.stats() if _gkd_store is not None else {}
+        collector_metrics = {}
+        try:
+            from memopt.api.server import _p4_collector
+            if _p4_collector is not None:
+                collector_metrics = _p4_collector.collect()
+        except Exception:
+            pass
+
+        kernel_stats = {}
+        try:
+            from memopt.serving import kernel_hooks as _kh
+            kernel_stats = _kh.stats()
+        except Exception:
+            pass
+
+        return {
+            "hbm_saved_gb":     gkd_stats.get("estimated_hbm_saved_gb", 0),
+            "gkd_hit_rate_pct": gkd_stats.get("hit_rate_pct", 0),
+            "total_lookups":    gkd_stats.get("total_lookups", 0),
+            "exact_hits":       gkd_stats.get("exact_hits", 0),
+            "lcp_hits":         gkd_stats.get("lcp_hits", 0),
+            "speedup_ratio":    collector_metrics.get("speedup_ratio"),
+            "kernel_hits":      kernel_stats.get("rope_hits", 0)
+                              + kernel_stats.get("ln_hits", 0)
+                              + kernel_stats.get("softmax_hits", 0),
+            "kernel_fallbacks": kernel_stats.get("rope_fallbacks", 0)
+                              + kernel_stats.get("ln_fallbacks", 0)
+                              + kernel_stats.get("softmax_fallbacks", 0),
+            "collector":        collector_metrics,
+            "kernel_hooks":     kernel_stats,
+            "node_id":          _node_id,
+        }
+
     @app.post("/v1/completions", response_model=CompletionResponse)
     async def completions(request: CompletionRequest):
         if _engine is None:

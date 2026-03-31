@@ -36,8 +36,12 @@ logger = logging.getLogger(__name__)
 # MEMOPT_SIGNING_KEY must be set via environment variable only.
 # The application never writes this key to disk.
 # In production: inject via Kubernetes secret, AWS SSM, or Vault.
-_SIGNING_KEY  = os.environ.get("MEMOPT_SIGNING_KEY", "")
 _CERT_VERSION = "1.0"
+
+
+def _get_signing_key() -> str:
+    """Read signing key from env at call time so tests can mutate the env."""
+    return os.environ.get("MEMOPT_SIGNING_KEY", "")
 
 
 def _canonical_json(data: dict) -> bytes:
@@ -74,8 +78,9 @@ def sign_entry(entry) -> dict:
     }
     canonical = _canonical_json(sign_target)
 
-    if _SIGNING_KEY:
-        key_bytes = _SIGNING_KEY.encode("utf-8")
+    signing_key = _get_signing_key()
+    if signing_key:
+        key_bytes = signing_key.encode("utf-8")
         signature = hmac.new(key_bytes, canonical, hashlib.sha256).hexdigest()
         status    = "signed"
         algorithm = "HMAC-SHA256"

@@ -1,0 +1,27 @@
+{
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "hbm_physical_gb": 85.093777408,
+  "block_size_mb": 4,
+  "virtual_gb": 92.274688,
+  "ratio": 1.08,
+  "hbm_used_gb": 66.73137664,
+  "dram_used_gb": 25.54331136,
+  "nvme_used_gb": 0.0,
+  "latency_ms": {
+    "hbm": {
+      "avg": 0.138,
+      "min": 0.082,
+      "max": 0.303
+    },
+    "dram": {
+      "avg": 0.128,
+      "min": 0.078,
+      "max": 0.332
+    },
+    "nvme": {
+      "avg": 4.994,
+      "min": 4.917,
+      "max": 5.352
+    }
+  }
+}
