@@ -2,7 +2,7 @@
 
 **Language:** Python 3.8+, PyTorch 2.0+
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 218 tests pass, 6 skipped on CPU-only (with torch + CUDA installed; all 218 pass)
+**Test suite:** 286 tests pass, 7 skipped on CPU-only (with torch + CUDA installed; all 286 pass)
 
 ---
 
@@ -47,7 +47,7 @@ memopt is a GPU memory profiling, optimization, and serving toolkit for PyTorch 
 
 Beyond single-model optimization, memopt provides:
 
-- **Infinite Context VMM** — multi-tier (HBM → DRAM → NVMe) KV-block paging with predictive prefetch so long-context inference never OOMs.
+- **Infinite Context VMM** — multi-tier (HBM → DRAM → NVMe) KV-block paging with predictive prefetch so long-context inference never OOMs. Includes a Markov chain Memory Oracle (Layer 2), TCP gossip federation for cross-node transition sharing, elastic tier allocation, and HBM pressure-aware horizon scaling (Layer 3).
 - **Global KV Cache Deduplication (GKD)** — cluster-wide content-addressed cache that eliminates redundant KV recomputation for shared prompt prefixes (90%+ hit rate in production).
 - **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference. Feedback loop: each re-synthesis reads the previous attempt's speedup, bottleneck type, and tiling config to produce a better kernel. Hardware drift triggers automatic re-synthesis of active kernels.
 - **Proof of Efficiency** — Prometheus metrics aggregator, per-batch energy/CO₂/cost savings ledger (SQLite, write-buffered), HMAC-signed optimization certificates, and GPU price arbitrage engine.
@@ -140,14 +140,25 @@ memopt/                        ← Python package root
 ├── vmm/
 │   ├── hal.py
 │   ├── page_table.py
-│   ├── prefetch_engine.py
+│   ├── prefetch_engine.py         ← extended: oracle + allocator + governor integration
 │   ├── tier_manager.py
 │   ├── weight_manager.py
+│   ├── access_log.py              ← Layer 1: non-blocking JSONL access logging (background daemon writer)
+│   ├── universal_profile.py       ← Layer 1: hardware memory tier detection (HBM/DRAM/NVMe/CXL)
+│   ├── oracle.py                  ← Layer 2: Markov chain predictive prefetch oracle
+│   ├── oracle_data_cleaner.py     ← Layer 2: 7-step cleaning pipeline for access logs
+│   ├── oracle_trainer.py          ← Layer 2: background oracle training daemon
+│   ├── federation.py              ← Layer 3: TCP gossip for cross-node oracle transition sharing
+│   ├── elastic_allocator.py       ← Layer 3: urgency-based tier allocation decisions
+│   ├── memory_governor.py         ← Layer 3: HBM pressure monitoring + horizon scaling
 │   ├── backends/
 │   │   ├── cuda_backend.py
 │   │   ├── rocm_backend.py
 │   │   └── unified_backend.py
 │   └── tests/
+│       ├── test_vmm_smoke.py      ← 13 tests (VMM + tenant isolation + Layer 1 integration)
+│       ├── test_oracle.py         ← 23 tests (oracle + data cleaner + trainer)
+│       └── test_layer3.py         ← 25 tests (federation + allocator + governor)
 └── workflows/
     └── analyze_workflow.py
 
@@ -169,7 +180,7 @@ memopt's core is built around six pillars that address the main GPU memory bottl
 
 | Pillar | Module | Problem Solved |
 |--------|--------|---------------|
-| **1 — Infinite Context VMM** | `vmm/` | KV cache OOM for long contexts |
+| **1 — Infinite Context VMM** | `vmm/` | KV cache OOM for long contexts; predictive oracle, federated learning, elastic allocation, HBM pressure governance |
 | **2 — Global KV Deduplication** | `cluster/gkd_store.py` | Redundant KV recomputation for shared prefixes |
 | **3 — Self-Synthesizing Kernels** | `kernels/` | HBM stall from unoptimised CUDA kernels; feedback loop + drift-triggered re-synthesis |
 | **4 — Proof of Efficiency** | `observability/` | Measure, certify, and monetise every optimization |
@@ -215,6 +226,26 @@ vmm.free_sequence("seq_001")
 
 Records per-sequence access patterns and issues async DRAM→HBM copies one block ahead on a dedicated CUDA stream (`_copy_stream`). Never touches the compute stream.
 
+The engine builds a first-order Markov chain of block access patterns and measures real inter-access timing per sequence using EWMA smoothing. Prefetches fire at 80% of the observed gap — arriving early without overshooting.
+
+**Layer 1 integration** — optional `access_log` param emits `BlockAccessEvent` to a background JSONL writer. `detect_universal_profile()` probes hardware tiers at init.
+
+**Layer 2 integration** — optional `oracle` param delegates prediction to `MemoryOracle`. When attached, the oracle's `predict()` replaces the built-in Markov chain. Predictions with confidence >= 0.5 trigger prefetches. The oracle is fed every access via `oracle.observe()`.
+
+**Layer 3 integration** — optional `allocator` and `governor` params. When an `ElasticAllocator` is attached, each oracle prediction is routed through `allocator.decide(confidence)` for tier placement tracking. The `MemoryGovernor` runs independently in a background thread, scaling the oracle's horizon based on HBM pressure.
+
+```python
+PrefetchEngine(
+    tier_manager,
+    access_log=AccessLog(...),      # Layer 1
+    oracle=MemoryOracle(...),       # Layer 2
+    allocator=ElasticAllocator(...),# Layer 3
+    governor=MemoryGovernor(...),   # Layer 3
+)
+```
+
+Methods added across layers: `get_hw_profile()`, `get_oracle()`, `oracle_stats()`, `get_allocator()`, `get_governor()`, `layer3_stats()`.
+
 ### 4.5 NVMe Crash Safety (`vmm/backends/unified_backend.py`, `vmm/backends/cuda_backend.py`)
 
 All writes to NVMe-tier block files are crash-safe:
@@ -235,10 +266,199 @@ Every sequence is bound to the `tenant_id` that first allocated it. Cross-tenant
 
 NVMe block paths are also namespaced per tenant: `<nvme_dir>/<tenant_id>/<sequence_id>_<block_index>.vmm_block`, preventing filesystem-level cross-tenant collisions.
 
-### 4.7 Test Coverage
+### 4.7 Access Logging (`vmm/access_log.py`) — Layer 1
 
-- `test_vmm_smoke.py`: allocate/fetch/free, stats, prefetch recording, multi-sequence isolation, error handling, tenant isolation (10 tests)
+Non-blocking, append-only JSONL event logger. Every block access is recorded as a `BlockAccessEvent` (frozen dataclass) and written to a rotating daily file via a background daemon thread.
+
+```python
+@dataclass(frozen=True)
+class BlockAccessEvent:
+    sequence_id: str
+    block_index: int
+    token_position: int
+    attention_layer: int
+    timestamp: float           # time.perf_counter()
+    tier_at_access: str        # "hbm" | "dram" | "nvme" | "unknown"
+    promotion_latency_ms: float
+    tenant_id: str
+```
+
+`AccessLog` uses a `queue.Queue(maxsize=10_000)` — `record()` calls `put_nowait()` and silently drops events when the queue is full. The background writer thread flushes to disk with `json.dumps()`. `shutdown()` sends a sentinel, drains remaining events, and closes the file handle.
+
+### 4.8 Universal Memory Profile (`vmm/universal_profile.py`) — Layer 1
+
+Probes all available memory tiers on the current hardware and returns a structured `UniversalMemoryProfile`. Works on any platform: CUDA (Ampere/Hopper/Blackwell), ROCm, Apple Silicon, plain Linux. All hardware probes are wrapped in `try/except` — never raises.
+
+```python
+@dataclass
+class MemoryTier:
+    name: str               # "hbm" | "dram" | "nvme" | "cxl" | "remote_hbm"
+    capacity_gb: float
+    bandwidth_gbs: float
+    latency_us: float
+    is_available: bool
+    device_path: str
+
+@dataclass
+class UniversalMemoryProfile:
+    tiers: List[MemoryTier]  # sorted by latency ascending (fastest first)
+    total_capacity_gb: float
+    architecture: str        # "cuda_ampere" | "cuda_hopper" | "cuda_blackwell" | "cpu" | ...
+    device_name: str
+    compute_capability: Tuple[int, ...]
+    supports_rdma: bool
+    supports_cxl: bool
+    detected_at: float
+```
+
+Detection order: HBM (via `torch.cuda`), DRAM (via `psutil` or `/proc/meminfo`), NVMe (`MEMOPT_NVME_DIR`), CXL (`/sys/bus/cxl/devices/`), Remote HBM (`MEMOPT_NODE_HOSTS`). GPU bandwidth uses the `GPU_SPECS` lookup table (8 entries covering A100/H100/B200/RTX 4090/RTX PRO 6000 Blackwell).
+
+### 4.9 Memory Oracle (`vmm/oracle.py`) — Layer 2
+
+Pure-Python predictive prefetch oracle using first-order Markov transitions, sequential heuristics, and recency tracking. No ML libraries.
+
+```python
+class MemoryOracle:
+    def __init__(self, horizon=50, max_transitions=100_000,
+                 min_confidence=0.3, hardware_profile=None)
+    def observe(self, sequence_id, block_index, step=None)
+    def predict(self, sequence_id, current_block, top_k=10) -> list[BlockPrediction]
+    def record_outcome(self, sequence_id, block_index)
+    def stats(self) -> OracleStats
+    def reset(self, sequence_id=None)
+    def warm_from_log(self, log_path, max_events=50_000) -> int
+```
+
+**Prediction sources** (in priority order):
+1. **Transition** — Markov chain probability (`count / total`), filtered by `min_confidence`
+2. **Sequential** — `current_block + 1` (conf 0.6) and `+ 2` (conf 0.4)
+3. **Recency** — last 5 accessed blocks for the sequence (conf 0.35)
+4. **Fallback** — `current_block + 1` (conf 0.3) when no other sources produce results
+
+**Hardware scaling** — when `hardware_profile` is provided and DRAM > 500 GB, horizon doubles; > 100 GB, horizon × 1.5.
+
+**Transition pruning** — every 1000 observations, the least-frequent transition is evicted to keep memory bounded by `max_transitions`.
+
+### 4.10 Oracle Data Cleaner (`vmm/oracle_data_cleaner.py`) — Layer 2
+
+7-step cleaning pipeline for raw JSONL access events before they are fed to the oracle:
+
+| Step | Action |
+|------|--------|
+| 1 | Parse — skip malformed JSON |
+| 2 | Field validation — block index range, valid tier, latency bounds |
+| 3 | Group by `sequence_id`, sort by `token_position` |
+| 4 | Deduplicate — sliding window removes repeated block accesses |
+| 5 | Filter short sequences — drop sequences below `min_sequence_length` |
+| 6 | Truncate long sequences — keep last `max_sequence_length` events |
+| 7 | Outlier filter — drop events with `promotion_latency_ms` above p99 AND > 1000ms |
+
+Returns `(clean_events, CleaningStats)` with drop reasons tracked per category.
+
+### 4.11 Oracle Trainer (`vmm/oracle_trainer.py`) — Layer 2
+
+Background daemon that warms a `MemoryOracle` from existing access logs and incrementally trains on new events. Uses `OracleDataCleaner` for full 7-step cleaning on every batch.
+
+- `start()` — spawns daemon thread; immediately warms from all `.jsonl` files in `log_dir`
+- Poll loop reads new lines from log files (tail-follow via `seek(offset)`), buffers per-file, writes to temp file, cleans, and feeds to oracle
+- Retains lines from incomplete sequences across polls (may reach `min_sequence_length` on next poll)
+
+### 4.12 Federation (`vmm/federation.py`) — Layer 3
+
+TCP gossip protocol for sharing Oracle Markov transitions across cluster nodes. Each node periodically broadcasts its transition table to all known peers, accelerating convergence without centralised coordination.
+
+```python
+class FederationManager:
+    def __init__(self, oracle, node_id="", peers=None,
+                 gossip_port=18600, gossip_interval_s=5.0)
+    def start()   # starts sender + receiver daemon threads
+    def stop()
+    def stats() -> FederationStats
+```
+
+**Protocol** — length-prefixed JSON frames over TCP (same framing as `remote_block.py`: 4-byte big-endian length + JSON payload).
+
+**Sender loop** — every `gossip_interval_s`, reads `oracle._transitions` under `oracle._lock`, serialises as `GossipBatch`, and sends to each peer.
+
+**Receiver loop** — TCP listener on `gossip_port`. For each incoming batch, deserialises and merges into the local oracle. Merge uses max-count semantics (takes the higher count for each transition) to avoid double-counting.
+
+**Self-filtering** — batches from the same `node_id` are silently dropped.
+
+**Dataclasses:**
+- `TransitionGossip(frozen)`: `from_block`, `to_block`, `count`
+- `GossipBatch(frozen)`: `node_id`, `epoch`, `transitions`
+- `FederationStats`: `node_id`, `peers_known`, `batches_sent`, `batches_received`, `transitions_merged`, `last_gossip_epoch`
+
+**Environment variables:** `MEMOPT_NODE_ID` (default `"node_0"`), `MEMOPT_NODE_HOSTS` (comma-separated `host:port` peers).
+
+### 4.13 Elastic Allocator (`vmm/elastic_allocator.py`) — Layer 3
+
+Decides WHERE to promote predicted blocks based on prediction confidence (urgency) and current memory state across local and remote nodes.
+
+```python
+class ElasticAllocator:
+    def __init__(self, hw_profile, node_id="", remote_nodes=None)
+    def decide(self, confidence, block_size_bytes=131_072) -> AllocationDecision
+    def update_node_state(self, state: NodeMemoryState)
+    def stats() -> AllocatorStats
+```
+
+**Decision priority:**
+
+| Priority | Condition | Target |
+|----------|-----------|--------|
+| 1 | urgency >= 0.8, local HBM free | `hbm` (local) |
+| 2 | urgency >= 0.7, remote HBM free | `remote_hbm` |
+| 3 | urgency >= 0.5, local DRAM free | `dram` (local) |
+| 4 | local DRAM free | `dram` (fallback) |
+| 5 | no space | `nvme` (fallback) |
+
+**Dataclasses:**
+- `NodeMemoryState(frozen)`: `node_id`, `hbm_used_gb`, `hbm_total_gb`, `dram_used_gb`, `dram_total_gb`, `is_local`
+- `AllocationDecision(frozen)`: `target_tier`, `target_node`, `urgency`, `reason`
+- `AllocatorStats`: `decisions_made`, `local_hbm`, `local_dram`, `remote_hbm`, `fallback_nvme`
+
+`update_node_state()` allows dynamic updates from remote nodes (e.g. via gossip or control plane heartbeats).
+
+### 4.14 Memory Governor (`vmm/memory_governor.py`) — Layer 3
+
+Watches HBM pressure, adjusts Oracle horizon, integrates DriftDetector from Pillar 6, and reports to the control plane.
+
+```python
+class MemoryGovernor:
+    def __init__(self, oracle, hw_profile, drift_detector=None,
+                 poll_interval_s=2.0, control_plane_url="", node_id="",
+                 hbm_used_gb_override=None)
+    def start()   # daemon thread
+    def stop()
+    def pressure_level() -> str
+    def stats() -> GovernorStats
+    def set_hbm_used_gb(used_gb)  # for testing without GPU
+```
+
+**Pressure levels and horizon scaling:**
+
+| Level | HBM utilization | Horizon multiplier |
+|-------|----------------|-------------------|
+| `PRESSURE_NORMAL` | < 70% | 1.0x (full horizon) |
+| `PRESSURE_ELEVATED` | 70–90% | 0.5x |
+| `PRESSURE_CRITICAL` | > 90% | 0.25x |
+
+**Poll cycle:**
+1. Compute HBM utilization (from `torch.cuda.memory_allocated()` or `hbm_used_gb_override` for testing)
+2. Determine pressure level
+3. Adjust `oracle._horizon` under `oracle._lock` (only on actual change)
+4. Check `DriftDetector.is_drifted()` if attached
+5. POST status to control plane via `urllib.request` if URL configured
+
+**Environment variables:** `MEMOPT_CONTROL_PLANE_URL`, `MEMOPT_NODE_ID`.
+
+### 4.15 Test Coverage
+
+- `test_vmm_smoke.py`: allocate/fetch/free, stats, prefetch recording, multi-sequence isolation, error handling, tenant isolation, Layer 1 integration (13 tests)
 - `test_vmm_benchmark.py`: tier capacity, prefetch hit rate, promotion latency, DMA bandwidth + 2 CPU CI tests (9 tests, 3 GPU-only skips)
+- `test_oracle.py`: oracle instantiation, observe/predict, confidence ordering, min confidence filter, record outcome accuracy, stats fields, reset, warm from log, trainer start/stop/ingest, cleaner malformed JSON, invalid fields, short sequences, dedup window, truncation, stats summary, missing file, directory merge (23 tests)
+- `test_layer3.py`: federation instantiation/serialization/build/merge/TCP integration, allocator tier decisions/remote HBM/stats/frozen, governor pressure levels/horizon scaling/stats (25 tests)
 
 ---
 
@@ -1722,7 +1942,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**218 tests pass, 6 skipped.** The 6 skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**286 tests pass, 7 skipped.** The skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
@@ -1732,8 +1952,10 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `kernels/tests/test_feedback_loop.py` | 10 | 10 PASS (Pillar 3 — feedback loop + drift re-synthesis) |
 | `kernels/tests/test_control_plane_callback.py` | 6 | 6 PASS (Pillar 6 — control plane callback) |
 | `serving/tests/test_serving_kernels.py` | 11 | 11 PASS |
-| `vmm/tests/test_vmm_smoke.py` | 10 | 10 PASS (4 new: tenant isolation) |
+| `vmm/tests/test_vmm_smoke.py` | 13 | 13 PASS (tenant isolation + Layer 1 integration) |
 | `vmm/tests/test_vmm_benchmark.py` | 7 | 4 PASS, 3 SKIP (GPU) |
+| `vmm/tests/test_oracle.py` | 23 | 23 PASS (Layer 2 — oracle + cleaner + trainer) |
+| `vmm/tests/test_layer3.py` | 25 | 25 PASS (Layer 3 — federation + allocator + governor) |
 | `cluster/tests/test_gkd.py` | 15 | 15 PASS (2 new: backend_degraded key, Redis degradation) |
 | `cluster/tests/test_lcp_prefix.py` | 18 | 18 PASS (Pillar 2 — LCP prefix matching) |
 | `cluster/tests/test_cluster.py` | 19 | 19 PASS |

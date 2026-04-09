@@ -2,8 +2,13 @@
 Smoke test — runs on any hardware without a GPU.
 Tests the full stack: allocate → fetch → promote → evict → free.
 """
+import json
+import tempfile
+
 import pytest
 from memopt.vmm import VMM
+from memopt.vmm.access_log import AccessLog
+from memopt.vmm.prefetch_engine import PrefetchEngine
 
 
 def test_basic_allocate_fetch_free():
@@ -99,3 +104,45 @@ def test_cross_tenant_free_raises():
     with pytest.raises(PermissionError):
         vmm.free_sequence("seq_locked", tenant_id="bob")
     vmm.free_sequence("seq_locked", tenant_id="alice")
+
+
+# ── Layer 1: access log + universal profile integration ──────────────
+
+def test_prefetch_engine_logs_access_event():
+    """PrefetchEngine emits BlockAccessEvent to AccessLog when provided."""
+    with tempfile.TemporaryDirectory() as td:
+        log = AccessLog(log_dir=td)
+        vmm = VMM()
+        vmm.prefetch = PrefetchEngine(vmm.tier_manager, access_log=log)
+
+        vmm.prefetch.record_access(
+            "seq_log", 0,
+            token_position=42, attention_layer=3,
+        )
+        log.shutdown()
+
+        path = log.stats()["log_file_path"]
+        with open(path) as f:
+            obj = json.loads(f.readline())
+        assert obj["token_position"] == 42
+        assert obj["attention_layer"] == 3
+        assert obj["sequence_id"] == "seq_log"
+
+
+def test_prefetch_engine_hw_profile_not_none():
+    """PrefetchEngine always detects a hardware profile."""
+    vmm = VMM()
+    profile = vmm.prefetch.get_hw_profile()
+    assert profile is not None
+    assert isinstance(profile.architecture, str) and profile.architecture != ""
+    assert len(profile.tiers) >= 1
+
+
+def test_prefetch_engine_works_without_access_log():
+    """Backward compat: PrefetchEngine works with no access_log argument."""
+    vmm = VMM()
+    vmm.allocate("seq_compat", 0, 512)
+    vmm.allocate("seq_compat", 1, 512)
+    vmm.fetch("seq_compat", 0)
+    vmm.fetch("seq_compat", 1)
+    vmm.free_sequence("seq_compat")
