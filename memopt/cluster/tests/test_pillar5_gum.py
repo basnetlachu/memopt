@@ -351,3 +351,52 @@ def test_concurrent_block_requests():
         assert len(results) == n_clients
         for r in results:
             assert r == data, "All concurrent fetches must return correct data"
+
+
+# ── TierManager GUM integration ──────────────────────────────────────
+
+def test_tier_manager_accepts_gum_params():
+    """TierManager constructor accepts GUM parameters without error."""
+    from memopt.vmm.tier_manager import TierManager
+    from memopt.vmm.page_table import PageTable
+    from unittest.mock import MagicMock
+
+    pt = PageTable()
+    mock_client = MagicMock()
+    mock_dir = MagicMock()
+
+    tm = TierManager(
+        pt,
+        remote_client=mock_client,
+        block_directory=mock_dir,
+        node_id="test-node")
+
+    assert tm._remote_client is mock_client
+    assert tm._block_directory is mock_dir
+    assert tm._node_id == "test-node"
+
+
+def test_tier_manager_stats_shows_gum_enabled():
+    """stats() should report gum_enabled=True when configured."""
+    from memopt.vmm.tier_manager import TierManager
+    from memopt.vmm.page_table import PageTable
+    from unittest.mock import MagicMock
+
+    pt = PageTable()
+    tm = TierManager(pt,
+                     remote_client=MagicMock(),
+                     block_directory=MagicMock(),
+                     node_id="n1")
+    s = tm.stats()
+    assert s["gum_enabled"] is True
+
+
+def test_tier_manager_stats_shows_gum_disabled():
+    """stats() should report gum_enabled=False by default."""
+    from memopt.vmm.tier_manager import TierManager
+    from memopt.vmm.page_table import PageTable
+
+    pt = PageTable()
+    tm = TierManager(pt)
+    s = tm.stats()
+    assert s["gum_enabled"] is False

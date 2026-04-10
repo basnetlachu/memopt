@@ -308,6 +308,14 @@ class CertifyDaemon:
     def drift_stats(self) -> dict:
         return self._drift.stats()
 
+    def certify_now(self, reason: str = "") -> None:
+        """Trigger immediate certification. Safe to call from any thread."""
+        logger.info(f"certify_now() triggered: {reason}")
+        try:
+            self._run_once()
+        except Exception as e:
+            logger.error(f"certify_now() failed: {e}", exc_info=True)
+
     def _loop(self) -> None:
         if self._on_startup:
             self._run_once()

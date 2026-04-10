@@ -58,6 +58,7 @@ _node_id: str = ""
 
 # Pillar 6 — CertifyDaemon for drift detection + re-synthesis
 _certify_daemon: object = None
+_power_sampler: object = None
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
@@ -106,8 +107,9 @@ if _HAS_FASTAPI:
     @app.get("/report/found-capacity")
     def found_capacity_report():
         """
-        Report real GKD deduplication stats and ledger totals.
-        All numbers are measured, not estimated.
+        Report GKD deduplication stats and ledger totals.
+        Energy savings are real measurements when PowerSampler is active,
+        estimated from GKD hit rate when PowerSampler is unavailable.
         """
         gkd_stats = _gkd_store.stats() if _gkd_store is not None else {}
         ledger_totals = {}
@@ -117,6 +119,12 @@ if _HAS_FASTAPI:
                 ledger_totals = _p4_ledger.totals()
         except Exception:
             pass
+
+        # Distinguish measured vs estimated savings
+        has_power = (_power_sampler is not None
+                     and getattr(_power_sampler, 'available', False))
+        energy_kwh = ledger_totals.get("energy_saved_kwh")
+        has_real_energy = (energy_kwh is not None and has_power)
 
         return {
             "gkd": {
@@ -130,6 +138,14 @@ if _HAS_FASTAPI:
                 "backend_degraded":         gkd_stats.get("backend_degraded", False),
             },
             "ledger": ledger_totals,
+            "energy_savings": {
+                "measured": has_real_energy,
+                "power_sampler_active": has_power,
+                "note": ("real NVML power measurements"
+                         if has_real_energy
+                         else "estimated from GKD hit rate — "
+                              "install pynvml for real measurements"),
+            },
             "node_id": _node_id,
             "generated_at": time.time(),
         }
@@ -206,12 +222,64 @@ if _HAS_FASTAPI:
             except Exception:
                 pass  # GKD failure must never block inference
 
-        # Submit to engine (blocking in executor so we don't block the event loop)
-        # NOTE: Even on GKD hit, we still run full inference because the engine
-        # does not yet support "decode from block_ref" or partial-prefix compute.
-        # The GKD lookup above builds the dedup index and tracks hit stats for
-        # the /report/found-capacity endpoint. Actual compute-skip requires
-        # engine integration (future work).
+        # ── GKD exact hit → skip inference ────────────────────────────
+        # On exact hit with cached output: return directly without
+        # calling engine.run_sync(). This is the core dedup value prop.
+        if gkd_hit is not None and not gkd_hit.is_partial:
+            try:
+                cached_output = _gkd_store.get_output(
+                    gkd_hit.block_ref)
+                if cached_output is not None:
+                    log.debug(
+                        "GKD exact hit: skipping inference "
+                        "for %d tokens (block_ref=%s)",
+                        seq_len, gkd_hit.block_ref)
+                    # Record hit in Pillar 4 metrics
+                    try:
+                        from memopt.api.server import (
+                            _p4_collector, _p4_ledger)
+                        if _p4_collector is not None:
+                            _p4_collector.record_request(
+                                cached_output.get(
+                                    "completion_tokens", 0))
+                        if _p4_ledger is not None:
+                            _p4_ledger.record(
+                                tokens=cached_output.get(
+                                    "completion_tokens", 0),
+                                tenant_id="_default",
+                                gkd_hit_rate_pct=100.0,
+                            )
+                    except Exception:
+                        pass
+                    return CompletionResponse(
+                        id=f"cmpl-{uuid.uuid4().hex[:8]}",
+                        model=request.model,
+                        choices=[CompletionChoice(
+                            text=cached_output.get("text", ""),
+                            index=0,
+                            finish_reason="stop",
+                        )],
+                        usage=CompletionUsage(
+                            prompt_tokens=seq_len,
+                            completion_tokens=cached_output.get(
+                                "completion_tokens", 0),
+                            total_tokens=seq_len + cached_output.get(
+                                "completion_tokens", 0),
+                        ),
+                    )
+            except Exception:
+                pass  # get_output failure → fall through to inference
+
+        if gkd_hit is not None and gkd_hit.is_partial:
+            log.debug(
+                "GKD partial hit: %s/%d tokens cached "
+                "(full inference still required)",
+                gkd_hit.matched_len, seq_len)
+
+        # ── Full miss or partial hit: run inference ───────────────────
+        import time as _time
+        _t_start = _time.perf_counter()
+
         loop = asyncio.get_event_loop()
         results: List[Request] = await loop.run_in_executor(
             None,
@@ -222,7 +290,37 @@ if _HAS_FASTAPI:
             ),
         )
 
+        _elapsed_s = _time.perf_counter() - _t_start
         result = results[0]
+
+        # ── Measure actual J/token from PowerSampler ──────────────────
+        actual_j_per_token = None
+        if (_power_sampler is not None
+                and result.tokens_generated > 0
+                and _elapsed_s > 0):
+            try:
+                avg_watts = _power_sampler.current_avg_watts()
+                if avg_watts > 0:
+                    total_joules = avg_watts * _elapsed_s
+                    actual_j_per_token = (
+                        total_joules / result.tokens_generated)
+                    log.debug(
+                        "Energy: %.4f J/token (%d tokens, %.1fms, "
+                        "%.1fW avg)",
+                        actual_j_per_token,
+                        result.tokens_generated,
+                        _elapsed_s * 1000,
+                        avg_watts)
+            except Exception:
+                pass  # measurement failure must never block response
+
+        # Decode output
+        if _tokenizer is not None:
+            prompt_len = input_ids.shape[1]
+            new_ids = result.output_ids[0, prompt_len:].tolist()
+            text = _tokenizer.decode(new_ids, skip_special_tokens=True)
+        else:
+            text = " ".join(str(t) for t in result.output_ids[0].tolist())
 
         # Pillar 1+2 — register into GKD for future dedup (only on miss)
         if _gkd_store is not None and gkd_hit is None:
@@ -234,18 +332,15 @@ if _HAS_FASTAPI:
                     block_ref=block_ref,
                     node_id=_node_id,
                 )
+                # Store output alongside block_ref for future exact hits
+                _gkd_store.register_output(block_ref, {
+                    "text": text,
+                    "completion_tokens": result.tokens_generated,
+                })
             except Exception:
                 pass  # registration failure must never block response
 
-        # Decode output
-        if _tokenizer is not None:
-            prompt_len = input_ids.shape[1]
-            new_ids = result.output_ids[0, prompt_len:].tolist()
-            text = _tokenizer.decode(new_ids, skip_special_tokens=True)
-        else:
-            text = " ".join(str(t) for t in result.output_ids[0].tolist())
-
-        # Pillar 4 — record metrics and ledger entry
+        # Pillar 4 — record metrics with real energy measurement
         try:
             from memopt.api.server import _p4_collector, _p4_ledger
             if _p4_collector is not None:
@@ -255,6 +350,7 @@ if _HAS_FASTAPI:
                 _p4_ledger.record(
                     tokens=result.tokens_generated,
                     tenant_id="_default",
+                    actual_j_per_token=actual_j_per_token,
                     gkd_hit_rate_pct=gkd_stats.get("hit_rate_pct"),
                 )
         except Exception:
@@ -337,6 +433,18 @@ def _build_engine(
             f"Auto-optimizer startup failed: {e} — serving without kernel optimisation"
         )
 
+    # Pillar 4 — PowerSampler for real energy measurement
+    global _power_sampler
+    try:
+        from memopt.profiler.power_sampler import PowerSampler
+        _power_sampler = PowerSampler(interval_ms=100)
+        _power_sampler.start()
+        log.info("PowerSampler active (NVML %s)",
+                 "available" if _power_sampler.available else "unavailable")
+    except Exception as e:
+        _power_sampler = None
+        log.warning("PowerSampler unavailable: %s", e)
+
     # Pillar 4 — wire MetricsCollector to data sources
     try:
         from memopt.api.server import _p4_collector, _p4_ledger
@@ -344,6 +452,8 @@ def _build_engine(
             if _p3_kv_cache is not None:
                 from memopt.serving import kernel_hooks as _kh
                 _p4_collector.register_kernel_hooks(_kh)
+            if _power_sampler is not None:
+                _p4_collector.register_power_sampler(_power_sampler)
             log.info("MetricsCollector: data sources registered")
     except Exception as e:
         log.debug("MetricsCollector wiring skipped: %s", e)

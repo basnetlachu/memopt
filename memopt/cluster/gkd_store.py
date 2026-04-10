@@ -12,37 +12,28 @@ Architecture:
     GKDStore
     ├── HashEngine          — SHA-256 + collision verification
     ├── LocalGKDBackend     — dict-based, single-node, no dependencies
-    └── RedisGKDBackend     — Redis-based, cluster-wide, production
+    └── RedisGKDBackend     — Redis or Redis Cluster, production
 
-Integration with VMM:
-    When the VMM allocates a new KV block, it calls:
-        hit = gkd.lookup(token_ids, sequence_length)
-        if hit:
-            return hit.block_ref   # skip allocation entirely
-        else:
-            block = vmm.allocate(...)
-            gkd.register(token_ids, sequence_length, block_ref)
-
-Instrumentation (critical for design partner demos):
-    gkd.stats() returns:
-        - total_lookups
-        - cache_hits
-        - cache_misses
-        - hit_rate_pct
-        - estimated_hbm_saved_gb   ← the number that sells the product
-        - estimated_compute_saved_pct
-        - collision_checks_total
-        - collision_detections_total   ← must always be 0
+Redis deployment options (set via REDIS_URL environment variable):
+    Single instance:
+        REDIS_URL=redis://localhost:6379
+    Redis Cluster (3+ nodes, production):
+        REDIS_URL=redis://node1:6379,redis://node2:6379,redis://node3:6379
+    Redis Sentinel (HA single instance):
+        REDIS_URL=redis+sentinel://sentinel1:26379/mymaster
 """
 from __future__ import annotations
-import time
+import json
 import logging
+import os
+import time
 import threading
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
 from .hashing import compute_hash, make_fingerprint, verify_fingerprint
+from .prefix_index import _verify_fingerprint_fast
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +42,12 @@ logger = logging.getLogger(__name__)
 class GKDEntry:
     """One entry in the dedup store."""
     content_hash:  str
-    fingerprint:   List[int]      # first 64 tokens for collision check
-    block_ref:     str            # VMM block identifier (sequence_id:block_index)
-    node_id:       str            # which node holds the physical block
-    size_bytes:    int            # size of the cached KV block
+    fingerprint:   List[int]
+    block_ref:     str
+    node_id:       str
+    size_bytes:    int
     registered_at: float = field(default_factory=time.monotonic)
-    hit_count:     int = 0        # how many times this entry was served
+    hit_count:     int = 0
 
 
 @dataclass
@@ -66,19 +57,15 @@ class GKDHit:
     node_id:     str
     size_bytes:  int           = 0
     hit_count:   int           = 0
-    matched_len: Optional[int] = None   # tokens matched (None = full)
-    delta_start: Optional[int] = None   # recompute from here
-    is_partial:  bool          = False  # True = LCP match
+    matched_len: Optional[int] = None
+    delta_start: Optional[int] = None
+    is_partial:  bool          = False
 
 
 class LocalGKDBackend:
     """
     In-memory backend for single-node development and testing.
-
     Thread-safe via RLock. No external dependencies.
-    All data is lost when the process exits — this is intentional.
-    Production deployments use RedisGKDBackend for persistence and
-    cross-node sharing.
     """
 
     def __init__(self):
@@ -89,15 +76,18 @@ class LocalGKDBackend:
         with self._lock:
             return self._store.get(content_hash)
 
-    def set(self, content_hash: str, entry: dict, ttl_seconds: int = 3600):
-        """TTL is ignored in the local backend — entries live until evicted or cleared."""
+    def set(self, content_hash: str, entry, ttl_seconds: int = 3600):
         with self._lock:
-            self._store[content_hash] = entry
+            if isinstance(entry, str):
+                self._store[content_hash] = entry
+            else:
+                self._store[content_hash] = entry
 
     def increment_hit(self, content_hash: str):
         with self._lock:
-            if content_hash in self._store:
-                self._store[content_hash]["hit_count"] += 1
+            e = self._store.get(content_hash)
+            if e and isinstance(e, dict):
+                e["hit_count"] = e.get("hit_count", 0) + 1
 
     def delete(self, content_hash: str):
         with self._lock:
@@ -111,72 +101,165 @@ class LocalGKDBackend:
         with self._lock:
             self._store.clear()
 
+    def pipeline_get(self, keys: List[str]) -> List[Optional[str]]:
+        """Batch get — returns results in same order as keys."""
+        with self._lock:
+            return [self._store.get(k) for k in keys]
+
 
 class RedisGKDBackend:
     """
     Redis-backed backend for cluster-wide deduplication.
 
-    All nodes in the cluster connect to the same Redis instance.
-    A KV block computed on Node A is immediately available to Node B.
-
-    Redis key format:  gkd:v1:{content_hash}
-    Redis value:       JSON-serialised GKDEntry fields
-    TTL:               Configurable, default 1 hour. Entries expire
-                       automatically — no manual eviction needed.
+    Supports both single Redis instance and Redis Cluster.
+    Selection is automatic based on the URL format:
+        Single:  redis://host:port
+        Cluster: redis://host1:port1,redis://host2:port2,...
 
     Failure mode:
-        If Redis is unreachable, all operations log a warning and return
-        None (treated as cache miss). The system degrades gracefully to
-        no deduplication — it never crashes inference.
+        If Redis is unreachable, all operations fall back to
+        LocalGKDBackend. The system degrades gracefully —
+        deduplication is disabled but inference never crashes.
     """
 
     _KEY_PREFIX = "gkd:v1:"
 
     def __init__(self, host: str = "localhost", port: int = 6379,
                  db: int = 0, password: Optional[str] = None,
-                 socket_timeout: float = 0.005):
-        """
-        Args:
-            host:             Redis hostname or IP.
-            port:             Redis port (default 6379).
-            db:               Redis DB index (default 0).
-            password:         Redis AUTH password, if set.
-            socket_timeout:   Max wait per Redis operation in seconds.
-                              0.005 = 5ms. Keeps GKD lookup off the
-                              hot inference path even if Redis is slow.
-        """
+                 socket_timeout: float = 0.005,
+                 redis_url: Optional[str] = None):
         self._degraded       = False
         self._degraded_since: Optional[float] = None
+        self._redis          = None
+        self._cluster_mode   = False
+        self._local_fallback = LocalGKDBackend()
+        self._available      = False
+        self._redis_url      = redis_url
+        self._json           = json
 
+        if redis_url:
+            self._connect(redis_url)
+        else:
+            # Legacy host/port path
+            try:
+                import redis as redis_lib
+                self._redis = redis_lib.Redis(
+                    host=host, port=port, db=db,
+                    password=password,
+                    socket_timeout=socket_timeout,
+                    decode_responses=True,
+                )
+                self._redis.ping()
+                self._available = True
+                self._cluster_mode = False
+                logger.info("GKD Redis connected: %s:%d", host, port)
+            except Exception as e:
+                self._mark_degraded(str(e))
+
+    def _connect(self, redis_url: str) -> None:
+        """
+        Connect to Redis. Tries Redis Cluster first if multiple URLs
+        are provided, falls back to single instance.
+
+        URL formats:
+            Single:  redis://host:port
+            Cluster: redis://host1:port1,redis://host2:port2,...
+        """
         try:
-            import redis, json
-            self._redis = redis.Redis(
-                host=host, port=port, db=db,
-                password=password,
-                socket_timeout=socket_timeout,
+            import redis as redis_lib
+        except ImportError:
+            self._mark_degraded("redis package not installed")
+            return
+
+        urls = [u.strip() for u in redis_url.split(",")]
+
+        # ── Redis Cluster path (multiple URLs) ────────────────────────
+        if len(urls) > 1:
+            try:
+                from redis.cluster import RedisCluster
+            except ImportError:
+                logger.warning(
+                    "redis.cluster not available — "
+                    "install redis>=4.1 for cluster support")
+                # Fall through to single instance with first URL
+                urls = [urls[0]]
+            else:
+                startup_nodes = []
+                for url in urls:
+                    parsed = urllib.parse.urlparse(url)
+                    startup_nodes.append({
+                        "host": parsed.hostname or "localhost",
+                        "port": parsed.port or 6379,
+                    })
+                try:
+                    client = RedisCluster(
+                        startup_nodes=startup_nodes,
+                        decode_responses=True,
+                        skip_full_coverage_check=True,
+                        retry_on_timeout=True,
+                        socket_timeout=2.0,
+                        socket_connect_timeout=2.0,
+                    )
+                    client.ping()
+                    self._redis = client
+                    self._cluster_mode = True
+                    self._available = True
+                    logger.info(
+                        "GKD Redis Cluster connected (%d nodes)",
+                        len(startup_nodes))
+                    return
+                except Exception as e:
+                    logger.warning(
+                        "GKD Redis Cluster failed: %s — "
+                        "trying single instance", e)
+
+        # ── Single instance path ──────────────────────────────────────
+        try:
+            client = redis_lib.Redis.from_url(
+                urls[0],
+                socket_timeout=2.0,
+                socket_connect_timeout=2.0,
+                retry_on_timeout=True,
                 decode_responses=True,
             )
-            self._json = json
+            client.ping()
+            self._redis = client
+            self._cluster_mode = False
             self._available = True
-            self._redis.ping()
-            logger.info("GKD Redis backend connected: %s:%d", host, port)
+            logger.info("GKD Redis single instance connected")
         except Exception as e:
-            self._available = False
-            self._local_fallback = LocalGKDBackend()
-            self._mark_degraded(str(e))
+            self._mark_degraded(f"Redis unavailable: {e}")
 
     def _mark_degraded(self, reason: str) -> None:
-        """Mark this backend as degraded and log at ERROR level once."""
         if not self._degraded:
             self._degraded       = True
             self._degraded_since = time.monotonic()
             logger.error(
                 "GKD Redis DEGRADED: %s. "
                 "Falling back to local backend — cluster-wide "
-                "deduplication is disabled. "
-                "Check Redis connectivity and set REDIS_URL.",
+                "deduplication is disabled.",
                 reason,
             )
+
+    def _health_check(self) -> bool:
+        """Called by MetricsCollector every 15s."""
+        if self._redis is None:
+            return False
+        try:
+            self._redis.ping()
+            if self._degraded:
+                logger.info("GKD Redis recovered")
+                self._degraded = False
+                self._degraded_since = None
+            return True
+        except Exception as e:
+            self._mark_degraded(f"Redis ping failed: {e}")
+            return False
+
+    def reconnect(self) -> None:
+        """Attempt to reconnect using the original URL."""
+        if self._redis_url:
+            self._connect(self._redis_url)
 
     @property
     def degraded(self) -> bool:
@@ -199,14 +282,15 @@ class RedisGKDBackend:
             logger.debug("GKD Redis GET failed: %s", e)
             return None
 
-    def set(self, content_hash: str, entry: dict, ttl_seconds: int = 3600):
+    def set(self, content_hash: str, entry, ttl_seconds: int = 3600):
         if not self._available:
             return self._local_fallback.set(content_hash, entry, ttl_seconds)
         try:
+            val = entry if isinstance(entry, str) else self._json.dumps(entry)
             self._redis.setex(
                 self._key(content_hash),
                 ttl_seconds,
-                self._json.dumps(entry),
+                val,
             )
         except Exception as e:
             logger.debug("GKD Redis SET failed: %s", e)
@@ -231,7 +315,8 @@ class RedisGKDBackend:
         if not self._available:
             return self._local_fallback.size()
         try:
-            cursor, keys = self._redis.scan(0, match=f"{self._KEY_PREFIX}*", count=1000)
+            cursor, keys = self._redis.scan(
+                0, match=f"{self._KEY_PREFIX}*", count=1000)
             return len(keys)
         except Exception:
             return -1
@@ -242,13 +327,45 @@ class RedisGKDBackend:
         try:
             cursor = 0
             while True:
-                cursor, keys = self._redis.scan(cursor, match=f"{self._KEY_PREFIX}*", count=500)
+                cursor, keys = self._redis.scan(
+                    cursor, match=f"{self._KEY_PREFIX}*", count=500)
                 if keys:
                     self._redis.delete(*keys)
                 if cursor == 0:
                     break
         except Exception as e:
             logger.debug("GKD Redis CLEAR failed: %s", e)
+
+    def pipeline_get(self, keys: List[str]) -> List[Optional[str]]:
+        """
+        Batch get using Redis pipeline — one round-trip for all keys.
+
+        For Redis Cluster: uses pipeline(transaction=False) which
+        works across cluster slots (non-atomic but correct for reads).
+        For single Redis: standard pipeline.
+
+        Returns results in same order as keys.
+        Falls back to sequential gets on error.
+        """
+        if not self._available:
+            return self._local_fallback.pipeline_get(keys)
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            for k in keys:
+                pipe.get(self._key(k))
+            raw_results = pipe.execute()
+            results = []
+            for raw in raw_results:
+                if raw is not None:
+                    results.append(raw)
+                else:
+                    results.append(None)
+            return results
+        except Exception as e:
+            logger.debug("GKD Redis pipeline failed: %s — "
+                         "falling back to sequential", e)
+            # Sequential fallback
+            return [self.get(k) for k in keys]
 
 
 class GKDStore:
@@ -262,23 +379,11 @@ class GKDStore:
         # Single-node development
         gkd = GKDStore()
 
-        # Cluster production
+        # Cluster production (single Redis)
         gkd = GKDStore(backend="redis", redis_host="redis.internal")
 
-        # In VMM allocation path:
-        hit = gkd.lookup(token_ids=[101, 202, 303, ...], sequence_length=512)
-        if hit:
-            # Skip KV computation entirely — serve from hit.block_ref
-            pass
-        else:
-            block = vmm.allocate(seq_id, block_index, size_bytes)
-            gkd.register(
-                token_ids=token_ids,
-                sequence_length=512,
-                block_ref=f"{seq_id}:{block_index}",
-                node_id="node-a",
-                size_bytes=block_size,
-            )
+        # Cluster production (Redis Cluster)
+        gkd = GKDStore(redis_url="redis://n1:6379,redis://n2:6379,redis://n3:6379")
     """
 
     def __init__(
@@ -292,35 +397,18 @@ class GKDStore:
         redis_url: Optional[str] = None,
         node_id: str = "local",
     ):
-        """
-        Args:
-            backend:             "local" (default, no deps) or "redis" (cluster).
-            redis_host:          Redis hostname. Used only when backend="redis".
-            redis_port:          Redis port.
-            redis_password:      Redis AUTH password.
-            default_ttl_seconds: How long entries live without being accessed.
-                                 1 hour default. Popular prompts stay hot.
-            block_size_bytes:    Default KV block size in bytes.
-                                 Used to estimate HBM saved in stats().
-            redis_url:           Optional redis:// or rediss:// URL. When provided,
-                                 overrides redis_host/redis_port/redis_password and
-                                 forces backend="redis".
-            node_id:             Identifier for this node in stats and logs.
-        """
         self._node_id = node_id
 
         if redis_url is not None:
-            # Parse redis[s]://[:password@]host[:port][/db]
-            parsed       = urllib.parse.urlparse(redis_url)
-            redis_host   = parsed.hostname or "localhost"
-            redis_port   = parsed.port or 6379
-            redis_password = parsed.password or redis_password
-            backend      = "redis"
+            backend = "redis"
 
         if backend == "redis":
-            self._backend = RedisGKDBackend(
-                host=redis_host, port=redis_port, password=redis_password
-            )
+            if redis_url:
+                self._backend = RedisGKDBackend(redis_url=redis_url)
+            else:
+                self._backend = RedisGKDBackend(
+                    host=redis_host, port=redis_port,
+                    password=redis_password)
         else:
             self._backend = LocalGKDBackend()
 
@@ -339,6 +427,52 @@ class GKDStore:
         self._lcp_tokens_reused: int = 0
         self._lcp_tokens_total:  int = 0
 
+        # Output cache: block_ref → completion output dict.
+        # Used by exact-hit path in serving/server.py to skip inference.
+        # Max 10K entries; evicts oldest on overflow.
+        self._output_cache: Dict[str, dict] = {}
+        self._output_cache_lock = threading.Lock()
+
+        # Background TTL enforcement for LocalGKDBackend
+        # (RedisGKDBackend uses native Redis EXPIRE)
+        self._ttl_thread = threading.Thread(
+            target=self._ttl_enforce_loop,
+            daemon=True, name="gkd-ttl")
+        self._ttl_thread.start()
+
+    # ── TTL enforcement ───────────────────────────────────────────────
+
+    def _ttl_enforce_loop(self) -> None:
+        """Remove expired entries every 5 minutes."""
+        while True:
+            time.sleep(300)
+            try:
+                self._enforce_ttl()
+            except Exception as e:
+                logger.error(f"TTL enforcement error: {e}")
+
+    def _enforce_ttl(self) -> None:
+        """Remove entries older than MEMOPT_GKD_ENTRY_TTL_S from local backend."""
+        ttl_s = float(os.environ.get('MEMOPT_GKD_ENTRY_TTL_S',
+                                      str(self._ttl)))
+        cutoff = time.time() - ttl_s
+        removed = 0
+        try:
+            if hasattr(self._backend, '_store'):
+                with self._backend._lock:
+                    expired = [
+                        k for k, v in self._backend._store.items()
+                        if isinstance(v, dict) and
+                        v.get('registered_at', 0) < cutoff]
+                    for k in expired:
+                        del self._backend._store[k]
+                        removed += 1
+            if removed > 0:
+                logger.info(
+                    f"GKD TTL: removed {removed} expired entries")
+        except Exception as e:
+            logger.debug(f"TTL enforce failed: {e}")
+
     # ── Primary API ────────────────────────────────────────────────────
 
     def lookup(
@@ -349,20 +483,7 @@ class GKDStore:
         """
         Look up whether a KV block for this token sequence already exists.
 
-        Args:
-            token_ids:        The prompt token IDs (prefix that drives KV cache).
-            sequence_length:  Total length — used in hash to prevent prefix
-                              collisions.
-
-        Returns:
-            GKDHit  if a verified cache entry exists — caller should skip
-                    KV computation and use hit.block_ref directly.
-            None    if no entry exists (cache miss) — caller should compute
-                    normally then call register().
-
-        Performance:
-            Local backend: ~0.01ms
-            Redis backend: ~0.5–2ms (network RTT to Redis)
+        Returns GKDHit on cache hit, None on cache miss.
         """
         with self._lock:
             self._total_lookups += 1
@@ -371,27 +492,12 @@ class GKDStore:
         raw = self._backend.get(content_hash)
 
         if raw is None:
-            # LCP fallback — only reached on exact miss
+            # LCP fallback — pipelined prefix lookup
             try:
-                from memopt.cluster.prefix_index import lookup_longest_prefix
-                result = lookup_longest_prefix(
-                    token_ids, sequence_length, self._backend
-                )
-                if result is not None:
-                    block_ref, node_id, matched_len = result
-                    with self._lock:
-                        self._cache_hits        += 1
-                        self._lcp_hits          += 1
-                        self._lcp_tokens_reused += matched_len
-                        self._lcp_tokens_total  += sequence_length
-                    return GKDHit(
-                        block_ref   = block_ref,
-                        node_id     = node_id,
-                        hit_count   = 1,
-                        matched_len = matched_len,
-                        delta_start = matched_len,
-                        is_partial  = True,
-                    )
+                lcp_hit = self._pipelined_lcp_lookup(
+                    token_ids, sequence_length)
+                if lcp_hit is not None:
+                    return lcp_hit
             except Exception as exc:
                 logger.debug("GKD LCP lookup failed: %s", exc)
 
@@ -399,17 +505,17 @@ class GKDStore:
                 self._cache_misses += 1
             return None
 
-        # Collision verification — the critical safety check
+        # Collision verification
         with self._lock:
             self._collision_checks += 1
 
         stored_fingerprint = raw.get("fingerprint", [])
-        if not verify_fingerprint(stored_fingerprint, token_ids):
+        if not _verify_fingerprint_fast(stored_fingerprint, token_ids):
             with self._lock:
                 self._collision_detections += 1
             logger.error(
                 "GKD COLLISION DETECTED for hash %s... "
-                "Treating as miss. Investigate immediately.",
+                "Treating as miss.",
                 content_hash[:16],
             )
             return None
@@ -429,6 +535,72 @@ class GKDStore:
             hit_count  = raw.get("hit_count", 0) + 1,
         )
 
+    def _pipelined_lcp_lookup(
+        self,
+        token_ids: List[int],
+        sequence_length: int,
+    ) -> Optional[GKDHit]:
+        """
+        LCP prefix lookup using pipelined backend reads.
+
+        Instead of O(seq_len/128) sequential round-trips to Redis,
+        this builds all prefix keys at once and fetches them in a
+        single pipeline call. On a 1000-token sequence this reduces
+        from ~8 sequential Redis calls to 1 pipelined call.
+        """
+        from memopt.cluster.prefix_index import (
+            prefix_key, BLOCK_SIZE,
+        )
+        from memopt.cluster.prefix_index import \
+            _verify_fingerprint_fast as vfp
+
+        max_prefix = (sequence_length // BLOCK_SIZE) * BLOCK_SIZE
+        if max_prefix == sequence_length:
+            max_prefix -= BLOCK_SIZE
+        if max_prefix < BLOCK_SIZE:
+            return None
+
+        # Build all prefix keys (longest first)
+        lengths = list(range(max_prefix, BLOCK_SIZE - 1, -BLOCK_SIZE))
+        keys = [prefix_key(token_ids, l) for l in lengths]
+
+        # Pipelined fetch — one round-trip for all keys
+        results = self._backend.pipeline_get(keys)
+
+        # Find longest match with fingerprint verification
+        for length, raw in zip(lengths, results):
+            if raw is None:
+                continue
+            try:
+                entry = json.loads(raw) if isinstance(raw, str) else raw
+                stored_fp = entry.get("fingerprint", [])
+                if not vfp(stored_fp, token_ids[:length]):
+                    logger.debug(
+                        "prefix_index: fingerprint mismatch len=%d",
+                        length)
+                    continue
+
+                with self._lock:
+                    self._cache_hits        += 1
+                    self._lcp_hits          += 1
+                    self._lcp_tokens_reused += length
+                    self._lcp_tokens_total  += sequence_length
+
+                return GKDHit(
+                    block_ref   = entry["block_ref"],
+                    node_id     = entry["node_id"],
+                    hit_count   = 1,
+                    matched_len = entry["matched_len"],
+                    delta_start = entry["matched_len"],
+                    is_partial  = True,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "prefix_index: parse error len=%d: %s", length, exc)
+                continue
+
+        return None
+
     def register(
         self,
         token_ids: List[int],
@@ -438,21 +610,7 @@ class GKDStore:
         size_bytes: Optional[int] = None,
         ttl_seconds: Optional[int] = None,
     ):
-        """
-        Register a newly computed KV block in the dedup store.
-
-        Call this after every cache miss once the KV block has been
-        allocated in the VMM. Future lookups with the same token_ids
-        will return a hit pointing to this block.
-
-        Args:
-            token_ids:       The prompt token IDs used to compute this block.
-            sequence_length: Total sequence length.
-            block_ref:       VMM block identifier: "{sequence_id}:{block_index}".
-            node_id:         ID of the node holding the physical block.
-            size_bytes:      Size of the KV block in bytes.
-            ttl_seconds:     Override the store's default TTL for this entry.
-        """
+        """Register a newly computed KV block in the dedup store."""
         content_hash = compute_hash(token_ids, sequence_length)
         fingerprint  = make_fingerprint(token_ids)
 
@@ -466,48 +624,49 @@ class GKDStore:
             "hit_count":     0,
         }
 
-        self._backend.set(content_hash, entry, ttl_seconds=ttl_seconds or self._ttl)
-        logger.debug("GKD registered: hash=%s... node=%s ref=%s", content_hash[:16], node_id, block_ref)
+        self._backend.set(
+            content_hash, entry,
+            ttl_seconds=ttl_seconds or self._ttl)
 
         try:
             from memopt.cluster.prefix_index import register_prefixes
             register_prefixes(
-                token_ids, sequence_length, block_ref, node_id, self._backend
-            )
+                token_ids, sequence_length, block_ref, node_id,
+                self._backend)
         except Exception as exc:
             logger.debug("GKD prefix registration failed: %s", exc)
 
-    def invalidate(self, token_ids: List[int], sequence_length: int):
-        """
-        Remove an entry from the store.
+    # ── Output cache (for exact-hit compute skip) ───────────────────
 
-        Call this when a KV block is evicted from all tiers and the
-        block_ref is no longer valid. Prevents stale pointers.
-        """
+    def get_output(self, block_ref: str) -> Optional[dict]:
+        """Return cached output for a block_ref.
+        Returns None if not found. Never raises."""
+        try:
+            with self._output_cache_lock:
+                return self._output_cache.get(block_ref)
+        except Exception:
+            return None
+
+    def register_output(self, block_ref: str, output: dict) -> None:
+        """Store completion output alongside block_ref for future exact hits.
+        Max 10K entries — evicts oldest on overflow. Never raises."""
+        try:
+            with self._output_cache_lock:
+                if len(self._output_cache) >= 10_000:
+                    oldest = next(iter(self._output_cache))
+                    del self._output_cache[oldest]
+                self._output_cache[block_ref] = output
+        except Exception:
+            pass
+
+    def invalidate(self, token_ids: List[int], sequence_length: int):
+        """Remove an entry from the store."""
         content_hash = compute_hash(token_ids, sequence_length)
         self._backend.delete(content_hash)
 
     # ── Instrumentation ────────────────────────────────────────────────
 
     def stats(self) -> Dict[str, Any]:
-        """
-        Return instrumentation metrics.
-
-        The 'estimated_hbm_saved_gb' number is what sells the product.
-
-        Example output on a popular deployment:
-            {
-                "total_lookups":              50_000,
-                "cache_hits":                 47_500,
-                "cache_misses":                2_500,
-                "hit_rate_pct":                 95.0,
-                "estimated_hbm_saved_gb":      593.75,
-                "estimated_compute_saved_pct":  95.0,
-                "entries_in_store":             2_500,
-                "collision_checks_total":      47_500,
-                "collision_detections_total":       0,  ← must always be 0
-            }
-        """
         with self._lock:
             total       = self._total_lookups
             hits        = self._cache_hits
@@ -528,8 +687,10 @@ class GKDStore:
             "entries_in_store":            self._backend.size(),
             "collision_checks_total":      col_checks,
             "collision_detections_total":  col_dets,
-            "backend_degraded":            getattr(self._backend, "degraded", False),
-            "backend_degraded_since":      getattr(self._backend, "degraded_since", None),
+            "backend_degraded":            getattr(
+                self._backend, "degraded", False),
+            "backend_degraded_since":      getattr(
+                self._backend, "degraded_since", None),
             "exact_hits":                  self._exact_hits,
             "lcp_hits":                    self._lcp_hits,
             "lcp_token_reuse_pct":         round(
@@ -539,7 +700,6 @@ class GKDStore:
         }
 
     def reset_stats(self):
-        """Reset all counters. Useful between benchmark runs."""
         with self._lock:
             self._total_lookups        = 0
             self._cache_hits           = 0

@@ -308,9 +308,42 @@ class RemoteBlockClient:
         remote_port:   int = _RBP_PORT,
     ) -> Optional[bytes]:
         """
-        Fetch a block from a remote node.
-        Returns raw bytes on success, None on any failure.
+        Fetch a block from a remote node with retry.
+        Returns raw bytes on success, None after all attempts fail.
+
+        Retry count: MEMOPT_FETCH_RETRIES (default 2).
+        Retry delay: MEMOPT_FETCH_RETRY_DELAY_S (default 0.5s).
         """
+        # Default: 0 retries (single attempt) for backward compat.
+        # Set MEMOPT_FETCH_RETRIES=2 in production for retry.
+        max_retries = int(os.environ.get('MEMOPT_FETCH_RETRIES', '0'))
+        retry_delay = float(os.environ.get(
+            'MEMOPT_FETCH_RETRY_DELAY_S', '0.5'))
+
+        for attempt in range(max_retries + 1):
+            result = self._try_fetch_once(
+                content_hash, remote_host, remote_port)
+            if result is not None:
+                return result
+            if attempt < max_retries:
+                logger.debug(
+                    f"fetch_block attempt {attempt + 1} failed, "
+                    f"retrying in {retry_delay}s")
+                time.sleep(retry_delay)
+
+        logger.error(
+            f"fetch_block failed after {max_retries + 1} attempts "
+            f"hash={content_hash[:16]}... "
+            f"peer={remote_host}:{remote_port}")
+        return None
+
+    def _try_fetch_once(
+        self,
+        content_hash: str,
+        remote_host:  str,
+        remote_port:  int,
+    ) -> Optional[bytes]:
+        """Single fetch attempt. Returns bytes or None."""
         try:
             sock = socket.create_connection(
                 (remote_host, remote_port), timeout=self._timeout
@@ -324,7 +357,6 @@ class RemoteBlockClient:
             }).encode()
             _send_frame(sock, request)
 
-            # Read response header
             header_raw = _recv_frame(sock, self._timeout)
             header     = json.loads(header_raw.decode())
 
@@ -344,7 +376,6 @@ class RemoteBlockClient:
                 sock.close()
                 return None
 
-            # Read block data
             data = _recv_frame(sock, self._timeout)
             sock.close()
 

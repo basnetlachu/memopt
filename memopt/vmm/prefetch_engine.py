@@ -9,6 +9,7 @@ Hardware-agnostic: uses only TierManager and PageTable.
 """
 from __future__ import annotations
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -138,6 +139,71 @@ class PrefetchEngine:
                 "pending_prefetches":         len(self._pending),
                 "calibrated_gap_ms":          gap_ms,
             }
+
+    def is_healthy(self) -> bool:
+        """Returns True if the engine is operational. Never raises."""
+        try:
+            # PrefetchEngine uses one-off daemon threads, not persistent ones.
+            # Health = lock is acquirable (not deadlocked) and state is sane.
+            if self._lock.acquire(timeout=1.0):
+                self._lock.release()
+                return True
+            return False
+        except Exception:
+            return False
+
+    def memory_pressure_pct(self) -> float:
+        """Returns HBM used / total as 0.0-100.0. Never raises."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return 0.0
+            allocated = torch.cuda.memory_allocated()
+            total = torch.cuda.get_device_properties(0).total_memory
+            if total == 0:
+                return 0.0
+            return (allocated / total) * 100.0
+        except Exception:
+            return 0.0
+
+    def _check_nvme_cap(self) -> None:
+        """Evict oldest NVMe blocks if usage exceeds 90% of MEMOPT_NVME_MAX_GB."""
+        try:
+            import shutil
+            nvme_dir = getattr(self, '_nvme_dir', None)
+            if nvme_dir is None:
+                nvme_dir = os.environ.get('MEMOPT_NVME_DIR', '')
+            if not nvme_dir or not os.path.isdir(nvme_dir):
+                return
+            max_bytes = float(os.environ.get(
+                'MEMOPT_NVME_MAX_GB', '500')) * 1e9
+            used = sum(
+                os.path.getsize(os.path.join(nvme_dir, f))
+                for f in os.listdir(nvme_dir)
+                if f.endswith('.vmm_block'))
+            if used > max_bytes * 0.9:
+                self._evict_oldest_nvme_pct(nvme_dir, 0.10)
+        except Exception as e:
+            logger.debug(f"nvme cap check failed: {e}")
+
+    def _evict_oldest_nvme_pct(self, nvme_dir: str, pct: float) -> None:
+        """Remove the oldest pct fraction of .vmm_block files."""
+        try:
+            files = [
+                (os.path.getmtime(os.path.join(nvme_dir, f)),
+                 os.path.join(nvme_dir, f))
+                for f in os.listdir(nvme_dir)
+                if f.endswith('.vmm_block')]
+            files.sort()  # oldest first
+            n = max(1, int(len(files) * pct))
+            for _, path in files[:n]:
+                try:
+                    os.unlink(path)
+                    logger.info(f"evicted nvme block: {path}")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"nvme eviction failed: {e}")
 
     def get_hw_profile(self) -> UniversalMemoryProfile:
         """Return the detected hardware memory profile."""

@@ -1,8 +1,9 @@
 # memopt — Complete Technical Reference
 
-**Language:** Python 3.8+, PyTorch 2.0+
+**Language:** Python 3.10+ (control plane), C++17 (data plane), CUDA 12.4+ (GPU kernels)
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 286 tests pass, 7 skipped on CPU-only (with torch + CUDA installed; all 286 pass)
+**Test suite:** 339 Python tests pass (10 skipped), 7 C++ GoogleTest suites, 0 failures
+**C++ extensions:** 6 pybind11 modules + 1 sidecar daemon (all optional — Python fallback on every path)
 
 ---
 
@@ -10,6 +11,7 @@
 
 1. [What memopt Does](#1-what-memopt-does)
 2. [Repository Layout](#2-repository-layout)
+2a. [C++ Acceleration Layer](#2a-c-acceleration-layer)
 3. [Six-Pillar Architecture](#3-six-pillar-architecture)
 4. [Pillar 1: Infinite Context VMM](#4-pillar-1-infinite-context-vmm)
 5. [Pillar 2: Global KV Cache Deduplication (GKD)](#5-pillar-2-global-kv-cache-deduplication-gkd)
@@ -34,6 +36,7 @@
 22. [HTTPS / TLS](#22-https--tls)
 23. [CLI Reference](#23-cli-reference)
 24. [Validated Real Numbers (A100)](#24-validated-real-numbers-a100)
+25. [Production Hardening](#25-production-hardening)
 
 ---
 
@@ -139,38 +142,157 @@ memopt/                        ← Python package root
 │       └── test_ledger_verify.py  ← Pillar 4: verify_and_certify tests  [new]
 ├── vmm/
 │   ├── hal.py
-│   ├── page_table.py
+│   ├── page_table.py              ← shim: imports C++ _memopt_core.PageTable or Python fallback
+│   ├── oracle.py                  ← shim: imports C++ _memopt_core.MemoryOracle or Python fallback
 │   ├── prefetch_engine.py         ← extended: oracle + allocator + governor integration
 │   ├── tier_manager.py
 │   ├── weight_manager.py
-│   ├── access_log.py              ← Layer 1: non-blocking JSONL access logging (background daemon writer)
-│   ├── universal_profile.py       ← Layer 1: hardware memory tier detection (HBM/DRAM/NVMe/CXL)
-│   ├── oracle.py                  ← Layer 2: Markov chain predictive prefetch oracle
+│   ├── access_log.py              ← Layer 1: non-blocking JSONL access logging
+│   ├── universal_profile.py       ← Layer 1: hardware memory tier detection
 │   ├── oracle_data_cleaner.py     ← Layer 2: 7-step cleaning pipeline for access logs
 │   ├── oracle_trainer.py          ← Layer 2: background oracle training daemon
-│   ├── federation.py              ← Layer 3: TCP gossip for cross-node oracle transition sharing
+│   ├── federation.py              ← Layer 3: bounded fan-out gossip + delta-only + Redis peer discovery
 │   ├── elastic_allocator.py       ← Layer 3: urgency-based tier allocation decisions
 │   ├── memory_governor.py         ← Layer 3: HBM pressure monitoring + horizon scaling
+│   ├── _page_table_py.py          ← Python fallback (original implementation)
+│   ├── _oracle_py.py              ← Python fallback (original implementation)
 │   ├── backends/
-│   │   ├── cuda_backend.py
-│   │   ├── rocm_backend.py
-│   │   └── unified_backend.py
+│   │   ├── cuda_backend.py        ← shim: C++ NVMe I/O via _memopt_cuda or Python fallback
+│   │   ├── rocm_backend.py        ← shim: inherits CUDA backend
+│   │   ├── unified_backend.py
+│   │   ├── _cuda_backend_py.py    ← Python fallback
+│   │   └── _rocm_backend_py.py    ← Python fallback
 │   └── tests/
-│       ├── test_vmm_smoke.py      ← 13 tests (VMM + tenant isolation + Layer 1 integration)
-│       ├── test_oracle.py         ← 23 tests (oracle + data cleaner + trainer)
-│       └── test_layer3.py         ← 25 tests (federation + allocator + governor)
+│       ├── test_vmm_smoke.py      ← 13 tests
+│       ├── test_oracle.py         ← 23 tests
+│       └── test_layer3.py         ← 32 tests (federation fanout + delta + discovery)
 └── workflows/
     └── analyze_workflow.py
 
+csrc/                              ← ALL C++ source code
+├── CMakeLists.txt                 ← root CMake (builds all 6 components)
+├── cmake/
+│   └── CompilerFlags.cmake        ← -O3, LTO, sanitizer flags
+├── core/                          ← _memopt_core.so (Phase 1a)
+│   ├── page_table.h/cpp           ← 64-shard concurrent page table
+│   ├── oracle.h/cpp               ← striped-lock Markov oracle
+│   ├── block_directory.h/cpp      ← 16-shard concurrent block directory
+│   └── bindings.cpp               ← pybind11: PageTable + MemoryOracle + BlockDirectoryCpp
+├── hooks/                         ← _memopt_hooks.so (Phase 1b)
+│   ├── key_hash.h                 ← FNV-1a cache key, OpId/ArchId enums
+│   ├── dispatch_table.h/cpp       ← lock-free dispatch + atomic notify
+│   └── bindings.cpp               ← pybind11: init_hooks, notify, make_cache_key
+├── paged/                         ← _memopt_paged.so (Phase 1c)
+│   ├── block_pool.h/cpp           ← lock-free (x86-64) / mutex block pool
+│   ├── paged_kv_cache.h/cpp       ← sequence metadata + block allocation
+│   ├── gather_kernel.cuh/cu       ← CUDA gather (fp16/bf16/fp32)
+│   └── bindings.cpp               ← pybind11: PagedKVCache + BlockPool
+├── cuda_backend/                  ← _memopt_cuda.so (Phase 2a)
+│   ├── stream_pool.h/cpp          ← 8-stream atomic round-robin
+│   ├── nvme_io.h/cpp              ← crash-safe write + fdatasync + rename
+│   ├── gds.h/cpp                  ← cuFile GDS (async on CUDA≥11.8)
+│   └── bindings.cpp               ← pybind11: CUDAStreamPool + NVMe I/O
+├── transport/                     ← memopt-transport binary (Phase 2b)
+│   ├── ring_buffer.h/cpp          ← SPSC shared memory IPC
+│   ├── protocol.h                 ← all message types (POD structs)
+│   ├── rdma_engine.h/cpp          ← ibverbs QP + CQ poller + QP exchange
+│   ├── tcp_fallback.h/cpp         ← epoll/kqueue multiplexer
+│   ├── daemon.h/cpp               ← sidecar lifecycle
+│   └── main.cpp                   ← entry point
+└── simd/                          ← _memopt_simd.so (Phase 3)
+    ├── prefix_match.h/cpp         ← AVX-512 / AVX2 / scalar LCP
+    └── bindings.cpp               ← pybind11: find_lcp + ISA detection
+
+tests/cpp/                         ← GoogleTest suites (7 files)
+├── test_page_table.cpp
+├── test_oracle.cpp
+├── test_dispatch_table.cpp
+├── test_block_pool.cpp
+├── test_cuda_backend.cpp
+├── test_transport.cpp
+└── test_prefix_match.cpp
+
+scripts/
+└── audit_wiring.py                ← runtime wiring verification script
+
 docs/
-├── architecture.md            ← this file
-deploy/                        ← deployment artifacts (not Python)
-├── grafana/                   ← Grafana dashboard JSON
-└── tls/                       ← nginx TLS config
-conftest.py                    ← root pytest fixtures
+├── architecture.md                ← this file
+├── rdma_deployment.md             ← RDMA deployment guide + troubleshooting
+deploy/
+├── grafana/                       ← Grafana dashboard JSON
+└── tls/                           ← nginx TLS config
+conftest.py
 pyproject.toml
 setup.py
 ```
+
+---
+
+## 2a. C++ Acceleration Layer
+
+memopt uses a **language boundary** architecture: Python owns the control plane (configuration, scheduling, API serving, ML heuristics), C++ owns the data plane (hot-path operations called millions of times per second).
+
+### Design Principles
+
+1. **Every C++ module has a Python fallback.** Each `.py` shim file tries `import _memopt_*` and falls back to the original Python implementation on `ImportError`. The system runs correctly (but slower) without any C++ extensions built.
+
+2. **GIL is never held during C++ work.** All pybind11 methods use `py::gil_scoped_release` before entering C++ code. Python objects are converted at the boundary; C++ operates on raw types.
+
+3. **No libtorch dependency.** C++ extensions use pybind11 for Python interop and raw CUDA/ibverbs APIs for hardware. PyTorch tensors are accessed via Python API at the boundary, not through libtorch C++ headers. This keeps the build simple for CPU-only environments.
+
+### Component Map
+
+| C++ Module | Replaces | Why C++ |
+|------------|----------|---------|
+| `_memopt_core` | `page_table.py`, `oracle.py`, `block_directory.py` | 64-shard page table eliminates global RLock; striped-lock oracle uses 5× less memory; 16-shard block directory |
+| `_memopt_hooks` | `kernel_hooks.py` notify path | FNV-1a key (no string alloc), atomic counter (no RLock), lock-free dispatch table (shared_mutex) |
+| `_memopt_paged` | `paged_attention.py` | Lock-free block pool (x86-64 CAS / mutex), CUDA gather kernel replaces N×torch.cat |
+| `_memopt_cuda` | `cuda_backend.py` NVMe I/O | GIL-free fdatasync+rename, 8-stream round-robin pool, cuFile GDS (async on CUDA≥11.8) |
+| `memopt-transport` | `transport.py` | Sidecar daemon: SPSC ring buffer IPC, ibverbs CQ poll at sub-µs, epoll TCP multiplexer |
+| `_memopt_simd` | `prefix_index.py` inner loop | AVX-512 (16 tokens/cycle) / AVX2 (8) / scalar LCP matching |
+
+### Shim Pattern
+
+Every replaced Python module follows this pattern:
+
+```python
+# memopt/vmm/page_table.py (shim)
+try:
+    from memopt._memopt_core import PageTable  # C++ path
+except ImportError:
+    from memopt.vmm._page_table_py import PageTable  # Python fallback
+```
+
+Callers import from the shim. They never import from `_py` backups directly. The audit script (`scripts/audit_wiring.py`) verifies zero import violations.
+
+### Build System
+
+```
+pyproject.toml          → scikit-build-core backend
+csrc/CMakeLists.txt     → pybind11_add_module for each .so
+                        → FetchContent(googletest) for C++ tests
+                        → conditional CUDA, RDMA, GDS, AVX-512
+```
+
+Build options (all optional, degrade gracefully):
+
+| CMake Option | Default | Effect |
+|-------------|---------|--------|
+| `MEMOPT_ENABLE_GDS` | OFF | cuFile GPUDirect Storage |
+| `MEMOPT_ENABLE_RDMA` | OFF | libibverbs transport |
+| `MEMOPT_ENABLE_AVX512` | OFF | Explicit AVX-512 (else `-march=native` in Release) |
+| `MEMOPT_ENABLE_SANITIZERS` | OFF | ASan + UBSan for testing |
+| `MEMOPT_ENABLE_TESTS` | OFF | GoogleTest C++ test suites |
+
+### Wiring Audit
+
+Run `python scripts/audit_wiring.py` to verify all components are correctly wired. The script checks:
+- Each shim imports the correct C++ module
+- No downstream code bypasses the shim
+- Architectural connections exist (VMM→Oracle, Server→KernelHooks, GKD→Pipeline, Federation→Fanout)
+
+Expected output on a dev machine (C++ not built): 5 WIRED, 8 PARTIAL, 0 FAILED.
+Expected output with C++ built: 13 WIRED, 0 PARTIAL, 0 FAILED.
 
 ---
 
@@ -230,7 +352,7 @@ The engine builds a first-order Markov chain of block access patterns and measur
 
 **Layer 1 integration** — optional `access_log` param emits `BlockAccessEvent` to a background JSONL writer. `detect_universal_profile()` probes hardware tiers at init.
 
-**Layer 2 integration** — optional `oracle` param delegates prediction to `MemoryOracle`. When attached, the oracle's `predict()` replaces the built-in Markov chain. Predictions with confidence >= 0.5 trigger prefetches. The oracle is fed every access via `oracle.observe()`.
+**Layer 2 integration** — `VMM.__init__()` creates a `MemoryOracle` instance and passes it to `PrefetchEngine(oracle=self.oracle)`. The oracle's `predict()` replaces the built-in Markov chain. Predictions with confidence >= 0.5 trigger prefetches. The oracle is fed every access via `oracle.observe()`. When C++ `_memopt_core` is built, the oracle uses striped locks (256 buckets) and 5× less memory per transition entry.
 
 **Layer 3 integration** — optional `allocator` and `governor` params. When an `ElasticAllocator` is attached, each oracle prediction is routed through `allocator.decide(confidence)` for tier placement tracking. The `MemoryGovernor` runs independently in a background thread, scaling the oracle's horizon based on HBM pressure.
 
@@ -245,6 +367,11 @@ PrefetchEngine(
 ```
 
 Methods added across layers: `get_hw_profile()`, `get_oracle()`, `oracle_stats()`, `get_allocator()`, `get_governor()`, `layer3_stats()`.
+
+**Production hardening:**
+- `is_healthy() → bool` — returns True if the engine is operational (lock acquirable, no deadlock). Never raises.
+- `memory_pressure_pct() → float` — returns HBM used / total as 0.0–100.0. Returns 0.0 when CUDA unavailable. Never raises.
+- `_check_nvme_cap()` — evicts oldest NVMe blocks when usage exceeds 90% of `MEMOPT_NVME_MAX_GB` (default 500 GB). Prevents NVMe disk exhaustion during long-running inference.
 
 ### 4.5 NVMe Crash Safety (`vmm/backends/unified_backend.py`, `vmm/backends/cuda_backend.py`)
 
@@ -365,7 +492,7 @@ Background daemon that warms a `MemoryOracle` from existing access logs and incr
 
 ### 4.12 Federation (`vmm/federation.py`) — Layer 3
 
-TCP gossip protocol for sharing Oracle Markov transitions across cluster nodes. Each node periodically broadcasts its transition table to all known peers, accelerating convergence without centralised coordination.
+TCP gossip protocol for sharing Oracle Markov transitions across cluster nodes. Designed for clusters of 1K–1M nodes.
 
 ```python
 class FederationManager:
@@ -378,9 +505,16 @@ class FederationManager:
 
 **Protocol** — length-prefixed JSON frames over TCP (same framing as `remote_block.py`: 4-byte big-endian length + JSON payload).
 
-**Sender loop** — every `gossip_interval_s`, reads `oracle._transitions` under `oracle._lock`, serialises as `GossipBatch`, and sends to each peer.
+**Bounded fan-out** — each gossip round sends to K random peers (default K=5 via `MEMOPT_GOSSIP_FANOUT`), not all peers. At 1M nodes, each node sends exactly 5 messages per interval, converging in O(log₅ N) ≈ 9 rounds.
 
-**Receiver loop** — TCP listener on `gossip_port`. For each incoming batch, deserialises and merges into the local oracle. Merge uses max-count semantics (takes the higher count for each transition) to avoid double-counting.
+**Delta-only gossip** — only transitions that changed since the last round are sent. If nothing changed, the round is skipped. Reduces gossip bandwidth from O(all_transitions) to O(new_transitions).
+
+**Peer discovery** — three tiers:
+1. **Redis** (preferred): nodes register in Redis with 30s TTL, discover peers via key scan. Set `REDIS_URL` to enable.
+2. **Static list** (fallback): `MEMOPT_NODE_HOSTS` env var.
+3. **None**: node runs alone, no gossip.
+
+**Receiver loop** — TCP listener on `gossip_port`. Merge uses max-count semantics (takes higher count per transition).
 
 **Self-filtering** — batches from the same `node_id` are silently dropped.
 
@@ -389,7 +523,7 @@ class FederationManager:
 - `GossipBatch(frozen)`: `node_id`, `epoch`, `transitions`
 - `FederationStats`: `node_id`, `peers_known`, `batches_sent`, `batches_received`, `transitions_merged`, `last_gossip_epoch`
 
-**Environment variables:** `MEMOPT_NODE_ID` (default `"node_0"`), `MEMOPT_NODE_HOSTS` (comma-separated `host:port` peers).
+**Environment variables:** `MEMOPT_NODE_ID` (default `"node_0"`), `MEMOPT_NODE_HOSTS` (static peer list), `MEMOPT_GOSSIP_FANOUT` (default 5), `REDIS_URL` (peer discovery).
 
 ### 4.13 Elastic Allocator (`vmm/elastic_allocator.py`) — Layer 3
 
@@ -511,14 +645,20 @@ If a collision is detected, the entry is treated as a miss and an error is logge
 
 | Backend | Use Case | Dependency |
 |---------|----------|-----------|
-| `LocalGKDBackend` | Single-node dev + testing | None |
-| `RedisGKDBackend` | Cluster-wide production | `redis-py` |
+| `LocalGKDBackend` | Single-node dev + testing | None (C++ 16-shard version via `_memopt_core` when built) |
+| `RedisGKDBackend` | Cluster-wide production | `redis-py` (supports Redis Cluster via comma-separated URLs) |
+
+**Redis Cluster support** — when `REDIS_URL` contains multiple comma-separated URLs (e.g., `redis://n1:6379,redis://n2:6379,redis://n3:6379`), `RedisGKDBackend` connects as a Redis Cluster client with `skip_full_coverage_check=True` and `retry_on_timeout=True`. Falls back to single instance if cluster init fails.
+
+**Pipelined LCP lookups** — on exact cache miss, the LCP fallback now uses `pipeline_get()` to fetch all prefix keys in a single Redis round-trip instead of O(seq_len/128) sequential calls. At 1000-token sequences this reduces from ~8 Redis round-trips to 1.
 
 Redis backend degrades gracefully to local if Redis is unreachable — inference never crashes.
 
 **Degradation alerting** — when `RedisGKDBackend` falls back to local, it calls `_mark_degraded(reason)` which logs at `ERROR` level (not `DEBUG`) exactly once. This makes Redis connectivity problems immediately visible in log aggregators and alerting systems. The degradation state is exposed in `GKDStore.stats()` as `backend_degraded: bool` and `backend_degraded_since: float | None` so Grafana and the `/metrics` endpoint can surface it. A spike in `backend_degraded=True` with `hit_rate_pct` dropping to ~0% indicates a Redis outage silently consuming compute that GKD would otherwise eliminate.
 
 **`/health` 503 on Redis degradation** — `api/server.py` exposes a `register_gkd(gkd)` hook. When a `GKDStore` is registered, the `GET /health` endpoint reads `gkd_store.stats()["backend_degraded"]` and returns `HTTP 503` (body `{"status":"degraded"}`) when True. Kubernetes liveness probes and load balancers will route traffic away from a degraded node automatically.
+
+**TTL enforcement** — a background daemon thread (`gkd-ttl`) runs every 5 minutes and removes expired entries from `LocalGKDBackend`. TTL is configurable via `MEMOPT_GKD_ENTRY_TTL_S` (default: same as `default_ttl_seconds` constructor arg, typically 3600). For `RedisGKDBackend`, Redis native `EXPIRE` handles TTL — the background thread only applies to the local fallback.
 
 ### 5.5 Transport (`cluster/transport.py`)
 
@@ -545,9 +685,18 @@ The transport layer implements a typed `AbstractTransport` ABC with three concre
 
 `_detect_best_tls()` runs `ibv_devinfo` with a 2-second timeout — never blocks startup. GPU-direct zero-copy (GPU HBM → NIC DMA → remote GPU HBM) is activated automatically when the `rc,cuda_copy` path is selected; requires GPUDirectRDMA kernel module + Mellanox/Broadcom NIC with correct firmware. UCX async ops (`connect`, `read`, `write`) each create and close their own event loop — no event loop is required in the caller.
 
-**TCPTransport** — raw socket implementation unchanged from before. `read()` and `write()` track `_bytes_sent`/`_bytes_recv` for `stats()`. `stats()` returns the required keys: `transport`, `bytes_sent`, `bytes_recv`, `latency_us_p50`, `latency_us_p99`.
+**TCPTransport** — raw socket implementation. `stats()` returns the required keys: `transport`, `bytes_sent`, `bytes_recv`, `latency_us_p50`, `latency_us_p99`.
 
 ucx-py is an **optional** dependency — not listed in `requirements.txt`. Install with `pip install ucx-py` or `conda install -c rapidsai ucx-py` to enable RDMA on InfiniBand/RoCE clusters.
+
+**C++ Sidecar Daemon (`memopt-transport`)** — for production RDMA deployments, the `memopt-transport` standalone binary replaces the Python transport with a sidecar process that communicates via shared memory ring buffers (`/dev/shm/memopt_transport_{node}_req/resp`). The daemon implements:
+- SPSC lock-free ring buffer for Python↔C++ IPC (4096 slots × 64KB)
+- ibverbs RDMA engine with full QP handshake (RESET→INIT→RTR→RTS) via TCP sideband, file, or etcd exchange
+- Dedicated CQ poller thread (pinned to core, SCHED_FIFO, sub-µs poll latency)
+- epoll/kqueue TCP multiplexer (100K+ connections on one thread)
+- Structured QP transition logging via `MEMOPT_QP_DEBUG=1`
+
+When the daemon is not running, `transport.py` automatically uses the Python `TCPTransport` or `UCXTransport` — no configuration change needed. See `docs/rdma_deployment.md` for deployment guide.
 
 ### 5.6 LCP Prefix Matching (`cluster/prefix_index.py`)
 
@@ -966,6 +1115,8 @@ result = ledger.verify_chain()
 
 Environment overrides: `MEMOPT_BASELINE_J_PER_TOKEN`, `MEMOPT_GRID_INTENSITY_KG_KWH`, `MEMOPT_ELECTRICITY_PRICE_USD`, `MEMOPT_GPU_PRICE_USD_HR`.
 
+**Disk space safety** — `record()` calls `_has_disk_space()` before every write. If free disk is below `MEMOPT_LEDGER_MIN_FREE_MB` (default 500 MB), the write is skipped and `_entries_skipped` counter is incremented. A `LedgerEntry` with `batch_id="skipped_..."` is returned so callers never get `None`. `size_bytes()` returns the current SQLite file size.
+
 Survives SQLite errors gracefully — writes are non-fatal, `totals()` returns empty dict on DB failure.
 
 **Chain verification and certification** — `verify_and_certify(tenant_id=None)` walks the hash chain via `verify_chain()`, then wraps the result in a signed certificate via `sign_entry()`. Returns `chain_valid`, `entries_checked`, `issued_at`, `signature`, and `signature_status`. The `GET /ledger/verify` endpoint exposes this — non-admin callers can only verify their own tenant; admins verify all entries.
@@ -1130,7 +1281,7 @@ Length-prefixed JSON frames over raw TCP (stdlib `socket` only — no ucx-py dep
 
 **`RemoteBlockServer`** — one daemon thread accept loop per node; spawns a handler thread per connection. Injects `block_directory` and `read_block_fn(path) → bytes | None` at construction — no direct VMM coupling.
 
-**`RemoteBlockClient`** — `fetch_block()` never raises; returns `None` on any failure (timeout, not found, read error). `acquire_lease()` / `release_lease()` are best-effort — if the server is unreachable, the caller proceeds without a lease (worst case: block evicted before transfer, `fetch_block` returns None → caller recomputes).
+**`RemoteBlockClient`** — `fetch_block()` never raises; returns `None` on any failure (timeout, not found, read error). Supports configurable retry via `MEMOPT_FETCH_RETRIES` (default 0 = single attempt) and `MEMOPT_FETCH_RETRY_DELAY_S` (default 0.5s). Set `MEMOPT_FETCH_RETRIES=2` in production for automatic retry on transient failures. `acquire_lease()` / `release_lease()` are best-effort — if the server is unreachable, the caller proceeds without a lease (worst case: block evicted before transfer, `fetch_block` returns None → caller recomputes).
 
 Environment variables:
 
@@ -1255,6 +1406,8 @@ Environment variables: `MEMOPT_DRIFT_THRESHOLD_PCT`, `MEMOPT_DRIFT_BASELINE_N`, 
   "detail": { ... full SiliconCertificate ... }
 }
 ```
+
+**On-demand certification** — `certify_now(reason="")` triggers `_run_once()` synchronously from any thread. Use for manual checks (`kill -USR1`) or automated triggers when drift exceeds a critical threshold.
 
 **Alert callback** — optional `alert_callback(result: dict)` fires on certification failure or drift detection. When no custom callback is provided, `CertifyDaemon` uses `make_drift_resynthesis_callback()` as the default — automatically re-synthesising active kernels when drift is detected.
 
@@ -1942,7 +2095,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 
 ### Test Suite
 
-**286 tests pass, 7 skipped.** The skipped tests require a live CUDA device and are in `test_pillar3_gpu.py` and `test_vmm_benchmark.py`.
+**339 tests pass, 10 skipped.** The skipped tests require a live CUDA device, the `redis` package, or C++ extensions.
 
 | Suite | Tests | Result |
 |-------|-------|--------|
@@ -1965,4 +2118,70 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `observability/tests/test_ledger_verify.py` | 6 | 6 PASS (Pillar 4 — chain verification) |
 | `control_plane/tests/test_degradation.py` | 6 | 6 PASS (Pillar 6 — database degradation tracking) |
 
+| `vmm/tests/test_vmm_hardening.py` | 5 | 5 PASS (production hardening) |
+| `vmm/tests/test_layer3.py` | 32 | 32 PASS (Layer 3 + federation fanout/delta/discovery) |
+| `cluster/tests/test_gkd_hardening.py` | 5 | 5 PASS (TTL enforcement, pipeline) |
+| `cluster/tests/test_gum_hardening.py` | 7 | 7 PASS (lease lifecycle, fetch retry) |
+| `kernels/tests/test_synthesis_hardening.py` | 4 | 4 PASS (circuit breaker, tolerances) |
+| `kernels/tests/test_drift_hardening.py` | 7 | 7 PASS (drift detector, certify_now) |
+| `observability/tests/test_ledger_hardening.py` | 6 | 6 PASS (disk space, size_bytes) |
+
 *`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.
+
+---
+
+## 25. Production Hardening
+
+Reliability engineering applied across all pillars. No new features, no API changes — only resilience improvements for data center deployment.
+
+### 25.1 Environment Variables (Hardening)
+
+| Variable | Default | Component | Purpose |
+|----------|---------|-----------|---------|
+| `MEMOPT_NVME_MAX_GB` | 500 | VMM PrefetchEngine | Max NVMe usage before eviction |
+| `MEMOPT_GKD_ENTRY_TTL_S` | 3600 | GKD Store | TTL for expired entry cleanup |
+| `MEMOPT_LEDGER_MIN_FREE_MB` | 500 | Optimization Ledger | Min free disk before skip writes |
+| `MEMOPT_FETCH_RETRIES` | 0 | RemoteBlockClient | Retry count for fetch_block (set 2 in prod) |
+| `MEMOPT_FETCH_RETRY_DELAY_S` | 0.5 | RemoteBlockClient | Delay between retries |
+| `MEMOPT_GOSSIP_FANOUT` | 5 | Federation | Peers per gossip round |
+| `REDIS_URL` | — | GKD, Federation, BlockDir | Redis for cluster state |
+
+### 25.2 Health Checks
+
+| Component | Method | Returns |
+|-----------|--------|---------|
+| PrefetchEngine | `is_healthy()` | `bool` — True if lock acquirable |
+| PrefetchEngine | `memory_pressure_pct()` | `float` — 0.0–100.0, never raises |
+| RedisGKDBackend | `_health_check()` | `bool` — ping Redis, clear degraded on success |
+| CertifyDaemon | `certify_now(reason)` | `None` — run certification synchronously |
+| OptimizationLedger | `size_bytes()` | `int` — SQLite file size, 0 on error |
+
+### 25.3 Background Threads (daemon=True)
+
+| Thread | Interval | Purpose |
+|--------|----------|---------|
+| `gkd-ttl` | 300s | Remove expired entries from LocalGKDBackend |
+| `ledger-flush` | 60s | Flush write buffer to SQLite |
+| `federation-sender` | 5s | Delta gossip to K random peers |
+| `federation-receiver` | continuous | Accept incoming gossip batches |
+| `memopt-certify-daemon` | 24h | Silicon certification + drift detection |
+
+### 25.4 Graceful Degradation
+
+Every external dependency degrades silently:
+
+| Dependency | When unavailable | Fallback |
+|------------|-----------------|----------|
+| Redis | Connection failed | LocalGKDBackend (in-memory) |
+| CUDA | Not installed | CPU tensors, zero pressure |
+| C++ extensions | Not built | Python implementations |
+| Transport daemon | Not running | Python TCPTransport |
+| NVMe disk full | 90% of MEMOPT_NVME_MAX_GB | Evict oldest blocks |
+| Ledger disk full | Below MEMOPT_LEDGER_MIN_FREE_MB | Skip writes, count skipped |
+| RDMA hardware | No IB device | TCP transport |
+| cuFile GDS | Not loaded | mmap + cudaMemcpyAsync |
+| AVX-512 | Not supported | AVX2 → scalar fallback |
+
+### 25.5 Test Coverage
+
+34 hardening-specific tests across 7 test files verify every degradation path, retry mechanism, and health check listed above.

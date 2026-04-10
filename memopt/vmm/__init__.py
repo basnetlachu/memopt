@@ -21,6 +21,7 @@ from .page_table import PageTable, PageTableEntry
 from .tier_manager import TierManager
 from .prefetch_engine import PrefetchEngine
 from .weight_manager import WeightManager
+from .oracle import MemoryOracle
 
 if TYPE_CHECKING:
     from memopt.cluster import GKDStore
@@ -40,7 +41,8 @@ class VMM:
     def __init__(self, gkd: Optional["GKDStore"] = None) -> None:
         self.page_table   = PageTable()
         self.tier_manager = TierManager(self.page_table)
-        self.prefetch     = PrefetchEngine(self.tier_manager)
+        self.oracle       = MemoryOracle()
+        self.prefetch     = PrefetchEngine(self.tier_manager, oracle=self.oracle)
         self.gkd          = gkd   # None = GKD disabled (backwards compatible)
         self._sequence_owners: dict = {}          # sequence_id → tenant_id
         self._owner_lock = threading.RLock()

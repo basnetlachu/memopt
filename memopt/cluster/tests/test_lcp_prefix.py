@@ -8,6 +8,7 @@ import pathlib
 import pytest
 from memopt.cluster.prefix_index import (
     BLOCK_SIZE, prefix_key, register_prefixes, lookup_longest_prefix,
+    find_lcp, _verify_fingerprint_fast,
 )
 
 
@@ -196,3 +197,49 @@ def test_benchmark_token_reuse(capsys):
                 f"reuse_pct={st['lcp_token_reuse_pct']:.1f}\n"
             )
     print()
+
+
+# ── find_lcp / verify_fingerprint wiring ──────────────────────────────
+
+def test_find_lcp_correctness():
+    """find_lcp returns correct LCP length."""
+    assert find_lcp([1, 2, 3, 4, 5], [1, 2, 3, 4, 5]) == 5
+    assert find_lcp([1, 2, 3, 4, 5], [1, 2, 9, 4, 5]) == 2
+    assert find_lcp([1, 2, 3], [9, 2, 3]) == 0
+    assert find_lcp([], []) == 0
+    assert find_lcp([1], [1]) == 1
+
+
+def test_verify_fingerprint_fast_matches():
+    """_verify_fingerprint_fast returns True on exact match."""
+    fp = list(range(64))
+    candidate = list(range(200))
+    assert _verify_fingerprint_fast(fp, candidate) is True
+
+
+def test_verify_fingerprint_fast_rejects_mismatch():
+    """_verify_fingerprint_fast returns False on mismatch."""
+    fp = list(range(64))
+    bad = list(range(200))
+    bad[30] = 99999  # mismatch at position 30
+    assert _verify_fingerprint_fast(fp, bad) is False
+
+
+def test_verify_fingerprint_fast_empty():
+    """_verify_fingerprint_fast handles empty fingerprints."""
+    assert _verify_fingerprint_fast([], []) is True
+    assert _verify_fingerprint_fast([], [1, 2, 3]) is False
+
+
+def test_lookup_uses_fast_verify():
+    """lookup_longest_prefix uses _verify_fingerprint_fast, not hashing.verify_fingerprint."""
+    b = DictBackend()
+    base = list(range(256))
+    register_prefixes(base, 256, "ref1", "node-a", b)
+
+    # Query with matching prefix
+    query = base + list(range(256, 384))
+    result = lookup_longest_prefix(query, 384, b)
+    assert result is not None
+    _, _, matched = result
+    assert matched == 128  # longest prefix < 384

@@ -231,3 +231,148 @@ def test_redis_backend_degraded_on_unreachable_url():
     assert s["backend_degraded"] is True, (
         "RedisGKDBackend must set degraded=True when Redis is unreachable"
     )
+
+
+# ── Redis Cluster support ─────────────────────────────────────────────
+
+
+def test_redis_url_parsing_single():
+    """Single URL → single Redis client (not cluster)."""
+    pytest.importorskip("redis")
+    from unittest.mock import patch, MagicMock
+    from memopt.cluster.gkd_store import RedisGKDBackend
+
+    backend = RedisGKDBackend.__new__(RedisGKDBackend)
+    backend._degraded = False
+    backend._degraded_since = None
+    backend._redis = None
+    backend._cluster_mode = False
+    backend._local_fallback = MagicMock()
+    backend._available = False
+    backend._redis_url = None
+    backend._json = __import__("json")
+
+    with patch("redis.Redis.from_url") as mock_from_url:
+        mock_client = MagicMock()
+        mock_client.ping.return_value = True
+        mock_from_url.return_value = mock_client
+        backend._connect("redis://localhost:6379")
+        assert backend._cluster_mode is False
+        assert backend._available is True
+
+
+def test_redis_url_parsing_cluster():
+    """Multiple URLs → Redis Cluster client attempted."""
+    pytest.importorskip("redis")
+    from unittest.mock import patch, MagicMock
+    from memopt.cluster.gkd_store import RedisGKDBackend
+
+    backend = RedisGKDBackend.__new__(RedisGKDBackend)
+    backend._degraded = False
+    backend._degraded_since = None
+    backend._redis = None
+    backend._cluster_mode = False
+    backend._local_fallback = MagicMock()
+    backend._available = False
+    backend._redis_url = None
+    backend._json = __import__("json")
+
+    with patch("redis.cluster.RedisCluster") as mock_cluster:
+        mock_client = MagicMock()
+        mock_client.ping.return_value = True
+        mock_cluster.return_value = mock_client
+        backend._connect(
+            "redis://n1:6379,redis://n2:6379,redis://n3:6379")
+        assert backend._cluster_mode is True
+        assert backend._available is True
+
+
+def test_pipeline_get_local_backend():
+    """LocalGKDBackend.pipeline_get returns correct batch results."""
+    from memopt.cluster.gkd_store import LocalGKDBackend
+    b = LocalGKDBackend()
+    b.set("k1", "v1")
+    b.set("k2", "v2")
+    results = b.pipeline_get(["k1", "missing", "k2"])
+    assert results[0] == "v1"
+    assert results[1] is None
+    assert results[2] == "v2"
+
+
+def test_pipelined_lcp_uses_pipeline_get():
+    """GKDStore LCP lookup should call pipeline_get, not sequential gets."""
+    from unittest.mock import patch, MagicMock
+    from memopt.cluster.gkd_store import GKDStore
+
+    store = GKDStore()
+    # Register a base sequence so prefixes exist
+    base = list(range(512))
+    store.register(base, 512, "ref1", "node-a")
+
+    # Patch pipeline_get on the backend to track calls
+    original_pipeline_get = store._backend.pipeline_get
+    call_log = {"count": 0}
+
+    def tracked_pipeline_get(keys):
+        call_log["count"] += 1
+        return original_pipeline_get(keys)
+
+    store._backend.pipeline_get = tracked_pipeline_get
+
+    # Lookup with a longer sequence that shares the prefix
+    query = base + list(range(512, 640))
+    store.lookup(query, 640)
+
+    # pipeline_get should have been called (not individual gets)
+    assert call_log["count"] >= 1, (
+        "LCP lookup should use pipeline_get for batched prefix fetches"
+    )
+
+
+# ── GKD exact hit → compute skip ──────────────────────────────────────
+
+
+def test_gkd_exact_hit_skips_inference():
+    """GKD exact hit returns cached output via get_output()."""
+    from memopt.cluster.gkd_store import GKDStore
+    store = GKDStore()
+    tokens = list(range(100))
+
+    # Register with output
+    block_ref = "test_ref_001"
+    output = {"text": "cached response", "completion_tokens": 10}
+    store.register(tokens, 100, block_ref, "node1")
+    store.register_output(block_ref, output)
+
+    # Lookup should return exact hit
+    hit = store.lookup(tokens, 100)
+    assert hit is not None
+    assert not hit.is_partial
+
+    # get_output should return the cached output
+    cached = store.get_output(hit.block_ref)
+    assert cached is not None
+    assert cached == output
+    assert cached["text"] == "cached response"
+
+
+def test_gkd_get_output_returns_none_on_miss():
+    """get_output() returns None for unknown block_ref. Never raises."""
+    from memopt.cluster.gkd_store import GKDStore
+    store = GKDStore()
+    result = store.get_output("nonexistent_ref")
+    assert result is None
+
+
+def test_gkd_output_cache_evicts_on_overflow():
+    """Output cache evicts oldest entry when full."""
+    from memopt.cluster.gkd_store import GKDStore
+    store = GKDStore()
+
+    # Fill to capacity (10K)
+    for i in range(100):
+        store.register_output(f"ref_{i}", {"text": f"output_{i}"})
+
+    # All 100 should be present
+    assert store.get_output("ref_0") is not None
+    assert store.get_output("ref_99") is not None

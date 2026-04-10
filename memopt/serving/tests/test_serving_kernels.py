@@ -323,3 +323,19 @@ def test_optimizer_does_not_refire_within_gap():
         time.sleep(0.2)
         assert fire_count["n"] <= 1, \
             f"Synthesis fired {fire_count['n']} times — should fire at most once"
+
+
+# ── CUDA gather kernel availability ───────────────────────────────────
+
+def test_has_cuda_gather_reflects_build():
+    """has_cuda_gather() returns a bool reflecting CUDA compilation."""
+    try:
+        import memopt._memopt_paged as p
+    except ImportError:
+        pytest.skip("C++ paged extension not built")
+
+    result = p.has_cuda_gather()
+    assert isinstance(result, bool)
+    # On this machine: just verify it doesn't crash
+    # and returns a consistent value
+    assert p.has_cuda_gather() == result

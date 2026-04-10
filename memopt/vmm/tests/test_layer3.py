@@ -332,3 +332,125 @@ def test_governor_stats_fields():
         "original_horizon", "adjustments_made", "drift_detected",
     ):
         assert hasattr(s, field_name)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Federation — bounded fan-out + delta gossip
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_bounded_fanout_limits_peers():
+    """Gossip sends to at most FANOUT peers, not all."""
+    from unittest.mock import patch, MagicMock
+
+    oracle = MemoryOracle()
+    oracle.observe("s1", 0, step=1)
+    oracle.observe("s1", 1, step=2)
+
+    fm = FederationManager(
+        oracle, node_id="n1",
+        peers=["p1:18600", "p2:18600", "p3:18600",
+               "p4:18600", "p5:18600"],
+    )
+    # Force fanout=3
+    fm._fanout = 3
+
+    with patch.object(fm, '_send_to_peer') as mock_send:
+        fm._do_gossip_round()
+        # Must send to exactly 3 peers, not 5
+        assert mock_send.call_count == 3
+
+
+def test_bounded_fanout_does_not_exceed_available():
+    """If fewer peers than fanout, send to all available."""
+    from unittest.mock import patch
+
+    oracle = MemoryOracle()
+    oracle.observe("s1", 0, step=1)
+    oracle.observe("s1", 1, step=2)
+
+    fm = FederationManager(
+        oracle, node_id="n1",
+        peers=["p1:18600", "p2:18600"],
+    )
+    fm._fanout = 10  # more than available
+
+    with patch.object(fm, '_send_to_peer') as mock_send:
+        fm._do_gossip_round()
+        assert mock_send.call_count == 2  # only 2 available
+
+
+def test_delta_gossip_skips_unchanged():
+    """No gossip sent when transitions have not changed."""
+    from unittest.mock import patch
+
+    oracle = MemoryOracle()
+    oracle.observe("s1", 0, step=1)
+    oracle.observe("s1", 1, step=2)
+
+    fm = FederationManager(
+        oracle, node_id="n1", peers=["p1:18600"])
+
+    # First round: should send (everything is new)
+    with patch.object(fm, '_send_to_peer') as mock_send:
+        fm._do_gossip_round()
+        assert mock_send.call_count == 1
+
+    # Second round: nothing changed — should NOT send
+    with patch.object(fm, '_send_to_peer') as mock_send:
+        fm._do_gossip_round()
+        mock_send.assert_not_called()
+
+
+def test_delta_gossip_sends_after_new_observation():
+    """Delta gossip sends when new transitions are observed."""
+    from unittest.mock import patch
+
+    oracle = MemoryOracle()
+    oracle.observe("s1", 0, step=1)
+    oracle.observe("s1", 1, step=2)
+
+    fm = FederationManager(
+        oracle, node_id="n1", peers=["p1:18600"])
+
+    # First round: flush initial transitions
+    with patch.object(fm, '_send_to_peer'):
+        fm._do_gossip_round()
+
+    # Observe new transition
+    oracle.observe("s1", 2, step=3)
+
+    # Second round: should send the new transition
+    with patch.object(fm, '_send_to_peer') as mock_send:
+        fm._do_gossip_round()
+        assert mock_send.call_count == 1
+
+
+def test_peer_discovery_falls_back_to_static():
+    """Static MEMOPT_NODE_HOSTS used when Redis absent."""
+    oracle = MemoryOracle()
+    fm = FederationManager(
+        oracle, node_id="n1",
+        peers=["static_peer:18600"])
+    fm._redis_client = None  # no Redis
+    peers = fm._discover_peers()
+    assert peers == ["static_peer:18600"]
+
+
+def test_peer_discovery_returns_empty_without_config():
+    """No peers when neither Redis nor MEMOPT_NODE_HOSTS set."""
+    oracle = MemoryOracle()
+    fm = FederationManager(oracle, node_id="n1", peers=[])
+    fm._redis_client = None
+    peers = fm._discover_peers()
+    assert peers == []
+
+
+def test_do_gossip_round_no_peers_no_crash():
+    """Gossip round with no peers doesn't crash."""
+    oracle = MemoryOracle()
+    oracle.observe("s1", 0, step=1)
+    oracle.observe("s1", 1, step=2)
+
+    fm = FederationManager(oracle, node_id="n1", peers=[])
+    fm._redis_client = None
+    fm._do_gossip_round()  # must not crash

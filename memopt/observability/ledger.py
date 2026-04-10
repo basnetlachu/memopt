@@ -321,6 +321,26 @@ class OptimizationLedger:
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
+    def _has_disk_space(self) -> bool:
+        """Check free disk space before writing. Returns True if ok."""
+        try:
+            import shutil
+            min_mb = float(os.environ.get(
+                'MEMOPT_LEDGER_MIN_FREE_MB', '500'))
+            db_dir = os.path.dirname(
+                os.path.abspath(self._db_path))
+            free_mb = shutil.disk_usage(db_dir).free / (1024 * 1024)
+            if free_mb < min_mb:
+                logger.warning(
+                    f"Ledger: low disk ({free_mb:.0f}MB free). "
+                    f"Skipping write.")
+                self._entries_skipped = \
+                    getattr(self, '_entries_skipped', 0) + 1
+                return False
+            return True
+        except Exception:
+            return True  # assume ok on error
+
     def record(
         self,
         tokens:              int,
@@ -335,7 +355,29 @@ class OptimizationLedger:
         """
         Record one batch and compute its savings.
         Returns the LedgerEntry regardless of whether DB write succeeds.
+        Skips write if disk space is below MEMOPT_LEDGER_MIN_FREE_MB.
         """
+        if not self._has_disk_space():
+            # Return a minimal entry without writing to DB
+            return LedgerEntry(
+                batch_id=f"skipped_{int(time.time())}",
+                timestamp=time.time(),
+                node_id=node_id,
+                tenant_id=tenant_id,
+                tokens_generated=tokens,
+                actual_j_per_token=actual_j_per_token,
+                baseline_j_per_token=baseline_j_per_token,
+                gkd_hit_rate_pct=gkd_hit_rate_pct,
+                speedup_ratio=speedup_ratio,
+                hbm_saved_bytes=hbm_saved_bytes,
+                energy_saved_kwh=None,
+                co2_saved_kg=None,
+                cost_saved_usd=None,
+                grid_intensity_used=_GRID_INTENSITY,
+                electricity_price_used=_ELECTRICITY_PRICE,
+                gpu_price_hr_used=_GPU_PRICE_HR,
+            )
+
         with self._lock:
             self._batch_counter += 1
             batch_id = f"{int(time.time())}_{self._batch_counter}"
@@ -418,6 +460,13 @@ class OptimizationLedger:
     def pending_count(self) -> int:
         """Return how many entries are buffered but not yet written to SQLite."""
         return self._buffer.pending_count()
+
+    def size_bytes(self) -> int:
+        """Return the size of the ledger database file in bytes. 0 on error."""
+        try:
+            return os.path.getsize(self._db_path)
+        except Exception:
+            return 0
 
     def recent(self, n: int = 100, tenant_id: Optional[str] = None) -> List[dict]:
         """Return the n most recent ledger entries as dicts.

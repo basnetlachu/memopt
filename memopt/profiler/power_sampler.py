@@ -123,9 +123,12 @@ class PowerSampler:
             log.debug("PowerSampler: idle measurement unavailable (%s)", exc)
         return None
 
-    # ── Context manager ───────────────────────────────────────────────────────
+    # ── Start / stop (for long-running server processes) ────────────────────
 
-    def __enter__(self) -> "PowerSampler":
+    def start(self) -> None:
+        """Start background sampling. Safe to call multiple times."""
+        if self._running:
+            return
         self._running = True
         self._samples = []
         self._thread = threading.Thread(
@@ -134,12 +137,21 @@ class PowerSampler:
             name="memopt-power-sampler",
         )
         self._thread.start()
-        return self
 
-    def __exit__(self, *args) -> None:
+    def stop(self) -> None:
+        """Stop background sampling."""
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(self) -> "PowerSampler":
+        self.start()
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.stop()
 
     # ── Background sampling loop ──────────────────────────────────────────────
 
@@ -157,6 +169,20 @@ class PowerSampler:
                 time.sleep(self.interval_ms / 1000.0)
         except Exception as exc:
             log.warning("PowerSampler thread failed: %s — no power data", exc)
+
+    def current_avg_watts(self) -> float:
+        """Return current average power in watts. 0.0 if no samples."""
+        if not self._samples:
+            return 0.0
+        # Use last 10 samples for a recent average
+        recent = self._samples[-10:] if len(self._samples) > 10 \
+            else self._samples
+        return sum(recent) / len(recent) if recent else 0.0
+
+    @property
+    def available(self) -> bool:
+        """True if NVML is working and samples are being collected."""
+        return self._running and len(self._samples) > 0
 
     # ── Report builder ────────────────────────────────────────────────────────
 
