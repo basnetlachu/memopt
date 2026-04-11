@@ -2112,7 +2112,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `cluster/tests/test_gkd.py` | 15 | 15 PASS (2 new: backend_degraded key, Redis degradation) |
 | `cluster/tests/test_lcp_prefix.py` | 18 | 18 PASS (Pillar 2 — LCP prefix matching) |
 | `cluster/tests/test_cluster.py` | 19 | 19 PASS |
-| `cluster/tests/test_pillar2_twonode.py` | 8 | 6 PASS, 1 SKIP, 1 flaky* |
+| `cluster/tests/test_pillar2_twonode.py` | 8 | 7 PASS, 1 SKIP |
 | `cluster/tests/test_pillar5_gum.py` | 19 | 19 PASS (Pillar 5 — all CPU/TCP, no GPU) |
 | `observability/tests/test_observability.py` | 29 | 29 PASS (2 new: write buffer flush, shutdown flush) |
 | `observability/tests/test_ledger_verify.py` | 6 | 6 PASS (Pillar 4 — chain verification) |
@@ -2126,7 +2126,7 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `kernels/tests/test_drift_hardening.py` | 7 | 7 PASS (drift detector, certify_now) |
 | `observability/tests/test_ledger_hardening.py` | 6 | 6 PASS (disk space, size_bytes) |
 
-*`test_pillar2_twonode` TCP tests are flaky when run after a prior suite that left a socket open (port reuse race). Passes in isolation.
+All TCP tests use dynamic port assignment via `_get_free_port()` — no port reuse races.
 
 ---
 
