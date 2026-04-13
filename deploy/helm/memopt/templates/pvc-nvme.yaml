@@ -1,0 +1,15 @@
+{{- if .Values.serving.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "memopt.fullname" . }}-nvme
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.storage.nvmeStorageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.nvmeSize }}
+{{- end }}

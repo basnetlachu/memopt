@@ -1,0 +1,34 @@
+[Unit]
+Description=memopt Serving Engine
+After=network.target memopt-transport.service
+Wants=memopt-transport.service
+
+[Service]
+Type=simple
+User=memopt
+Group=memopt
+EnvironmentFile=/etc/memopt/config.env
+WorkingDirectory=/var/memopt
+ExecStart=/usr/bin/python3 -m memopt.serving.server --port 8080
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=30s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memopt-serving
+
+# Security
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/memopt /dev/shm
+
+# GPU access
+SupplementaryGroups=video render
+
+[Install]
+WantedBy=multi-user.target

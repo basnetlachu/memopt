@@ -1,0 +1,19 @@
+{{- if .Values.serving.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memopt.fullname" . }}-serving
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+    component: serving
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.serving.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "memopt.selectorLabels" . | nindent 4 }}
+    component: serving
+{{- end }}

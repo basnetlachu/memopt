@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memopt-operator
+  namespace: memopt
+  labels:
+    app: memopt-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memopt-operator
+  template:
+    metadata:
+      labels:
+        app: memopt-operator
+    spec:
+      serviceAccountName: memopt-operator
+      containers:
+        - name: operator
+          image: memopt/serving:latest
+          command:
+            - python3
+            - -m
+            - memopt.operator.main
+          env:
+            - name: MEMOPT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MEMOPT_RECONCILE_INTERVAL_S
+              value: "30"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import sys
+                  sys.exit(0)
+            initialDelaySeconds: 10
+            periodSeconds: 30

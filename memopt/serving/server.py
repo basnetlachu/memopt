@@ -59,10 +59,62 @@ _node_id: str = ""
 # Pillar 6 — CertifyDaemon for drift detection + re-synthesis
 _certify_daemon: object = None
 _power_sampler: object = None
+_pod_controller: object = None
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="memopt serving", version="1.0") if _HAS_FASTAPI else None
+
+
+# ── Oracle helpers (importable, no FastAPI dependency) ────────────────────────
+
+
+def _get_oracle():
+    """Return the VMM oracle instance, or None."""
+    if _engine is None:
+        return None
+    vmm_inst = getattr(_engine, '_vmm', None)
+    if vmm_inst and hasattr(vmm_inst, 'oracle'):
+        return vmm_inst.oracle
+    return None
+
+
+def _get_top_transitions(oracle, top_k: int = 100) -> list[dict]:
+    """
+    Extract top_k transitions by count from a MemoryOracle.
+
+    Returns list of:
+    {
+        "from_block": int,
+        "to_block":   int,
+        "count":      int,
+        "confidence": float,  # count / total_from
+        "total_from": int     # total transitions from this block
+    }
+
+    Sorted by count descending.
+    Thread-safe. Returns [] on any error.
+    """
+    try:
+        results = []
+        with oracle._lock:
+            for from_block, targets in oracle._transitions.items():
+                total_from = sum(targets.values())
+                for to_block, count in targets.items():
+                    confidence = (
+                        count / total_from if total_from > 0 else 0.0)
+                    results.append({
+                        "from_block": from_block,
+                        "to_block":   to_block,
+                        "count":      count,
+                        "confidence": round(confidence, 4),
+                        "total_from": total_from,
+                    })
+
+        results.sort(key=lambda x: x["count"], reverse=True)
+        return results[:top_k]
+    except Exception:
+        return []
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
@@ -96,6 +148,163 @@ if _HAS_FASTAPI:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 if _HAS_FASTAPI:
+    _start_time = time.time()
+
+    @app.get("/oracle/stats")
+    def oracle_stats_endpoint():
+        """Top oracle transitions for pod controller aggregation."""
+        try:
+            oracle = _get_oracle()
+            if oracle is None:
+                return {
+                    "node_id": _node_id or "unknown",
+                    "transitions": [],
+                    "total_transitions": 0,
+                    "horizon": 0,
+                    "min_confidence": 0.3,
+                    "exported_at": time.time(),
+                }
+            top_transitions = _get_top_transitions(oracle)
+            stats = oracle.stats()
+            return {
+                "node_id": _node_id or "unknown",
+                "transitions": top_transitions,
+                "total_transitions":
+                    getattr(stats, 'transitions_learned',
+                            len(top_transitions)),
+                "horizon": getattr(stats, 'horizon', 0),
+                "min_confidence":
+                    getattr(oracle, '_min_confidence', 0.3),
+                "exported_at": time.time(),
+            }
+        except Exception:
+            return {
+                "node_id": _node_id or "unknown",
+                "transitions": [],
+                "total_transitions": 0,
+                "horizon": 0,
+                "min_confidence": 0.3,
+                "exported_at": time.time(),
+            }
+
+    @app.get("/oracle/health")
+    async def oracle_health():
+        """
+        Oracle health check for pod controller.
+        No auth required — internal network only.
+        """
+        oracle = _get_oracle()
+        if oracle is None:
+            return {
+                "node_id": _node_id or "unknown",
+                "oracle_active": False,
+                "transition_count": 0,
+                "horizon": 0,
+                "prediction_accuracy": 0.0,
+                "healthy": False,
+            }
+
+        try:
+            stats = oracle.stats()
+
+            transition_count = 0
+            try:
+                with oracle._lock:
+                    transition_count = sum(
+                        len(v) for v in
+                        oracle._transitions.values())
+            except Exception:
+                pass
+
+            accuracy = 0.0
+            try:
+                if hasattr(stats, "outcome_accuracy"):
+                    accuracy = stats.outcome_accuracy
+                elif stats.total_predictions_made > 0:
+                    accuracy = (
+                        stats.total_predictions_correct
+                        / stats.total_predictions_made)
+            except Exception:
+                pass
+
+            return {
+                "node_id": _node_id or "unknown",
+                "oracle_active": True,
+                "transition_count": transition_count,
+                "horizon": getattr(stats, "horizon", 0),
+                "prediction_accuracy": round(accuracy, 4),
+                "healthy": True,
+            }
+        except Exception as e:
+            log.error(f"Oracle health error: {e}")
+            return {
+                "node_id": _node_id or "unknown",
+                "oracle_active": False,
+                "transition_count": 0,
+                "horizon": 0,
+                "prediction_accuracy": 0.0,
+                "healthy": False,
+            }
+
+    @app.post("/oracle/merge")
+    async def oracle_merge(payload: dict):
+        """
+        Receive transitions from pod oracle and merge into local oracle.
+
+        Called by pod controller to push high-confidence pod-level
+        transitions down to individual nodes.
+
+        Only merges transitions with
+        confidence >= MEMOPT_MIN_MERGE_CONFIDENCE (default 0.5).
+
+        No auth — internal network only.
+        """
+        oracle = _get_oracle()
+        if oracle is None:
+            return {"merged": 0, "skipped": 0,
+                    "reason": "oracle_not_active"}
+
+        min_confidence = float(os.getenv(
+            "MEMOPT_MIN_MERGE_CONFIDENCE", "0.5"))
+
+        transitions = payload.get("transitions", [])
+        source = payload.get("source", "unknown")
+
+        merged = 0
+        skipped = 0
+
+        for t in transitions:
+            try:
+                confidence = t.get("confidence", 0.0)
+                if confidence < min_confidence:
+                    skipped += 1
+                    continue
+
+                from_block = int(t["from_block"])
+                to_block   = int(t["to_block"])
+                count      = int(t["count"])
+
+                # Cap injected count to avoid one pod overwhelming
+                # the local oracle's learned transitions
+                merge_count = min(count, 10)
+
+                # Directly inject the transition rather than calling
+                # observe() repeatedly — observe() would create
+                # spurious prev→from transitions as a side effect
+                with oracle._lock:
+                    oracle._transitions[from_block][to_block] += \
+                        merge_count
+
+                merged += 1
+            except Exception:
+                skipped += 1
+
+        log.debug(
+            f"Oracle merge from {source}: "
+            f"merged={merged} skipped={skipped}")
+
+        return {"merged": merged, "skipped": skipped}
+
     @app.get("/health")
     def health():
         return {
@@ -103,6 +312,169 @@ if _HAS_FASTAPI:
             "engine": "continuous_batching",
             "ready": _engine is not None,
         }
+
+    @app.get("/healthz")
+    def healthz():
+        """Liveness probe — 200 if alive, 503 if should be restarted.
+        Must respond in < 100ms. No blocking calls. No auth required."""
+        try:
+            checks = {}
+            healthy = True
+
+            # Check background threads
+            try:
+                from memopt.vmm import VMM
+                vmm_instance = getattr(_engine, '_vmm', None)
+                if vmm_instance and hasattr(vmm_instance, 'prefetch'):
+                    if not vmm_instance.prefetch.is_healthy():
+                        checks["threads"] = "unhealthy"
+                        healthy = False
+                    else:
+                        checks["threads"] = "ok"
+                else:
+                    checks["threads"] = "ok"
+            except Exception:
+                checks["threads"] = "ok"
+
+            # Check Redis degradation duration
+            try:
+                if _gkd_store is not None:
+                    stats = _gkd_store.stats()
+                    degraded = stats.get("backend_degraded", False)
+                    since = stats.get("backend_degraded_since")
+                    if degraded and since is not None:
+                        duration = time.monotonic() - since
+                        if duration > 300:  # > 5 minutes
+                            checks["redis"] = "degraded_5m"
+                            healthy = False
+                        else:
+                            checks["redis"] = "degraded"
+                    else:
+                        checks["redis"] = "ok"
+                else:
+                    checks["redis"] = "not_configured"
+            except Exception:
+                checks["redis"] = "ok"
+
+            status_code = 200 if healthy else 503
+            # HAL-reported hardware info — callers use this to route
+            # traffic (AMD vs NVIDIA pools, CPU-only debug nodes).
+            hw_backend = "unknown"
+            gpu_count = 0
+            try:
+                from memopt.vmm.hal import get_hal
+                _hal = get_hal()
+                hw_backend = _hal.backend.value
+                gpu_count = _hal.gpu_count
+            except Exception:
+                pass
+
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=status_code,
+                content={
+                    "status": "ok" if healthy else "degraded",
+                    "node_id": _node_id or "unknown",
+                    "uptime_seconds": round(
+                        time.time() - _start_time, 1),
+                    "hardware_backend": hw_backend,
+                    "gpu_count": gpu_count,
+                    "checks": checks,
+                })
+        except Exception:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "node_id": _node_id or "unknown",
+                })
+
+    @app.get("/readyz")
+    def readyz():
+        """Readiness probe — 200 if ready to serve, 503 if not.
+        Kubernetes removes pod from endpoints on 503.
+        May take up to 500ms. No auth required."""
+        try:
+            checks = {}
+            ready = True
+            reason = ""
+
+            # Check engine initialized
+            if _engine is None:
+                ready = False
+                reason = "engine_not_initialized"
+                checks["engine"] = "not_ready"
+            else:
+                checks["engine"] = "ok"
+
+            # Check GKD store initialized
+            if _gkd_store is not None:
+                checks["gkd"] = "ok"
+            else:
+                checks["gkd"] = "local_fallback"
+
+            # Check silicon certification
+            cert_hash = ""
+            try:
+                if _certify_daemon is not None:
+                    if _certify_daemon.is_certified():
+                        checks["certification"] = "valid"
+                        last = _certify_daemon.last_result()
+                        if last:
+                            cert_hash = str(
+                                last.get("certificate_hash",
+                                         ""))[:16]
+                    else:
+                        checks["certification"] = "not_certified"
+                else:
+                    checks["certification"] = "not_configured"
+            except Exception:
+                checks["certification"] = "unknown"
+
+            # Check drift
+            drift_pct = 0.0
+            try:
+                if _certify_daemon is not None:
+                    ds = _certify_daemon.drift_stats()
+                    if ds.get("is_drifted", False):
+                        drift_pct = ds.get("drift_pct", 0.0) or 0.0
+                        if drift_pct > 15.0:
+                            ready = False
+                            reason = "drift_exceeded_15pct"
+                            checks["drift"] = f"{drift_pct:.1f}%"
+                        else:
+                            checks["drift"] = f"{drift_pct:.1f}%"
+                    else:
+                        checks["drift"] = "none"
+            except Exception:
+                checks["drift"] = "unknown"
+
+            status_code = 200 if ready else 503
+            from fastapi.responses import JSONResponse
+            content = {
+                "status": "ready" if ready else "not_ready",
+                "node_id": _node_id or "unknown",
+                "checks": checks,
+            }
+            if cert_hash:
+                content["cert_hash"] = cert_hash
+            if drift_pct > 0:
+                content["drift_pct"] = drift_pct
+            if not ready and reason:
+                content["reason"] = reason
+
+            return JSONResponse(
+                status_code=status_code, content=content)
+        except Exception:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "reason": "internal_error",
+                    "node_id": _node_id or "unknown",
+                })
 
     @app.get("/report/found-capacity")
     def found_capacity_report():
@@ -370,6 +742,113 @@ if _HAS_FASTAPI:
                 total_tokens=input_ids.shape[1] + result.tokens_generated,
             ),
         )
+
+
+    # ── Pod GKD endpoints ──────────────────────────────────────────────────────
+
+    @app.get("/pod/gkd/lookup")
+    def pod_gkd_lookup(hash: str = "", seq_len: int = 0):
+        """Pod-level GKD cache lookup. No auth (internal network)."""
+        if _pod_controller is None:
+            return {"hit": False, "block_ref": None, "node_id": None}
+        try:
+            entry = _pod_controller._gkd_cache.get(hash, seq_len)
+            if entry:
+                return {
+                    "hit": True,
+                    "block_ref": entry.get("block_ref"),
+                    "node_id": entry.get("node_id"),
+                }
+            return {"hit": False, "block_ref": None, "node_id": None}
+        except Exception:
+            return {"hit": False, "block_ref": None, "node_id": None}
+
+    @app.post("/pod/gkd/register")
+    def pod_gkd_register(payload: dict):
+        """Register entry in pod GKD cache. No auth (internal)."""
+        if _pod_controller is None:
+            return {"status": "no_pod_controller"}
+        try:
+            _pod_controller._gkd_cache.put(
+                payload.get("hash", ""),
+                payload.get("seq_len", 0),
+                {
+                    "block_ref": payload.get("block_ref", ""),
+                    "node_id": payload.get("node_id", ""),
+                })
+            return {"status": "ok"}
+        except Exception:
+            return {"status": "error"}
+
+    @app.get("/pod/gkd/stats")
+    def pod_gkd_stats():
+        """Pod GKD cache stats."""
+        if _pod_controller is None:
+            return {"pod_controller": "not_active"}
+        return _pod_controller._gkd_cache.stats()
+
+    @app.get("/pod/oracle/stats")
+    async def pod_oracle_stats():
+        """
+        Export pod oracle transitions for global oracle aggregation.
+
+        Only active when pod controller is running (MEMOPT_POD_ID set).
+        No auth — internal network only.
+        """
+        if _pod_controller is None:
+            return {
+                "pod_id": "",
+                "transitions": [],
+                "aggregator_stats": {},
+                "exported_at": time.time(),
+            }
+
+        try:
+            transitions = \
+                _pod_controller._aggregator.get_pod_transitions(
+                    top_k=200)
+
+            return {
+                "pod_id": _pod_controller._config.pod_id,
+                "transitions": transitions,
+                "aggregator_stats":
+                    _pod_controller._aggregator.stats(),
+                "exported_at": time.time(),
+            }
+        except Exception as e:
+            log.error(f"Pod oracle export error: {e}")
+            return {
+                "pod_id": "",
+                "transitions": [],
+                "aggregator_stats": {},
+                "exported_at": time.time(),
+            }
+
+    @app.get("/pod/bloom-filter")
+    def pod_bloom_filter():
+        """
+        Export the node's bloom filter as base64 bytes.
+        Pod controllers can merge bloom filters from all nodes
+        to build a cluster-wide negative filter.
+        """
+        import base64
+        if _gkd_store is None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=503,
+                content={"error": "gkd_store not initialized"})
+        try:
+            raw = _gkd_store._bloom.to_bytes()
+            return {
+                "node_id": _node_id,
+                "bloom_bytes_b64": base64.b64encode(raw).decode(),
+                "bloom_stats": _gkd_store._bloom.stats(),
+            }
+        except Exception as e:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(e)})
 
 
 # ── Engine builder ────────────────────────────────────────────────────────────

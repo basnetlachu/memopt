@@ -1,0 +1,54 @@
+#!ipxe
+#
+# memopt iPXE boot script.
+# Served by a TFTP/HTTP boot server to nodes performing network boot.
+# Flow:
+#   1. Resolve the memopt boot server URL (DHCP option 175, or baked
+#      default).
+#   2. Chainload the per-MAC boot configuration from the boot server.
+#      The control plane's GET /boot/config/{mac} returns JSON + an
+#      `ipxe_script` URL that iPXE can chain to.
+#   3. On chain failure, fall back to the "latest" image and a minimal
+#      kernel command line so the node still comes up for debugging.
+#
+# REQUIRES: A real iPXE-capable NIC and a PXE/TFTP/HTTP boot server.
+#           Cannot be executed without hardware.
+
+# ── Boot server URL ──────────────────────────────────────────────────
+# DHCP option 175 may carry a custom URL. Fall back to the default
+# when unset.
+set boot-server ${175:string}
+isset ${boot-server} || set boot-server http://memopt-boot.example.com
+
+# ── Node identity ────────────────────────────────────────────────────
+# MAC address is always available and is the canonical identity for
+# PXE boot before the node has learned its memopt node_id.
+set node-mac ${net0/mac}
+
+echo memopt iPXE boot: node-mac=${node-mac} boot-server=${boot-server}
+
+# ── Primary: chainload per-MAC configuration ─────────────────────────
+chain --timeout 10000 ${boot-server}/boot/config/${node-mac} || goto fallback
+
+# If chain succeeded, iPXE will have executed the returned script and
+# will not reach here. The explicit goto ensures we don't silently
+# fall through if the server returned an unexpected content-type.
+goto booted
+
+# ── Fallback: boot latest image with a minimal kernel cmdline ────────
+:fallback
+echo Boot server unreachable, using fallback
+set image-url ${boot-server}/images/latest
+set kernel-args memopt.node_id=${node-mac} memopt.boot_server=${boot-server} systemd.unit=memopt-boot.target
+
+kernel ${image-url}/vmlinuz ${kernel-args}
+initrd ${image-url}/initrd.img
+imgstat
+boot || goto failed
+
+:booted
+exit
+
+:failed
+echo Boot failed
+shell

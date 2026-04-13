@@ -1,0 +1,45 @@
+apiVersion: memopt.io/v1alpha1
+kind: MemoptCluster
+metadata:
+  name: nebius-design-partner
+  namespace: memopt
+  annotations:
+    memopt.io/description: >
+      Design partner deployment for Nebius.
+      3-128 nodes, A100 SXM4.
+      Redis for cluster-wide GKD.
+      RDMA auto-detection.
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+    node.kubernetes.io/instance-type: a100-sxm4
+
+  image:
+    repository: memopt/serving
+    tag: latest
+
+  redis:
+    url: "redis://redis-service:6379"
+
+  serving:
+    port: 8080
+    resources:
+      requests:
+        cpu: "4000m"
+        memory: "16Gi"
+      limits:
+        cpu: "8000m"
+        memory: "32Gi"
+
+  transport:
+    # auto = tries RDMA, falls back to TCP
+    mode: auto
+
+  certification:
+    enabled: true
+    # Daily at midnight
+    schedule: "0 0 * * *"
+
+  globalOracle:
+    enabled: false
+    pullIntervalSeconds: 60

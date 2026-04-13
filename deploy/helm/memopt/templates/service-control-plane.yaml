@@ -1,0 +1,19 @@
+{{- if .Values.controlPlane.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "memopt.fullname" . }}-control-plane
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+    component: control-plane
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.controlPlane.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "memopt.selectorLabels" . | nindent 4 }}
+    component: control-plane
+{{- end }}

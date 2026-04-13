@@ -1,0 +1,39 @@
+apiVersion: memopt.io/v1alpha1
+kind: MemoptCluster
+metadata:
+  name: validation-cluster
+  namespace: memopt
+spec:
+  # Select all GPU nodes
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+  image:
+    repository: memopt/serving
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  serving:
+    port: 8080
+    resources:
+      requests:
+        cpu: "2000m"
+        memory: "8Gi"
+      limits:
+        cpu: "8000m"
+        memory: "32Gi"
+
+  # No Redis for single-node validation
+  # GKD uses local backend
+  redis:
+    url: ""
+
+  transport:
+    mode: tcp
+
+  certification:
+    enabled: true
+    schedule: "0 */6 * * *"
+
+  globalOracle:
+    enabled: false

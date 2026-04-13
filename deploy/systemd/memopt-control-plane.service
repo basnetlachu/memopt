@@ -1,0 +1,23 @@
+[Unit]
+Description=memopt Control Plane
+After=network.target
+
+[Service]
+Type=simple
+User=memopt
+Group=memopt
+EnvironmentFile=/etc/memopt/config.env
+ExecStart=/usr/bin/python3 -m memopt.control_plane.server --port 8765
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memopt-control-plane
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

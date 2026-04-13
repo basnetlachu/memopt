@@ -1,0 +1,24 @@
+[Unit]
+Description=memopt Pod Controller
+After=network.target memopt-serving.service
+Wants=memopt-serving.service
+
+[Service]
+Type=simple
+User=memopt
+Group=memopt
+EnvironmentFile=/etc/memopt/config.env
+ExecStart=/usr/bin/python3 -m memopt pod-controller start --pod-id ${MEMOPT_POD_ID}
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memopt-pod-controller
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

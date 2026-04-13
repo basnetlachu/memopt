@@ -1,0 +1,75 @@
+{{- if .Values.transport.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "memopt.fullname" . }}-transport
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+    component: transport
+spec:
+  selector:
+    matchLabels:
+      {{- include "memopt.selectorLabels" . | nindent 6 }}
+      component: transport
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "memopt.selectorLabels" . | nindent 8 }}
+        component: transport
+    spec:
+      serviceAccountName: {{ include "memopt.serviceAccountName" . }}
+      hostNetwork: true
+      hostIPC: true
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: transport
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/local/bin/memopt-transport
+            - --node-id
+            - $(MEMOPT_NODE_ID)
+            - --tcp-port
+            - "{{ .Values.transport.port }}"
+          env:
+            - name: MEMOPT_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: MEMOPT_TRANSPORT
+              value: {{ .Values.memopt.transport | quote }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "memopt.fullname" . }}-config
+          ports:
+            - containerPort: {{ .Values.transport.port }}
+              hostPort: {{ .Values.transport.port }}
+              protocol: TCP
+            - containerPort: {{ .Values.transport.gossipPort }}
+              hostPort: {{ .Values.transport.gossipPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.transport.resources | nindent 12 }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: memopt-data
+              mountPath: /var/memopt
+      volumes:
+        - name: shm
+          hostPath:
+            path: /dev/shm
+        - name: memopt-data
+          hostPath:
+            path: /var/memopt
+            type: DirectoryOrCreate
+{{- end }}

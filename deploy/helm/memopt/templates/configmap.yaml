@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "memopt.fullname" . }}-config
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+data:
+  MEMOPT_TRANSPORT: {{ .Values.memopt.transport | quote }}
+  MEMOPT_NVME_DIR: {{ .Values.memopt.nvmeDir | quote }}
+  MEMOPT_EVICT_HIGH: {{ .Values.memopt.evictHigh | quote }}
+  MEMOPT_EVICT_LOW: {{ .Values.memopt.evictLow | quote }}
+  MEMOPT_GOSSIP_FANOUT: {{ .Values.memopt.gossipFanout | quote }}
+  MEMOPT_CERTIFY_ON_STARTUP: {{ .Values.memopt.certifyOnStartup | quote }}

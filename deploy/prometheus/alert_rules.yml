@@ -1,0 +1,68 @@
+groups:
+  - name: memopt_canary
+    rules:
+
+      - alert: MemoptRolloutPaused
+        expr: memopt_rollout_stage == 6
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: memopt rollout is paused
+          description: >
+            The active memopt rollout has been paused for more than
+            1 minute. Check the canary controller logs and the most
+            recent gate evaluation to determine whether to resume
+            or abort.
+
+      - alert: MemoptRolloutFailed
+        expr: memopt_rollout_stage == 7
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: memopt rollout has failed
+          description: >
+            The active memopt rollout transitioned to FAILED. Some
+            nodes may be running a regressed image. Verify rollback
+            intent is recorded for affected nodes and reboot them
+            via IPMI/manual intervention.
+
+      - alert: MemoptCertFailureHigh
+        expr: >
+          (
+            sum(rate(memopt_cert_failures_total[5m]))
+            /
+            sum(rate(memopt_cert_attempts_total[5m]))
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: High certification failure rate
+          description: >
+            More than 5% of silicon certifications are failing over
+            the last 5 minutes. This typically indicates either bad
+            hardware entering the cluster or a bad image version.
+
+      - alert: MemoptNodeUnhealthy
+        expr: up{job="memopt-serving"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: memopt serving is down on a node
+          description: >
+            memopt serving is unreachable on {{ $labels.instance }}
+            for more than 1 minute.
+
+      - alert: MemoptHighDrift
+        expr: memopt_drift_pct > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: High hardware drift detected
+          description: >
+            Node {{ $labels.node_id }} has drift of {{ $value }}%.
+            Thresholds: > 5% alert, > 15% triggers eviction.

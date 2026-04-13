@@ -1,17 +1,25 @@
-# memopt single-server deployment
-# Usage:
-#   cp deployment/single-server/.env.example .env
-#   nano .env   # add MEMOPT_LICENSE_KEY and NODE_NAME
-#   docker-compose up -d
-
+# memopt local development stack
+# Usage: docker-compose up -d
+# Access: serving at :8080, control plane at :8765,
+#         Grafana at :3000, Prometheus at :9090
 
 services:
-  memopt:
-    image: ghcr.io/basnetlachu/memopt:latest
-    container_name: memopt
+  memopt-serving:
+    build: .
+    image: memopt/serving:dev
+    ports:
+      - "8080:8080"
+    environment:
+      - MEMOPT_NODE_ID=dev-node-01
+      - REDIS_URL=redis://redis:6379
+      - MEMOPT_TRANSPORT=tcp
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - memopt-data:/home/memopt/.memopt
     restart: unless-stopped
-
-    # GPU access — uses all GPUs on the host
     deploy:
       resources:
         reservations:
@@ -20,95 +28,101 @@ services:
               count: all
               capabilities: [gpu]
 
-    # Host PID namespace — required for memopt scan to see running LLMs
-    pid: host
-
-    # Privileged — required for nvidia-smi and /proc access
-    privileged: true
-
-    environment:
-      # ── Required ───────────────────────────────────────────────────────────
-      - MEMOPT_LICENSE_KEY=${MEMOPT_LICENSE_KEY}
-      - NODE_NAME=${NODE_NAME:-memopt-node}
-
-      # ── Optional — generated on first run if not set ───────────────────────
-      - MEMOPT_API_KEY=${MEMOPT_API_KEY:-}
-
-      # ── Operational config ─────────────────────────────────────────────────
-      - MEMOPT_MODE=${MEMOPT_MODE:-full}
-      - MEMOPT_GPU_COST_PER_HOUR=${MEMOPT_GPU_COST_PER_HOUR:-2.50}
-      - MEMOPT_SCAN_INTERVAL=${MEMOPT_SCAN_INTERVAL:-60}
-      - MEMOPT_SAMPLE_SECONDS=${MEMOPT_SAMPLE_SECONDS:-5}
-      - MEMOPT_AUTO_APPLY=${MEMOPT_AUTO_APPLY:-false}
-
-      # ── Multi-node (optional) ──────────────────────────────────────────────
-      # Set to URL of dedicated control plane for multi-node clusters
-      - MEMOPT_CONTROL_PLANE=${MEMOPT_CONTROL_PLANE:-}
-
-      # ── TLS / HTTPS (optional) ─────────────────────────────────────────────
-      - MEMOPT_HTTPS=${MEMOPT_HTTPS:-false}
-      - MEMOPT_DOMAIN=${MEMOPT_DOMAIN:-}
-      # MEMOPT_TLS_CERT and MEMOPT_TLS_KEY: base64-encoded PEM files
-      # Only needed if MEMOPT_HTTPS=true and no certs in memopt_data volume
-
-      # ── Keygen.sh (set at build time, not runtime) ─────────────────────────
-      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-YOUR_KEYGEN_ACCOUNT_ID}
-
+  memopt-control-plane:
+    build: .
+    image: memopt/serving:dev
+    command:
+      - python3
+      - -m
+      - memopt.control_plane.server
+      - --port
+      - "8765"
     ports:
-      - "8080:8080"   # Dashboard + control plane API
-      - "8000:8000"   # Per-node REST API + Prometheus /metrics
-      - "443:443"     # HTTPS (when MEMOPT_HTTPS=true)
-
+      - "8765:8765"
+    environment:
+      - MEMOPT_NODE_ID=control-plane-01
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://memopt:memopt_dev@postgres/memopt
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     volumes:
-      # Persist memopt state across container restarts
-      # (API key, license cache, SQLite DB, drift alerts, TLS certs)
-      - memopt_data:/root/.memopt
-      # Read-only /proc access for process detection on host
-      - /proc:/proc:ro
+      - memopt-data:/home/memopt/.memopt
+    restart: unless-stopped
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: memopt
+      POSTGRES_USER: memopt
+      POSTGRES_PASSWORD: memopt_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "pg_isready -U memopt"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  scylladb:
+    image: scylladb/scylla:5.4
+    command: --developer-mode=1 --smp=1 --memory=512M
+    ports:
+      - "9042:9042"
+    volumes:
+      - scylla-data:/var/lib/scylla
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 30s
+      retries: 10
+      start_period: 60s
 
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  # ── Optional: Prometheus ─────────────────────────────────────────────────
-  # Uncomment to include Prometheus in this stack.
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   container_name: memopt-prometheus
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-  #     - prometheus_data:/prometheus
-  #   ports:
-  #     - "9090:9090"
-  #   command:
-  #     - '--config.file=/etc/prometheus/prometheus.yml'
-  #     - '--storage.tsdb.retention.time=30d'
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
 
-  # ── Optional: Grafana ────────────────────────────────────────────────────
-  # grafana:
-  #   image: grafana/grafana:latest
-  #   container_name: memopt-grafana
-  #   restart: unless-stopped
-  #   ports:
-  #     - "3000:3000"
-  #   environment:
-  #     - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-memopt}
-  #   volumes:
-  #     - grafana_data:/var/lib/grafana
-  #     - ./memopt/grafana/provisioning:/etc/grafana/provisioning:ro
-  #     - ./memopt/grafana/memopt_dashboard.json:/etc/grafana/dashboards/memopt.json:ro
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=memopt
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./deploy/grafana:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
 
 volumes:
-  memopt_data:
-  # prometheus_data:
-  # grafana_data:
+  memopt-data:
+  redis-data:
+  scylla-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

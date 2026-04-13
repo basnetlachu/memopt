@@ -1,0 +1,84 @@
+image:
+  repository: memopt/serving
+  tag: latest
+  pullPolicy: IfNotPresent
+
+redis:
+  url: ""  # Required — set via --set redis.url=redis://redis:6379
+
+controlPlane:
+  enabled: true
+  replicas: 1
+  port: 8765
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+
+serving:
+  enabled: true
+  replicas: 1
+  port: 8080
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "4Gi"
+      nvidia.com/gpu: 1
+    limits:
+      cpu: "4000m"
+      memory: "16Gi"
+      nvidia.com/gpu: 1
+
+transport:
+  enabled: true
+  port: 18516
+  gossipPort: 18600
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+
+memopt:
+  nodeId: ""  # Auto-detected from hostname if empty
+  transport: tcp
+  nvmeDir: /var/memopt/nvme
+  evictHigh: "0.90"
+  evictLow: "0.75"
+  gossipFanout: "5"
+  certifyOnStartup: "true"
+  logLevel: INFO
+
+storage:
+  nvmeSize: 100Gi
+  nvmeStorageClass: local-path
+
+secrets:
+  anthropicApiKey: ""
+  memoptSigningKey: ""
+  memoptApiKey: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+operator:
+  enabled: false
+  replicas: 1
+  reconcileIntervalSeconds: 30
+  dryRun: false
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+crds:
+  install: true

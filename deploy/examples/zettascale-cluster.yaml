@@ -1,0 +1,32 @@
+apiVersion: memopt.io/v1alpha1
+kind: MemoptCluster
+metadata:
+  name: zettascale-cluster
+  namespace: memopt
+  annotations:
+    memopt.io/status: >
+      FUTURE — requires Phase 6-10 completion.
+      Documents target architecture only.
+      Not deployable with current implementation.
+spec:
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+  image:
+    repository: memopt/serving
+    tag: latest
+
+  # ScyllaDB for 100M+ ops/sec
+  scylladb:
+    hosts: "scylla-1:9042,scylla-2:9042,scylla-3:9042"
+
+  transport:
+    mode: rdma
+
+  certification:
+    enabled: true
+    schedule: "0 0 * * *"
+
+  globalOracle:
+    enabled: true
+    pullIntervalSeconds: 60

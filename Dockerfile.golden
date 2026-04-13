@@ -1,0 +1,192 @@
+# memopt golden image — bakes memopt completely into Ubuntu 22.04.
+#
+# Differs from the production Dockerfile:
+#   - Ubuntu 22.04 base (CUDA runtime installed via NVIDIA apt repo)
+#   - Includes systemd + cloud-init for bare-metal / PXE boot
+#   - Includes memopt-transport binary
+#   - Pre-compiles C++ extensions for all SM targets
+#   - Writes /etc/memopt/version + /etc/memopt/git-commit so the
+#     running node knows exactly which image it booted from.
+#
+# Multi-stage:
+#   cuda-base : Ubuntu + CUDA runtime via apt
+#   builder   : adds toolchain, builds C++ extensions + transport
+#   golden    : final — no compilers, no build tools
+
+ARG CUDA_VERSION=12.4
+ARG PYTHON_VERSION=3.11
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 1: cuda-base — Ubuntu 22.04 + CUDA runtime from NVIDIA apt repo
+# ═══════════════════════════════════════════════════════════════════════════
+
+FROM ubuntu:22.04 AS cuda-base
+
+ARG CUDA_VERSION
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget gnupg2 curl ca-certificates \
+    && wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cuda-runtime-${CUDA_VERSION/./-} \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 2: builder — compiles C++ extensions for all SM targets
+# ═══════════════════════════════════════════════════════════════════════════
+
+FROM cuda-base AS builder
+
+ARG PYTHON_VERSION
+ARG CUDA_ARCHITECTURES="86;90;100"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+    && wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc \
+        | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main" \
+        > /etc/apt/sources.list.d/kitware.list \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+        python3-pip \
+        cmake \
+        ninja-build \
+        gcc g++ \
+        libibverbs-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 \
+        /usr/bin/python${PYTHON_VERSION} 1
+
+RUN python3 -m pip install --no-cache-dir \
+        pybind11>=2.13.0 \
+        scikit-build-core>=0.10.0 \
+        build wheel setuptools>=61.0
+
+WORKDIR /build
+
+COPY csrc/ csrc/
+COPY pyproject.toml setup.py README.md ./
+COPY memopt/ memopt/
+
+# Build C++ extensions; on a CPU-only build machine (no CUDA),
+# we continue anyway — Python fallback ships with the package.
+RUN mkdir -p csrc/build && cd csrc/build \
+    && cmake .. \
+        -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+        -DMEMOPT_ENABLE_TESTS=OFF \
+    && ninja -j"$(nproc)" \
+    || echo "WARNING: C++ build failed — Python fallback will be used"
+
+RUN mkdir -p /artifacts/memopt /artifacts/bin \
+    && find csrc/build -name "_memopt_*.so" -exec cp {} /artifacts/memopt/ \; 2>/dev/null \
+    && (cp csrc/build/memopt-transport /artifacts/bin/ 2>/dev/null || true)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage 3: golden — final image, no compilers
+# ═══════════════════════════════════════════════════════════════════════════
+
+FROM cuda-base AS golden
+
+ARG PYTHON_VERSION
+ARG MEMOPT_VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+ARG CUDA_ARCHITECTURES="86;90;100"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+LABEL memopt.version="${MEMOPT_VERSION}"
+LABEL memopt.git-commit="${GIT_COMMIT}"
+LABEL memopt.build-date="${BUILD_DATE}"
+LABEL memopt.sm-targets="${CUDA_ARCHITECTURES}"
+LABEL org.opencontainers.image.title="memopt-golden"
+LABEL org.opencontainers.image.description="memopt golden image — baked for PXE/bare-metal boot"
+
+# Runtime packages only. No compilers, no cmake, no build tools.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-venv \
+        python3-pip \
+        libgomp1 \
+        systemd systemd-sysv \
+        openssh-server \
+        cloud-init \
+        curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 \
+        /usr/bin/python${PYTHON_VERSION} 1
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip
+
+WORKDIR /app
+
+COPY pyproject.toml setup.py README.md ./
+COPY requirements.txt ./
+COPY memopt/ memopt/
+
+# Pinned runtime dependencies only
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -e .
+
+# Copy pre-compiled C++ extensions + transport binary from builder
+RUN --mount=from=builder,source=/artifacts,target=/tmp/artifacts \
+    cp /tmp/artifacts/memopt/*.so memopt/ 2>/dev/null || true; \
+    cp /tmp/artifacts/bin/memopt-transport /usr/local/bin/ 2>/dev/null || true; \
+    echo "C++ extensions:" && ls memopt/_memopt*.so 2>/dev/null || echo "  (none — Python fallback)"
+
+# memopt service user (non-login)
+RUN useradd -r -s /sbin/nologin memopt
+
+# Directory structure for bare-metal deployment
+RUN mkdir -p \
+        /etc/memopt \
+        /var/memopt/nvme \
+        /var/memopt/certs \
+        /var/memopt/logs \
+        /var/run/memopt \
+    && chown -R memopt:memopt /var/memopt /var/run/memopt
+
+# Systemd units — copied but NOT enabled during docker build because
+# systemctl cannot execute inside the container builder. First_boot.sh
+# enables them via `systemctl enable` on the real node.
+COPY deploy/systemd/memopt-transport.service       /etc/systemd/system/
+COPY deploy/systemd/memopt-serving.service         /etc/systemd/system/
+COPY deploy/systemd/memopt-control-plane.service   /etc/systemd/system/
+COPY deploy/systemd/memopt-pod-controller.service  /etc/systemd/system/
+
+# First-boot script
+COPY scripts/first_boot.sh /usr/local/bin/memopt-first-boot
+RUN chmod +x /usr/local/bin/memopt-first-boot
+
+# Entrypoint for container use (ignored under systemd PXE boot)
+RUN printf '#!/bin/bash\nset -e\ncase "${1:-serve}" in\n  serve) exec python3 -m memopt.serving.server ;;\n  transport) exec /usr/local/bin/memopt-transport ;;\n  first-boot) exec /usr/local/bin/memopt-first-boot ;;\n  *) exec "$@" ;;\nesac\n' > /usr/local/bin/memopt-entrypoint.sh \
+    && chmod +x /usr/local/bin/memopt-entrypoint.sh
+
+# Version stamps — the contract of a golden image
+RUN echo "${MEMOPT_VERSION}" > /etc/memopt/version \
+    && echo "${GIT_COMMIT}" > /etc/memopt/git-commit \
+    && echo "${BUILD_DATE}" > /etc/memopt/build-date \
+    && echo "${CUDA_ARCHITECTURES}" > /etc/memopt/sm-targets
+
+EXPOSE 8080 8765 18516 18600
+
+ENTRYPOINT ["/usr/local/bin/memopt-entrypoint.sh"]
+CMD ["serve"]

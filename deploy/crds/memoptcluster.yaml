@@ -1,0 +1,202 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: memoptclusters.memopt.io
+spec:
+  group: memopt.io
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - nodeSelector
+              properties:
+                nodeSelector:
+                  type: object
+                  description: >
+                    Label selector for GPU nodes.
+                    Only nodes matching these labels will have
+                    memopt deployed.
+                  additionalProperties:
+                    type: string
+
+                image:
+                  type: object
+                  properties:
+                    repository:
+                      type: string
+                      default: "memopt/serving"
+                    tag:
+                      type: string
+                      default: "latest"
+                    pullPolicy:
+                      type: string
+                      enum:
+                        - Always
+                        - IfNotPresent
+                        - Never
+                      default: "IfNotPresent"
+
+                redis:
+                  type: object
+                  properties:
+                    url:
+                      type: string
+                      description: >
+                        Redis connection URL.
+                        Leave empty to use local GKD backend only.
+
+                scylladb:
+                  type: object
+                  properties:
+                    hosts:
+                      type: string
+                      description: >
+                        Comma-separated ScyllaDB hosts for
+                        large scale GKD.
+
+                serving:
+                  type: object
+                  properties:
+                    port:
+                      type: integer
+                      minimum: 1024
+                      maximum: 65535
+                      default: 8080
+                    resources:
+                      type: object
+                      properties:
+                        requests:
+                          type: object
+                          properties:
+                            cpu:
+                              type: string
+                            memory:
+                              type: string
+                        limits:
+                          type: object
+                          properties:
+                            cpu:
+                              type: string
+                            memory:
+                              type: string
+
+                certification:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                      description: >
+                        Run silicon certification before
+                        admitting new nodes.
+                    schedule:
+                      type: string
+                      default: "0 0 * * *"
+                      description: >
+                        Cron schedule for periodic
+                        recertification.
+
+                transport:
+                  type: object
+                  properties:
+                    mode:
+                      type: string
+                      enum:
+                        - tcp
+                        - rdma
+                        - auto
+                      default: "auto"
+
+                globalOracle:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    pullIntervalSeconds:
+                      type: integer
+                      minimum: 10
+                      default: 60
+
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Initializing
+                    - Running
+                    - Degraded
+                    - Failed
+                  description: Current phase of the cluster.
+
+                readyNodes:
+                  type: integer
+                  description: >
+                    Number of nodes with memopt running and
+                    certified.
+
+                totalNodes:
+                  type: integer
+                  description: Total nodes matching nodeSelector.
+
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+
+                observedGeneration:
+                  type: integer
+
+      subresources:
+        status: {}
+
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Ready
+          type: string
+          jsonPath: .status.readyNodes
+        - name: Total
+          type: string
+          jsonPath: .status.totalNodes
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+
+  scope: Namespaced
+  names:
+    plural: memoptclusters
+    singular: memoptcluster
+    kind: MemoptCluster
+    shortNames:
+      - mc

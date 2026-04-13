@@ -399,3 +399,66 @@ if(MEMOPT_ENABLE_TESTS)
     endif()
     add_test(NAME test_prefix_match COMMAND test_prefix_match)
 endif()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AMD ROCm backend
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Two compile modes:
+#   MEMOPT_ENABLE_ROCM=ON   → require HIP + ROCm; build real bindings
+#   MEMOPT_ENABLE_ROCM=OFF  → build stub module so Python imports
+#                             always succeed on CUDA-only hosts
+#
+# The stub emits `_memopt_rocm.ROCM_AVAILABLE = False`; the real module
+# emits `ROCM_AVAILABLE = True`. Python shim (_rocm_backend_py.py)
+# checks this attribute.
+
+option(MEMOPT_ENABLE_ROCM "Build AMD ROCm backend" OFF)
+
+if(MEMOPT_ENABLE_ROCM)
+    set(ROCM_PATH $ENV{ROCM_PATH}
+        CACHE PATH "Path to ROCm installation")
+    if(NOT ROCM_PATH)
+        set(ROCM_PATH "/opt/rocm")
+    endif()
+
+    find_package(hip QUIET
+        PATHS ${ROCM_PATH}/cmake
+              ${ROCM_PATH}/lib/cmake/hip)
+
+    if(NOT hip_FOUND)
+        message(WARNING
+            "HIP not found at ${ROCM_PATH}. "
+            "ROCm backend disabled — building stub. "
+            "Set ROCM_PATH or install ROCm.")
+        set(MEMOPT_ENABLE_ROCM OFF)
+    else()
+        message(STATUS "Found HIP: ${hip_VERSION}")
+
+        pybind11_add_module(_memopt_rocm
+            rocm/rocm_backend.cpp)
+        target_compile_definitions(_memopt_rocm PRIVATE
+            MEMOPT_ROCM_AVAILABLE=1)
+        target_link_libraries(_memopt_rocm PRIVATE hip::host)
+
+        # gfx90a  = MI210, MI250X
+        # gfx940  = MI300A
+        # gfx941  = MI300X
+        # gfx942  = MI300X (newer revision)
+        set_target_properties(_memopt_rocm PROPERTIES
+            HIP_ARCHITECTURES "gfx90a;gfx940;gfx941;gfx942")
+
+        install(TARGETS _memopt_rocm LIBRARY DESTINATION memopt)
+        message(STATUS "ROCm backend: enabled")
+    endif()
+endif()
+
+if(NOT MEMOPT_ENABLE_ROCM)
+    # Stub build — no MEMOPT_ROCM_AVAILABLE define, so the cpp emits
+    # the stub module. Safe to compile on NVIDIA / macOS / CPU-only.
+    pybind11_add_module(_memopt_rocm
+        rocm/rocm_backend.cpp)
+    install(TARGETS _memopt_rocm LIBRARY DESTINATION memopt)
+    message(STATUS "ROCm backend: stub (disabled)")
+endif()

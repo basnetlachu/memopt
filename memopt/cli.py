@@ -477,6 +477,143 @@ def cmd_daemon(args):
         print("Use: memopt daemon start|stop|status|logs")
 
 
+def cmd_operator(args):
+    """Start or query the Kubernetes operator."""
+    import os
+    import signal
+    import threading
+
+    op_cmd = getattr(args, "operator_command", None)
+    if not op_cmd:
+        print(
+            "Usage: memopt operator start "
+            "[--namespace NS] [--interval S] [--dry-run]")
+        return
+
+    from memopt.operator.controller import (
+        MemoptOperator, K8S_AVAILABLE)
+
+    if op_cmd == "start":
+        if not K8S_AVAILABLE and \
+                not getattr(args, "dry_run", False):
+            print(
+                "ERROR: kubernetes package not installed. "
+                "Run: pip install kubernetes "
+                "(or use --dry-run for validation).")
+            sys.exit(1)
+
+        namespace = getattr(args, "namespace", "") or \
+            os.getenv("MEMOPT_NAMESPACE", "memopt")
+        interval = float(
+            getattr(args, "interval", 30.0) or 30.0)
+        dry_run = bool(getattr(args, "dry_run", False))
+
+        operator = MemoptOperator(
+            namespace=namespace,
+            reconcile_interval_s=interval,
+            dry_run=dry_run)
+
+        stop_event = threading.Event()
+
+        def handle_signal(sig, frame):
+            print("\nStopping operator...")
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        if dry_run:
+            print(
+                f"Operator starting (dry-run): "
+                f"namespace={namespace} interval={interval}s")
+            # In dry-run the start() path skips Kubernetes connect;
+            # run a few reconcile passes directly.
+            try:
+                operator._reconcile_all()
+                print("Dry-run reconcile complete. "
+                      "Press Ctrl+C to stop.")
+                stop_event.wait()
+            finally:
+                print("Operator stopped.")
+            return
+
+        success = operator.start()
+        if not success:
+            print(
+                "ERROR: operator failed to start "
+                "(is the cluster reachable?)")
+            sys.exit(1)
+
+        try:
+            print(
+                f"Operator running: namespace={namespace} "
+                f"interval={interval}s")
+            print("Press Ctrl+C to stop")
+            stop_event.wait()
+        finally:
+            operator.stop()
+            print("Operator stopped.")
+        return
+
+    if op_cmd == "status":
+        # Construct a detached instance purely to report K8s availability
+        operator = MemoptOperator(dry_run=True)
+        stats = operator.stats()
+        print("memopt operator status:")
+        for key, val in stats.items():
+            print(f"  {key}: {val}")
+        return
+
+
+def cmd_pod_controller(args):
+    """Start or manage the pod controller."""
+    import os
+    import signal
+    import threading
+
+    pod_cmd = getattr(args, "pod_command", None)
+    if not pod_cmd:
+        print("Usage: memopt pod-controller start --pod-id POD_ID")
+        return
+
+    if pod_cmd == "start":
+        # Apply CLI args to environment
+        if getattr(args, "pod_id", ""):
+            os.environ["MEMOPT_POD_ID"] = args.pod_id
+        if getattr(args, "control_plane", ""):
+            os.environ["MEMOPT_CONTROL_PLANE_URL"] = args.control_plane
+        if getattr(args, "redis_url", ""):
+            os.environ["REDIS_URL"] = args.redis_url
+
+        from memopt.vmm.pod_controller import PodController, PodConfig
+
+        config = PodConfig.from_env()
+
+        if not config.pod_id:
+            print("ERROR: pod-id required. "
+                  "Set --pod-id or MEMOPT_POD_ID env var.")
+            sys.exit(1)
+
+        controller = PodController(config)
+        stop_event = threading.Event()
+
+        def handle_signal(sig, frame):
+            print("\nStopping pod controller...")
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        try:
+            controller.start()
+            print(f"Pod controller started: pod={config.pod_id}")
+            print("Press Ctrl+C to stop")
+            stop_event.wait()
+        finally:
+            controller.stop()
+            print("Pod controller stopped.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="memopt",
@@ -634,6 +771,50 @@ def main():
     daemon_parser.add_argument("--follow", "-F", action="store_true",
                                help="Follow log output (logs only)")
     daemon_parser.set_defaults(func=cmd_daemon)
+
+    # pod-controller command
+    pod_parser = subparsers.add_parser(
+        "pod-controller",
+        help="Pod controller for multi-node oracle aggregation")
+    pod_sub = pod_parser.add_subparsers(dest="pod_command")
+    pod_start = pod_sub.add_parser(
+        "start", help="Start the pod controller (foreground)")
+    pod_start.add_argument(
+        "--pod-id", dest="pod_id", default="",
+        help="Pod identifier (or set MEMOPT_POD_ID)")
+    pod_start.add_argument(
+        "--control-plane", dest="control_plane", default="",
+        help="Control plane URL (or set MEMOPT_CONTROL_PLANE_URL)")
+    pod_start.add_argument(
+        "--redis-url", dest="redis_url", default="",
+        help="Redis URL (or set REDIS_URL)")
+    pod_parser.set_defaults(func=cmd_pod_controller)
+
+    # operator command
+    operator_parser = subparsers.add_parser(
+        "operator",
+        help="Kubernetes operator controller loop")
+    operator_sub = operator_parser.add_subparsers(
+        dest="operator_command")
+    op_start = operator_sub.add_parser(
+        "start",
+        help="Start the memopt Kubernetes operator")
+    op_start.add_argument(
+        "--namespace", dest="namespace", default="",
+        help="Kubernetes namespace to watch "
+             "(default: memopt)")
+    op_start.add_argument(
+        "--interval", dest="interval",
+        type=float, default=30.0,
+        help="Reconcile interval in seconds "
+             "(default: 30)")
+    op_start.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="Log actions without calling the K8s API")
+    operator_sub.add_parser(
+        "status",
+        help="Show operator statistics")
+    operator_parser.set_defaults(func=cmd_operator)
 
     args = parser.parse_args()
 

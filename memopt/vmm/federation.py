@@ -132,11 +132,29 @@ class FederationManager:
         # Delta tracking: only send changed transitions
         self._last_gossiped: Dict[Tuple[int, int], int] = {}
 
-        # Redis peer discovery (optional)
-        self._redis_client = None
+        # Node discovery — replaces manual Redis key scan
+        # with NodeDiscovery (SCAN-based, capability-aware)
+        self._discovery = None
+        self._redis_client = None  # kept for backward compat
         self._peer_registry_key = "memopt:federation:nodes"
-        self._peer_ttl_s = 30  # node considered dead after 30s no refresh
-        self._init_redis_discovery()
+        self._peer_ttl_s = 30
+        try:
+            from memopt.vmm.discovery import (
+                NodeDiscovery, NodeCapabilities)
+            caps = NodeCapabilities()
+            caps.detect()
+            caps.gossip_port = gossip_port
+            self._discovery = NodeDiscovery(
+                capabilities=caps,
+                redis_url=os.environ.get("REDIS_URL", ""),
+                on_peer_join=self._on_peer_join,
+                on_peer_leave=self._on_peer_leave,
+            )
+        except Exception as e:
+            logger.debug(
+                "NodeDiscovery init failed: %s — "
+                "using legacy discovery", e)
+            self._init_redis_discovery()
 
         self._stats = FederationStats(
             node_id=self._node_id,
@@ -183,29 +201,49 @@ class FederationManager:
 
     def _discover_peers(self) -> List[str]:
         """
-        Get current peer list.
-        Redis (if available) → dynamic discovery.
-        Fallback → static MEMOPT_NODE_HOSTS list.
+        Get current peer addresses as host:port strings.
+        Uses NodeDiscovery when available, else legacy Redis scan,
+        else static MEMOPT_NODE_HOSTS.
         """
+        # Prefer NodeDiscovery (SCAN-based, capability-aware)
+        if self._discovery is not None:
+            try:
+                discovered = self._discovery.peers()
+                if discovered:
+                    return [
+                        f"{p.host}:{p.gossip_port}"
+                        for p in discovered
+                    ]
+            except Exception:
+                pass
+
+        # Legacy: direct Redis key scan
         if self._redis_client:
             try:
                 pattern = f"{self._peer_registry_key}:*"
-                keys = self._redis_client.keys(pattern)
+                cursor = 0
                 peers = []
-                for key in keys:
-                    key_str = key if isinstance(key, str) else key.decode()
-                    node_id = key_str.split(":")[-1]
-                    if node_id == self._node_id:
-                        continue  # skip self
-                    value = self._redis_client.get(key)
-                    if value:
-                        val = value if isinstance(value, str) \
-                            else value.decode()
-                        peers.append(val)
+                while True:
+                    cursor, keys = self._redis_client.scan(
+                        cursor, match=pattern, count=100)
+                    for key in keys:
+                        key_str = key if isinstance(key, str) \
+                            else key.decode()
+                        node_id = key_str.split(":")[-1]
+                        if node_id == self._node_id:
+                            continue
+                        value = self._redis_client.get(key)
+                        if value:
+                            val = value if isinstance(value, str) \
+                                else value.decode()
+                            peers.append(val)
+                    if cursor == 0:
+                        break
                 if peers:
                     return peers
             except Exception as e:
                 logger.debug("Redis peer discovery failed: %s", e)
+
         # Fallback: static peer list
         return list(self._peers)
 
@@ -213,6 +251,8 @@ class FederationManager:
 
     def start(self) -> None:
         self._stop_event.clear()
+        if self._discovery is not None:
+            self._discovery.start()
         self._register_self()
         self._sender_thread = threading.Thread(
             target=self._sender_loop, daemon=True,
@@ -237,6 +277,8 @@ class FederationManager:
             self._sender_thread.join(timeout=5.0)
         if self._receiver_thread is not None:
             self._receiver_thread.join(timeout=5.0)
+        if self._discovery is not None:
+            self._discovery.stop()
 
     def stats(self) -> FederationStats:
         with self._lock:
@@ -449,3 +491,18 @@ class FederationManager:
                 for to_b, count in counter.items():
                     result[(from_b, to_b)] = count
         return result
+
+    # ── Discovery callbacks ───────────────────────────────────────────
+
+    def _on_peer_join(self, peer) -> None:
+        """Called by NodeDiscovery when a new peer appears."""
+        logger.info(
+            "Federation: peer joined %s at %s:%s "
+            "(%.1fGB HBM free)",
+            peer.node_id, peer.host, peer.gossip_port,
+            getattr(peer, 'hbm_free_gb', 0.0))
+
+    def _on_peer_leave(self, peer) -> None:
+        """Called by NodeDiscovery when a peer disappears."""
+        logger.warning(
+            "Federation: peer left %s", peer.node_id)

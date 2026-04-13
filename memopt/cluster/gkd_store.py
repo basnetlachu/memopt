@@ -29,9 +29,11 @@ import os
 import time
 import threading
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
+from .bloom_filter import BloomFilter
 from .hashing import compute_hash, make_fingerprint, verify_fingerprint
 from .prefix_index import _verify_fingerprint_fast
 
@@ -415,6 +417,11 @@ class GKDStore:
         self._ttl              = default_ttl_seconds
         self._block_size_bytes = block_size_bytes
 
+        # Pod controller URL for two-tier lookup
+        self._pod_url = os.environ.get(
+            "MEMOPT_POD_CONTROLLER_URL", "")
+        self._pod_hits = 0
+
         self._lock                 = threading.Lock()
         self._total_lookups        = 0
         self._cache_hits           = 0
@@ -426,6 +433,18 @@ class GKDStore:
         self._lcp_hits:          int = 0
         self._lcp_tokens_reused: int = 0
         self._lcp_tokens_total:  int = 0
+
+        # Bloom filter: pre-filters backend queries.
+        # If content_hash not in bloom → definitely not in store, skip backend.
+        # Expected items configurable via env var (default 1M, 1% FP).
+        bloom_expected = int(os.environ.get(
+            "MEMOPT_BLOOM_EXPECTED_ITEMS", "1000000"))
+        bloom_fp = float(os.environ.get(
+            "MEMOPT_BLOOM_FP_RATE", "0.01"))
+        self._bloom = BloomFilter(
+            expected_items=bloom_expected,
+            false_positive_rate=bloom_fp)
+        self._bloom_filtered: int = 0
 
         # Output cache: block_ref → completion output dict.
         # Used by exact-hit path in serving/server.py to skip inference.
@@ -489,9 +508,27 @@ class GKDStore:
             self._total_lookups += 1
 
         content_hash = compute_hash(token_ids, sequence_length)
-        raw = self._backend.get(content_hash)
+
+        # Bloom filter pre-check: if definitely absent, skip backend.get().
+        # The bloom filter only tracks exact content hashes, not prefix
+        # hashes, so the LCP fallback path must still run on bloom miss.
+        if content_hash not in self._bloom:
+            with self._lock:
+                self._bloom_filtered += 1
+            raw = None
+        else:
+            raw = self._backend.get(content_hash)
 
         if raw is None:
+            # Tier 2: Try pod GKD cache before cluster store
+            pod_hit = self._pod_lookup(
+                content_hash, sequence_length)
+            if pod_hit is not None:
+                with self._lock:
+                    self._cache_hits += 1
+                    self._pod_hits += 1
+                return pod_hit
+
             # LCP fallback — pipelined prefix lookup
             try:
                 lcp_hit = self._pipelined_lcp_lookup(
@@ -614,6 +651,9 @@ class GKDStore:
         content_hash = compute_hash(token_ids, sequence_length)
         fingerprint  = make_fingerprint(token_ids)
 
+        # Add to bloom filter so future lookups don't skip backend
+        self._bloom.add(content_hash)
+
         entry = {
             "content_hash":  content_hash,
             "fingerprint":   fingerprint,
@@ -635,6 +675,59 @@ class GKDStore:
                 self._backend)
         except Exception as exc:
             logger.debug("GKD prefix registration failed: %s", exc)
+
+        # Register in pod cache (fire-and-forget)
+        self._pod_register(
+            content_hash, sequence_length,
+            block_ref, node_id)
+
+    # ── Pod two-tier lookup ───────────────────────────────────────────
+
+    def _pod_lookup(self, content_hash: str,
+                    seq_len: int) -> Optional[GKDHit]:
+        """Pod GKD cache lookup via HTTP. 10ms timeout. Never raises."""
+        if not self._pod_url:
+            return None
+        try:
+            url = (f"{self._pod_url}/pod/gkd/lookup"
+                   f"?hash={content_hash}&seq_len={seq_len}")
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=0.050) as resp:
+                data = json.loads(resp.read())
+                if data.get("hit"):
+                    return GKDHit(
+                        block_ref=data.get("block_ref", ""),
+                        node_id=data.get("node_id", ""),
+                        is_partial=False)
+        except Exception:
+            pass
+        return None
+
+    def _pod_register(self, content_hash: str,
+                      seq_len: int, block_ref: str,
+                      node_id: str) -> None:
+        """Register in pod cache. Fire-and-forget. Never blocks."""
+        if not self._pod_url:
+            return
+        try:
+            url = f"{self._pod_url}/pod/gkd/register"
+            data = json.dumps({
+                "hash": content_hash,
+                "seq_len": seq_len,
+                "block_ref": block_ref,
+                "node_id": node_id,
+            }).encode()
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            threading.Thread(
+                target=urllib.request.urlopen,
+                args=(req,),
+                kwargs={"timeout": 0.050},
+                daemon=True).start()
+        except Exception:
+            pass
 
     # ── Output cache (for exact-hit compute skip) ───────────────────
 
@@ -697,6 +790,10 @@ class GKDStore:
                 self._lcp_tokens_reused / self._lcp_tokens_total * 100, 1
             ) if self._lcp_tokens_total > 0 else 0.0,
             "total_hits":                  hits,
+            "pod_hits":                    self._pod_hits,
+            "pod_controller_url":          self._pod_url or "not_configured",
+            "bloom_filtered":              self._bloom_filtered,
+            "bloom_stats":                 self._bloom.stats(),
         }
 
     def reset_stats(self):
@@ -707,3 +804,66 @@ class GKDStore:
             self._bytes_saved          = 0
             self._collision_checks     = 0
             self._collision_detections = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Backend factory — selects ScyllaDB → Redis → Local
+# ═══════════════════════════════════════════════════════════════════════════
+
+def make_gkd_backend(
+    redis_url: str = "",
+    node_id: str = "",
+):
+    """
+    Create the best available GKD backend.
+
+    Priority:
+      1. ScyllaDB (SCYLLA_HOSTS env var set)
+      2. Redis    (redis_url argument or REDIS_URL env var)
+      3. Local    (in-memory, single-node)
+
+    Never raises — always returns a working backend.
+    """
+    # 1. Try ScyllaDB
+    scylla_hosts = os.environ.get("SCYLLA_HOSTS", "")
+    if scylla_hosts:
+        hosts = [h.strip() for h in scylla_hosts.split(",")
+                 if h.strip()]
+        if hosts:
+            try:
+                from memopt.cluster.scylla_gkd_backend import \
+                    ScyllaGKDBackend
+                backend = ScyllaGKDBackend(
+                    hosts=hosts,
+                    port=int(os.environ.get("SCYLLA_PORT", "9042")),
+                    keyspace=os.environ.get(
+                        "SCYLLA_KEYSPACE", "memopt"),
+                    consistency=os.environ.get(
+                        "SCYLLA_CONSISTENCY", "ONE"),
+                    ttl_s=int(os.environ.get(
+                        "MEMOPT_GKD_ENTRY_TTL_S", "3600")),
+                )
+                logger.info("GKD backend: ScyllaDB (%d hosts)", len(hosts))
+                return backend
+            except ImportError:
+                logger.warning(
+                    "ScyllaDB requested but cassandra-driver "
+                    "not installed. pip install cassandra-driver. "
+                    "Falling back.")
+            except Exception as e:
+                logger.warning(
+                    "ScyllaDB connection failed: %s. Falling back.", e)
+
+    # 2. Try Redis
+    url = redis_url or os.environ.get("REDIS_URL", "")
+    if url:
+        try:
+            backend = RedisGKDBackend(redis_url=url)
+            logger.info("GKD backend: Redis")
+            return backend
+        except Exception as e:
+            logger.warning("Redis failed: %s. Falling back to local.", e)
+
+    # 3. Local fallback
+    logger.info("GKD backend: local (single-node)")
+    return LocalGKDBackend()

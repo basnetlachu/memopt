@@ -1,0 +1,75 @@
+{{- if .Values.controlPlane.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "memopt.fullname" . }}-control-plane
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+    component: control-plane
+spec:
+  serviceName: {{ include "memopt.fullname" . }}-control-plane
+  replicas: {{ .Values.controlPlane.replicas }}
+  selector:
+    matchLabels:
+      {{- include "memopt.selectorLabels" . | nindent 6 }}
+      component: control-plane
+  template:
+    metadata:
+      labels:
+        {{- include "memopt.selectorLabels" . | nindent 8 }}
+        component: control-plane
+    spec:
+      serviceAccountName: {{ include "memopt.serviceAccountName" . }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python3
+            - -m
+            - memopt.control_plane.server
+            - --port
+            - "{{ .Values.controlPlane.port }}"
+          env:
+            - name: MEMOPT_NODE_ID
+              value: control-plane
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: MEMOPT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memopt.fullname" . }}-secrets
+                  key: api-key
+                  optional: true
+          envFrom:
+            - configMapRef:
+                name: {{ include "memopt.fullname" . }}-config
+          ports:
+            - containerPort: {{ .Values.controlPlane.port }}
+              name: http
+          resources:
+            {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: control-plane-data
+              mountPath: /home/memopt/.memopt
+  volumeClaimTemplates:
+    - metadata:
+        name: control-plane-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+{{- end }}

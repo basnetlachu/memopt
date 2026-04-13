@@ -1,0 +1,50 @@
+{{- if .Values.operator.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memopt.fullname" . }}-operator
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+    component: operator
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "memopt.selectorLabels" . | nindent 6 }}
+      component: operator
+  template:
+    metadata:
+      labels:
+        {{- include "memopt.selectorLabels" . | nindent 8 }}
+        component: operator
+    spec:
+      serviceAccountName: {{ include "memopt.fullname" . }}-operator
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command:
+            - python3
+            - -m
+            - memopt.operator.main
+          env:
+            - name: MEMOPT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MEMOPT_RECONCILE_INTERVAL_S
+              value: {{ .Values.operator.reconcileIntervalSeconds | quote }}
+            - name: MEMOPT_OPERATOR_DRY_RUN
+              value: {{ .Values.operator.dryRun | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - "import sys; sys.exit(0)"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+{{- end }}

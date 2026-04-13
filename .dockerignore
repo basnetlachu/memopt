@@ -1,19 +1,18 @@
 # Version control
 .git
 .gitignore
+.github
 
 # Python bytecode
 __pycache__
 *.pyc
 *.pyo
 *.pyd
-*.so
 
 # Virtual environments
 .venv
 venv
 env
-.env
 
 # Build artifacts
 *.egg-info
@@ -29,8 +28,6 @@ build/
 *.key
 *.pem
 *.crt
-~/.memopt/api_key
-~/.memopt/license_cache.json
 
 # Editor files
 .vscode/
@@ -39,7 +36,7 @@ build/
 *.swo
 .DS_Store
 
-# Node.js (if any frontend tooling)
+# Node.js
 node_modules/
 
 # Test artifacts
@@ -59,3 +56,15 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Documentation (keep README.md)
+docs/
+*.md
+!README.md
+
+# Keep these for build:
+# csrc/ — C++ source code
+# memopt/ — Python package
+# pyproject.toml, setup.py — build config
+# requirements.txt — dependencies
+# deploy/ — runtime configs

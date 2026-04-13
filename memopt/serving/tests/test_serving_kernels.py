@@ -339,3 +339,71 @@ def test_has_cuda_gather_reflects_build():
     # On this machine: just verify it doesn't crash
     # and returns a consistent value
     assert p.has_cuda_gather() == result
+
+
+# ── Kubernetes health check endpoints ─────────────────────────────────
+
+def test_healthz_returns_200_when_running():
+    """Liveness probe returns 200 with status and checks."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from memopt.serving.server import app
+    if app is None:
+        pytest.skip("FastAPI not available")
+    client = TestClient(app)
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert "node_id" in data
+    assert "checks" in data
+    assert "uptime_seconds" in data
+
+
+def test_readyz_returns_200_or_503():
+    """Readiness probe returns 200 or 503, never 500."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from memopt.serving.server import app
+    if app is None:
+        pytest.skip("FastAPI not available")
+    client = TestClient(app)
+    response = client.get("/readyz")
+    assert response.status_code in [200, 503]
+    data = response.json()
+    assert "status" in data
+    assert "node_id" in data
+
+
+def test_healthz_never_returns_500():
+    """Liveness probe must return 200 or 503, never 500."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from memopt.serving.server import app
+    if app is None:
+        pytest.skip("FastAPI not available")
+    client = TestClient(app)
+    response = client.get("/healthz")
+    assert response.status_code != 500
+
+
+def test_health_endpoint_unchanged():
+    """Original /health endpoint still works."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from memopt.serving.server import app
+    if app is None:
+        pytest.skip("FastAPI not available")
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"

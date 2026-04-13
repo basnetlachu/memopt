@@ -50,6 +50,14 @@ class GPUSpec:
     warp_size: int = 32
     clock_ghz: float = 1.4  # GPU clock frequency
 
+    # Phase 9c extensions — optional, default to unmeasured datasheet.
+    vendor: str = "NVIDIA"           # "NVIDIA" | "AMD" | "Intel" | ...
+    architecture: str = ""           # "Hopper", "CDNA3", "Ampere", ...
+    arch_tag: str = ""               # "sm_90", "gfx942", ...
+    hbm_size_gb: float = 0.0         # Total HBM on a single card
+    measured: bool = False           # False = datasheet only
+    source: str = ""                 # Human-readable provenance
+
     @property
     def ridge_point_fp32(self) -> float:
         """Arithmetic intensity at roofline ridge (FLOPS/byte)."""
@@ -419,6 +427,66 @@ GPU_SPECS = {
         l2_cache_mb=4.0,
         max_warps_per_sm=64,
         clock_ghz=1.73,
+    ),
+
+    # ==========================================================================
+    # AMD CDNA — datasheet values. NOT MEASURED on real hardware yet.
+    # ==========================================================================
+    # sm_count / clock_ghz fields hold the AMD analogues (CU count /
+    # peak boost clock) so roofline math still works. compute_capability
+    # is (0, 0) because CDNA uses GCN arch tags instead of NVIDIA's
+    # (major, minor) numbering — use `arch_tag` for that.
+
+    "AMD Instinct MI300X": GPUSpec(
+        name="AMD Instinct MI300X",
+        compute_capability=(0, 0),
+        sm_count=304,                    # CU count
+        peak_fp32_tflops=163.4,
+        peak_fp16_tflops=1307.4,
+        peak_memory_bandwidth_gbps=5300.0,
+        l2_cache_mb=256.0,               # Infinity Cache
+        max_warps_per_sm=64,
+        clock_ghz=2.1,                   # peak boost
+        vendor="AMD",
+        architecture="CDNA3",
+        arch_tag="gfx942",
+        hbm_size_gb=192.0,
+        measured=False,
+        source="AMD MI300X datasheet",
+    ),
+    "AMD Instinct MI250X": GPUSpec(
+        name="AMD Instinct MI250X",
+        compute_capability=(0, 0),
+        sm_count=220,                    # CU count
+        peak_fp32_tflops=47.9,
+        peak_fp16_tflops=383.0,
+        peak_memory_bandwidth_gbps=3276.8,
+        l2_cache_mb=16.0,
+        max_warps_per_sm=64,
+        clock_ghz=1.7,
+        vendor="AMD",
+        architecture="CDNA2",
+        arch_tag="gfx90a",
+        hbm_size_gb=128.0,
+        measured=False,
+        source="AMD MI250X datasheet",
+    ),
+    "AMD Instinct MI210": GPUSpec(
+        name="AMD Instinct MI210",
+        compute_capability=(0, 0),
+        sm_count=104,                    # CU count
+        peak_fp32_tflops=22.6,
+        peak_fp16_tflops=181.0,
+        peak_memory_bandwidth_gbps=1638.4,
+        l2_cache_mb=8.0,
+        max_warps_per_sm=64,
+        clock_ghz=1.7,
+        vendor="AMD",
+        architecture="CDNA2",
+        arch_tag="gfx90a",
+        hbm_size_gb=64.0,
+        measured=False,
+        source="AMD MI210 datasheet",
     ),
 }
 

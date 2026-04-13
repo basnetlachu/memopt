@@ -1,0 +1,18 @@
+# memopt development dependencies
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Build tools (C++ extensions)
+build>=1.0.0
+scikit-build-core>=0.5.0
+pybind11>=2.11.0
+cmake>=3.18
+ninja
+
+# Wheel packaging
+auditwheel>=5.3.0
+
+# Code quality
+black>=23.0.0

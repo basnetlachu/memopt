@@ -1,0 +1,90 @@
+{{- if .Values.serving.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "memopt.fullname" . }}-serving
+  labels:
+    {{- include "memopt.labels" . | nindent 4 }}
+    component: serving
+spec:
+  replicas: {{ .Values.serving.replicas }}
+  selector:
+    matchLabels:
+      {{- include "memopt.selectorLabels" . | nindent 6 }}
+      component: serving
+  template:
+    metadata:
+      labels:
+        {{- include "memopt.selectorLabels" . | nindent 8 }}
+        component: serving
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.serving.port }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ include "memopt.serviceAccountName" . }}
+      containers:
+        - name: serving
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python3
+            - -m
+            - memopt.serving.server
+            - --port
+            - "{{ .Values.serving.port }}"
+          env:
+            - name: MEMOPT_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memopt.fullname" . }}-secrets
+                  key: anthropic-api-key
+                  optional: true
+            - name: MEMOPT_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "memopt.fullname" . }}-secrets
+                  key: signing-key
+                  optional: true
+          envFrom:
+            - configMapRef:
+                name: {{ include "memopt.fullname" . }}-config
+          ports:
+            - containerPort: {{ .Values.serving.port }}
+              name: http
+          resources:
+            {{- toYaml .Values.serving.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: nvme-storage
+              mountPath: /var/memopt/nvme
+            - name: memopt-data
+              mountPath: /home/memopt/.memopt
+      volumes:
+        - name: nvme-storage
+          persistentVolumeClaim:
+            claimName: {{ include "memopt.fullname" . }}-nvme
+        - name: memopt-data
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,32 @@
+[Unit]
+Description=memopt RDMA Transport Daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=memopt
+Group=memopt
+EnvironmentFile=/etc/memopt/config.env
+ExecStart=/usr/local/bin/memopt-transport \
+    --node-id ${MEMOPT_NODE_ID} \
+    --tcp-port 18516 \
+    --shm-prefix /dev/shm/memopt_transport
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=10s
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ReadWritePaths=/dev/shm /var/memopt
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

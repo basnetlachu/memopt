@@ -2,8 +2,8 @@
 
 **Language:** Python 3.10+ (control plane), C++17 (data plane), CUDA 12.4+ (GPU kernels)
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
-**Test suite:** 339 Python tests pass (10 skipped), 7 C++ GoogleTest suites, 0 failures
-**C++ extensions:** 6 pybind11 modules + 1 sidecar daemon (all optional — Python fallback on every path)
+**Test suite:** 688 Python tests pass (21 skipped — clean skips for CockroachDB / AMD ROCm hardware paths), 7 C++ GoogleTest suites, 0 failures
+**C++ extensions:** 7 pybind11 modules + 1 sidecar daemon (all optional — Python fallback on every path; AMD ROCm backend compiles to a stub on non-AMD hosts)
 
 ---
 
@@ -37,6 +37,13 @@
 23. [CLI Reference](#23-cli-reference)
 24. [Validated Real Numbers (A100)](#24-validated-real-numbers-a100)
 25. [Production Hardening](#25-production-hardening)
+26. [Three-Tier Oracle Hierarchy](#26-three-tier-oracle-hierarchy)
+27. [Kubernetes Operator](#27-kubernetes-operator)
+28. [Golden Image & PXE Boot](#28-golden-image--pxe-boot)
+29. [Image Registry & Rollback](#29-image-registry--rollback)
+30. [Canary Rollouts](#30-canary-rollouts)
+31. [Global-Scale Database (CockroachDB)](#31-global-scale-database-cockroachdb)
+32. [Hardware Abstraction Layer](#32-hardware-abstraction-layer)
 
 ---
 
@@ -59,6 +66,13 @@ Beyond single-model optimization, memopt provides:
 - **Background daemon** — zero-touch GPU process monitor via NVML.
 - **Serving runtime** — OpenAI-compatible HTTP interface with paged attention, continuous batching, GKD dedup on every request, and `/report/found-capacity` endpoint for real-time savings reporting.
 - **Control plane** — lightweight FastAPI server for cluster node reporting, status, serving engine registration, and node degradation tracking (drift → automatic traffic rerouting).
+- **Three-tier oracle hierarchy** — node → pod → global oracles share high-confidence transitions across the cluster (1s pod-pull cadence, 60s global-pull cadence, gate evaluation with confidence + node-coverage filters).
+- **Kubernetes operator** — `MemoptCluster` / `MemoptNode` CRDs + a polling reconcile loop that watches both, ensures one `MemoptNode` per matching node, drives drift→evict at >15%, and runs in dry-run on machines without `kubernetes` installed.
+- **Golden image + PXE boot** — `Dockerfile.golden` bakes Ubuntu 22.04 + CUDA runtime + memopt + pre-compiled C++ extensions + systemd units + `first_boot.sh` so nodes boot from an image in < 60 s with no compiler at boot. iPXE script + `/boot/config/{mac}` + `/boot/callback` + `/boot/status` close the loop with the control plane.
+- **Image registry + rollback** — every golden image is registered with `git_commit`, `cuda_version`, `sm_targets`, `digest`; a per-node rollback intent overrides the served image_version on the next PXE boot.
+- **Canary rollouts** — 1-10-100-All progressive deployment with real gate evaluation (cert pass rate, error rate, latency vs baseline, GKD hit rate). HTTP API + Prometheus alerts (`MemoptRolloutPaused`, `MemoptRolloutFailed`, `MemoptCertFailureHigh`) + Grafana dashboard.
+- **Global-scale database** — `SQLite` for dev, `PostgreSQL` for single-region prod, `CockroachDB` for 100K+ node fleets. Dialect-aware queries (DISTINCT ON for PG/CRDB, MAX-id subquery for SQLite), composite indexes for hot paths, heartbeat batcher coalescing 1M-node drift writes, `migrate_to_crdb.sh` migration tool.
+- **Hardware Abstraction Layer (HAL)** — runtime detection of NVIDIA CUDA / AMD ROCm / CPU-only / unknown via `pynvml` → `torch.cuda` → `rocm-smi` → fallback. Real C++ HIP backend for AMD MI300X (`gfx94x` unified-memory aware), Intel Gaudi + Google TPU stubs defining the contract for future hardware.
 
 ---
 
@@ -78,6 +92,7 @@ memopt/                        ← Python package root
 │   ├── hashing.py             ← Content fingerprinting   [renamed from hash_engine.py]
 │   ├── hypervisor.py          ← Memory hypervisor
 │   ├── transport.py           ← TCP/RDMA transport layer [renamed from rdma_transport.py]
+│   ├── bloom_filter.py        ← Bloom filter pre-filter for GKD (Kirsch & Mitzenmacher double hashing)
 │   ├── block_directory.py     ← Pillar 5: cluster-wide block location index (local + Redis)
 │   ├── remote_block.py        ← Pillar 5: cross-node block transfer protocol (TCP, stdlib only)
 │   └── tests/
@@ -613,16 +628,23 @@ incoming request
       ▼
   GKDStore.lookup(token_ids, seq_len)
       │
-   exact hit? ──yes──▶ return hit.block_ref  (skip all KV compute)
-      │
-     no
-      │
       ▼
-  lookup_longest_prefix(token_ids, seq_len)     ← LCP fallback
+  content_hash = SHA-256(token_ids)
       │
-   prefix hit? ──yes──▶ return GKDHit(is_partial=True,
-      │                     matched_len=N, delta_start=N)
-      │                     (skip KV compute for first N tokens)
+  bloom filter ──absent──▶ skip backend.get()  (bloom_filtered++)
+      │                          │
+   present (maybe)               ▼
+      │               LCP prefix lookup (pipelined)
+      ▼                          │
+  backend.get(hash)        prefix hit? ──yes──▶ GKDHit(is_partial=True)
+      │                          │
+   exact hit? ──yes──▶ return hit.block_ref  (skip all KV compute)
+      │                         no
+     no                          │
+      │                          ▼
+      ▼                     cache miss
+  pod GKD cache lookup
+      │
      no
       │
       ▼
@@ -630,8 +652,35 @@ incoming request
       │
       ▼
   GKDStore.register(token_ids, seq_len, block_ref, node_id)
+      │  ├── bloom.add(content_hash)     ← seed bloom for future lookups
       │  └── register_prefixes() stores block-aligned prefix hashes
 ```
+
+### 5.2a Bloom Filter Pre-Filter (`cluster/bloom_filter.py`)
+
+The bloom filter eliminates backend round-trips for content hashes that have **never been registered**. At scale (100K+ nodes), this prevents millions of wasted ScyllaDB/Redis queries per second.
+
+**Implementation:**
+- Kirsch & Mitzenmacher (2006) double hashing via SHA-256
+- Optimal parameter calculation: for 1M items at 1% FP rate → ~1.14 MB, k=7
+- Thread-safe via `threading.Lock`
+- `to_bytes()` / `from_bytes()` serialization for network transfer
+
+**Integration with GKDStore:**
+- `register()` calls `self._bloom.add(content_hash)` for every new entry
+- `lookup()` checks `content_hash not in self._bloom` before `backend.get()`
+- On bloom rejection: backend is skipped entirely, `bloom_filtered` counter increments
+- LCP prefix lookup still runs on bloom miss (bloom only tracks exact hashes, not prefix hashes)
+
+**Pod bloom filter sharing** — `/pod/bloom-filter` endpoint exports the node's bloom filter as base64 bytes. Pod controllers can merge filters from all nodes to build a cluster-wide negative filter, further reducing cross-pod queries.
+
+**Configuration:**
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MEMOPT_BLOOM_EXPECTED_ITEMS` | `1000000` | Expected number of unique content hashes |
+| `MEMOPT_BLOOM_FP_RATE` | `0.01` | Target false positive rate |
+
+**Stats** — `GKDStore.stats()` includes `bloom_filtered` (queries skipped) and `bloom_stats` (fill rate, memory, estimated FP rate).
 
 ### 5.3 Hash + Collision Safety (`cluster/hashing.py`)
 
@@ -2185,3 +2234,488 @@ Every external dependency degrades silently:
 ### 25.5 Test Coverage
 
 34 hardening-specific tests across 7 test files verify every degradation path, retry mechanism, and health check listed above.
+
+---
+
+## 26. Three-Tier Oracle Hierarchy
+
+Sections 4.9–4.12 describe the per-node Memory Oracle. At cluster scale the Markov transitions a single node observes are noisy and incomplete. The three-tier hierarchy aggregates them upward and pushes the high-confidence signal back down.
+
+```
+┌──────────────────────────────┐
+│ Global Oracle (60s cycle)   │   ◀─ pulls from pods
+│ — control-plane process      │       pushes to pods
+└───────────┬──────────────────┘
+            ▼ pull every 60 s
+┌──────────────────────────────┐
+│ Pod Oracle Aggregator (1s)  │   ◀─ pulls from nodes (1 / pod)
+│ — pod-controller process     │       pushes to nodes
+└───────────┬──────────────────┘
+            ▼ pull every 1 s
+┌──────────────────────────────┐
+│ Node Oracle (per-request)   │   ◀─ updated on every block access
+│ — serving process            │       receives merges from pod
+└──────────────────────────────┘
+```
+
+### 26.1 Node oracle export (`serving/server.py`)
+
+Each serving node exposes three endpoints consumed by the pod controller:
+
+| Endpoint | Method | Body / Returns |
+|----------|--------|----------------|
+| `/oracle/stats`  | GET  | Top-100 transitions: `[{from_block, to_block, count, confidence, total_from}]` + `min_confidence`, `exported_at` |
+| `/oracle/health` | GET  | `{node_id, oracle_active, transition_count, horizon, prediction_accuracy, healthy}` |
+| `/oracle/merge`  | POST | Receive `{source: "pod"|"global", transitions: [...]}`. Filters by `MEMOPT_MIN_MERGE_CONFIDENCE` (default 0.5). Returns `{merged, skipped}`. |
+
+Confidence is computed at export time as `count / total_from` per `from_block`. Merge writes go directly into `oracle._transitions[from][to]` (cap `min(count, 10)`) — bypassing `observe()` to avoid spurious `prev→from` side-effects.
+
+### 26.2 Pod aggregator (`vmm/pod_controller.py`, `PodOracleAggregator`)
+
+Pulls every node's `/oracle/stats` on `MEMOPT_POD_ORACLE_PULL_S` (default 1.0 s).
+
+- **Confidence filter:** drops transitions below `MEMOPT_POD_MIN_CONFIDENCE` (default 0.5). Legacy node payloads (no `confidence` field) are accepted with implicit confidence 1.0.
+- **Per-transition node coverage:** `_transition_nodes: dict[(from, to), set(node_id)]` tracks which nodes contributed each pair. `get_pod_transitions(min_node_coverage=...)` returns only transitions seen on ≥ N % of pulled nodes — kills single-node noise.
+- **Push-back:** every `MEMOPT_POD_PUSH_EVERY_N` cycles (default 10) the controller POSTs its top-50 high-coverage transitions to every node's `/oracle/merge` (fire-and-forget threads, 0.5 s timeout).
+- **Stats:** `nodes_pulled`, `transitions_merged`, `transitions_skipped`, `push_backs`, `transition_coverage`, `last_pull_at`.
+
+### 26.3 Global oracle (`vmm/global_oracle.py`)
+
+Runs in the control-plane process (gated on `MEMOPT_GLOBAL_ORACLE=true`). Pulls from registered pods every `MEMOPT_GLOBAL_ORACLE_PULL_S` (default 60 s).
+
+- **Pod registry:** populated when `POST /api/v1/pods/{pod_id}` includes a `pod_url` field (added by the pod controller's reporting loop).
+- **Higher confidence bar:** drops pod transitions with `confidence < 0.6` (vs. the pod's 0.5 floor).
+- **Pod coverage filter:** `get_global_transitions(min_pod_coverage=0.05)` returns only transitions seen on ≥ 5 % of known pods.
+- **Push-back:** every cycle, top-20 global transitions are POSTed to every pod's `/oracle/merge` with `source: "global"`.
+- **Endpoints (control plane):** `GET /api/v1/global-oracle/stats`, `GET /api/v1/global-oracle/transitions` (both auth-required).
+
+### 26.4 Test coverage
+
+12 tests in `vmm/tests/test_global_oracle.py` (config, lifecycle, registration, coverage filter, mocked pull, control-plane endpoints) + 12 new pod-aggregator tests. All run on CPU.
+
+---
+
+## 27. Kubernetes Operator
+
+Replaces manual `kubectl apply` orchestration with a controller that watches `MemoptCluster` / `MemoptNode` CRDs and reconciles toward declared state.
+
+### 27.1 CRDs (`deploy/crds/`)
+
+| CRD | Plural | Short | Purpose |
+|-----|--------|-------|---------|
+| `MemoptCluster` | `memoptclusters` | `mc` | Top-level cluster spec — node selector, image, redis url, serving / certification / transport / globalOracle config |
+| `MemoptNode` | `memoptnodes` | `mn` | One per matching K8s node — created by the operator. Tracks cert hash, drift_pct, hbm_free, last_heartbeat, conditions |
+
+Both are namespaced, served at `memopt.io/v1alpha1`, declare a `status` subresource, and define `additionalPrinterColumns` so `kubectl get mc` / `kubectl get mn` show meaningful columns.
+
+`scripts/validate_crds.py` parses both YAMLs + cross-checks the Python models in `memopt/operator/models.py` (`MemoptClusterSpec`, `MemoptNodeStatus`, `StatusCondition`, etc.) round-trip through `from_dict` / `to_dict`.
+
+### 27.2 Controller (`memopt/operator/controller.py`, `MemoptOperator`)
+
+Polling-based (not event-driven — kept simple for design-partner phase).
+
+```python
+op = MemoptOperator(namespace="memopt", reconcile_interval_s=30, dry_run=False)
+op.start()   # background thread runs _reconcile_all() every interval
+```
+
+Reconciliation per cluster:
+1. Parse `spec` → `MemoptClusterSpec`
+2. List `nodes` matching `spec.nodeSelector` (Kubernetes label selector)
+3. For each node: `_ensure_memopt_node()` creates the `MemoptNode` if absent
+4. For each `MemoptNode`: `_reconcile_node()` — checks `/healthz` on the serving pod, computes new phase (Ready / Degraded / Failed), writes `status`
+5. Update cluster `status.phase` (Pending / Initializing / Running) + `readyNodes` / `totalNodes`
+
+**Drift policy:** `drift_pct > 15` forces `Degraded` regardless of health (matches `CertifyDaemon`).
+
+**Optionality of the kubernetes package:** `K8S_AVAILABLE` flag set by a top-level `try: import kubernetes`. `start()` re-reads it via the module so `test_operator_start_no_k8s_package` can patch it. `dry_run=True` short-circuits every API call so the operator is fully testable without a cluster (17 tests in `memopt/operator/tests/test_controller.py`, 19 model tests, 10 integration tests).
+
+### 27.3 Helm + manifests
+
+| Path | Purpose |
+|------|---------|
+| `deploy/helm/memopt/values.yaml` | `operator.enabled` (default `false`), `replicas`, `reconcileIntervalSeconds`, `dryRun`, `resources`, `crds.install` |
+| `deploy/helm/memopt/templates/operator-deployment.yaml` | Deployment gated on `operator.enabled` |
+| `deploy/helm/memopt/templates/operator-rbac.yaml` | ServiceAccount + ClusterRole (nodes, pods, memopt.io/*, daemonsets) + ClusterRoleBinding |
+| `deploy/operator/deployment.yaml` | Standalone Deployment (non-Helm install) |
+| `deploy/operator/rbac.yaml` | Standalone RBAC |
+| `deploy/examples/single-node-cluster.yaml` | Validation cluster (no Redis, TCP transport) |
+| `deploy/examples/design-partner-cluster.yaml` | Nebius design-partner config (Redis + RDMA-auto + daily certification) |
+| `deploy/examples/zettascale-cluster.yaml` | FUTURE — documents the 1M-node target shape (ScyllaDB, RDMA, global oracle) |
+
+`make install-crds`, `make deploy-operator`, `make apply-example`, `make operator-status`, `make validate` wire the lifecycle.
+
+### 27.4 CLI
+
+`memopt operator start [--namespace NS] [--interval S] [--dry-run]` and `memopt operator status` follow the same pattern as `memopt pod-controller start`. `--dry-run` works on machines without `kubernetes` installed.
+
+---
+
+## 28. Golden Image & PXE Boot
+
+At 1M nodes, runtime installation (`pip install memopt` at boot) fails too often. The golden image bakes everything in.
+
+### 28.1 `Dockerfile.golden`
+
+Three-stage build (`cuda-base` → `builder` → `golden`):
+
+- Base: `ubuntu:22.04` + CUDA runtime via NVIDIA's `cuda-keyring` apt repo (controls exact CUDA version, unlike `nvidia/cuda:*` images)
+- `builder` stage installs cmake/ninja/python-dev, builds C++ extensions for `CMAKE_CUDA_ARCHITECTURES="86;90;100"`, copies `_memopt_*.so` + `memopt-transport` to `/artifacts/`
+- Final `golden` stage installs runtime-only packages (`python3.11`, `libgomp1`, `systemd`, `cloud-init`, `openssh-server`), mounts artifacts from the builder, sets up `memopt` system user + `/var/memopt/{nvme,certs,logs}`, copies all four systemd units to `/etc/systemd/system/`, copies `first_boot.sh` to `/usr/local/bin/memopt-first-boot`
+- Stamps `/etc/memopt/version`, `/etc/memopt/git-commit`, `/etc/memopt/build-date`, `/etc/memopt/sm-targets` — read at runtime by `memopt/image_version.py`
+
+### 28.2 `scripts/build_golden_image.sh`
+
+Six steps with `set -euo pipefail`:
+
+1. Validate `--cuda-version` (`X.Y` regex), `--sm-targets` (`A;B;C`), `--tag` (`vMAJOR.MINOR.PATCH[-suffix]`), Docker available
+2. Get `GIT_COMMIT` / `GIT_BRANCH` / `BUILD_DATE` (fallback to `unknown`)
+3. `docker build` with all build-args + labels (`memopt.version`, `memopt.git-commit`, `memopt.build-date`, `memopt.sm-targets`, `memopt.cuda-version`)
+4. Run image with `python3 -c "import memopt; ..."` to verify extensions present and `/etc/memopt/version` was written
+5. Optionally `docker push` (requires `--push`)
+6. Write `dist/golden-image-manifest.json` with version, commit, branch, date, cuda, sm_targets[], registry, image, digest, validated
+
+### 28.3 `scripts/first_boot.sh`
+
+The only script that runs on a fresh PXE boot. Idempotent via `/etc/memopt/.first_boot_done` marker.
+
+1. Detect `NODE_ID` from `/run/cloud-init/instance-data.json` → `MEMOPT_NODE_ID` env → `hostname`
+2. Detect `RACK` / `POD` / `REGION` from env (DHCP options 224/225 in production)
+3. Write `/etc/memopt/config.env` with all detected values + `REDIS_URL` / `MEMOPT_CONTROL_PLANE_URL`
+4. Detect GPU count via `nvidia-smi --query-gpu=name`; write `hardware.env`
+5. Run `python3 -m memopt certify --node-id $NODE_ID --output-dir /var/memopt/certs`. On failure: log `FAILED` to `/etc/memopt/cert_status` and continue (node still starts, control plane knows it's uncertified)
+6. POST to `${CONTROL_PLANE}/api/v1/nodes` (registration) + `${CONTROL_PLANE}/boot/callback` (boot event with version, gpu count, cert status, `/proc/uptime`-derived boot time)
+7. Touch the marker file
+8. `systemctl enable && systemctl start` for `memopt-transport.service` and `memopt-serving.service`
+
+Every step is non-fatal. A single failed dependency never bricks the node.
+
+### 28.4 `memopt/image_version.py`
+
+Single source of truth for "what image am I running":
+
+```python
+get_image_version()      # /etc/memopt/version → MEMOPT_IMAGE_VERSION → memopt.__version__ → "unknown"
+get_git_commit()         # /etc/memopt/git-commit → MEMOPT_GIT_COMMIT → "unknown"
+get_node_image_info()    # {image_version, git_commit, image_source: "golden"|"docker"|"development"}
+```
+
+Wired into `vmm.discovery.NodeCapabilities` so every gossip + control-plane registration carries image info.
+
+### 28.5 PXE serving (`deploy/pxe/`)
+
+| File | Purpose |
+|------|---------|
+| `ipxe_boot.script` | iPXE script: read DHCP option 175 → chainload `${boot-server}/boot/config/${mac}` → fallback to "latest" image with minimal kernel cmdline |
+| `node_config.json.template` | Per-node JSON returned by `/boot/config/{mac}` — image_url, kernel_args[], rack/pod/region |
+
+### 28.6 Boot callback endpoints (`control_plane/server.py`)
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /boot/config/{mac_address}` | none (boot network) | Returns boot config; honors pending rollback intent (overrides `image_version`); falls back to defaults for unknown MACs |
+| `POST /boot/callback` | none | Records boot event (version, cert status, gpu count, boot time) into `boot_events` |
+| `GET /boot/status` | required | Cluster-wide status: `total_nodes`, `booted_nodes`, `current_version`, `version_distribution`, `failed_certs` |
+
+`boot_events` table added by migration **003**; queries use `MAX(id) GROUP BY node_id` on SQLite and `DISTINCT ON (node_id)` on Postgres/CRDB (see Section 31).
+
+### 28.7 GitHub Actions
+
+`.github/workflows/build_golden_image.yml` triggers on release tags + manual dispatch. Builds with `docker/build-push-action@v5`, validates the image, uploads `golden-image-manifest.json` as a release asset. **Note:** GitHub-hosted runners have no GPU and no `nvcc`; the C++ kernels fall back to Python in CI. Real CUDA build requires a self-hosted GPU runner (Nebius / cloud GPU). Documented in the workflow.
+
+### 28.8 Tests
+
+18 tests in `tests/test_golden_image.py` cover the image_version module (mocked file paths), `bash -n` syntax for `build_golden_image.sh` + `first_boot.sh`, NodeCapabilities round-trip, workflow YAML validity, and Dockerfile presence/content.
+
+---
+
+## 29. Image Registry & Rollback
+
+### 29.1 Image registry (`control_plane/database.py`, migration 004)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `POST /api/v1/images` | auth | Register a version (called by CI/CD post-build) |
+| `GET /api/v1/images` | auth | List versions + current `stable_version` |
+| `POST /api/v1/images/{v}/stable` | auth | Mark stable — served to new nodes |
+| `POST /api/v1/images/{v}/deprecated` | auth | Mark deprecated — alerts fire |
+| `GET /api/v1/images/{v}/nodes` | auth | List nodes whose latest boot is on `{v}` |
+
+`scripts/register_image.sh` is the CI/CD wrapper — validates `vMAJOR.MINOR.PATCH[-suffix]` format, builds JSON via `python3 json.dumps` (correct escaping for digests), POSTs to the control plane, optionally `--mark-stable`.
+
+### 29.2 Rollback (`control_plane/database.py`, migration 005)
+
+Rollback at PXE scale records *intent* — the actual reboot is manual or IPMI-driven.
+
+```
+POST /api/v1/nodes/{node_id}/rollback
+{"target_version": "v0.9.0", "reason": "regression"}
+```
+
+Inserts into `rollback_intents`; `GET /boot/config/{mac}` calls `db.get_pending_rollback(node_id)` and overrides `image_version` with `target_version` if a pending intent exists. On the next reboot the node picks up the rollback target.
+
+### 29.3 Test coverage
+
+18 tests in `control_plane/tests/test_image_versions.py`:
+- HTTP: register/list/mark-stable/mark-deprecated/list-nodes/rollback flows
+- DB: stable+deprecated exclusion, version-node-count latest-only semantics, pending rollback retrieval
+- Migration 005 + 006 table presence
+- `test_boot_config_honors_pending_rollback` — full end-to-end: register → rollback → `/boot/config/{mac}` returns the override
+
+---
+
+## 30. Canary Rollouts
+
+Implements the **1-10-100-All** progressive rollout strategy. One active rollout at a time, gate-driven advancement, automatic pause on failure.
+
+### 30.1 Models (`memopt/canary/models.py`)
+
+```python
+class RolloutStage(Enum):
+    PENDING, STAGE_1, STAGE_2, STAGE_3, STAGE_ALL,
+    COMPLETED, PAUSED, FAILED
+
+class GateResult(Enum):
+    PASS, FAIL, WARN, UNKNOWN  # UNKNOWN ≠ FAIL — never blocks on missing data
+```
+
+`StageConfig.default_stages()` produces the 4-stage default:
+
+| Stage | Racks | Soak | max_error_rate | min_cert_pass | min_gkd_hit |
+|-------|-------|------|----------------|---------------|-------------|
+| 1 | 1 | 5 m | 5.0 % | 90.0 % | 0.0 % |
+| 2 | 10 | 15 m | 2.0 % | 95.0 % | 0.0 % |
+| 3 | 100 | 1 h | 1.0 % | 98.0 % | 50.0 % |
+| ALL | -1 | continuous | 1.0 % | 98.0 % | 50.0 % |
+
+`RolloutPlan` / `RolloutState` / `StageEvaluation` / `GateEvaluation` all expose `to_dict()` for HTTP / DB persistence.
+
+### 30.2 Gate evaluator (`memopt/canary/gates.py`)
+
+Every gate queries **real data**:
+
+| Gate | Source |
+|------|--------|
+| `cert_pass_rate` | `boot_events` table (latest per node, target_version filter) |
+| `error_rate` | `/healthz` on each stage node (`status == "ok"` ratio) |
+| `latency_p99` | `/metrics` parses `memopt_request_duration_*p99*`; delta vs `canary_baselines.latency_p99` |
+| `gkd_hit_rate` | `/metrics` parses `gkd_hit_rate_pct`; below threshold → **WARN** (workload-dependent), not FAIL |
+
+**Missing-data policy:** every gate returns `GateResult.UNKNOWN` when data isn't collectible (no boot events on target version yet, `/metrics` unreachable, no baseline set). UNKNOWN → PASS in `_aggregate_gates()` so missing infra never halts a healthy rollout.
+
+### 30.3 Controller (`memopt/canary/controller.py`)
+
+Background thread (`MEMOPT_CANARY_CHECK_S`, default 30 s). State machine in `_tick()`:
+
+```
+PENDING → STAGE_1 → [soak] → gates → STAGE_2 → ... → STAGE_ALL → COMPLETED
+                              │
+                              └─ FAIL → PAUSED (manual resume)
+```
+
+Public surface: `begin_rollout(target, current)`, `pause_rollout(reason)`, `resume_rollout()`, `abort_rollout(reason)`, `get_status()`, `stats()`. `begin_rollout` raises `ValueError` if a non-terminal rollout is already active. Aggregation rules:
+
+- any FAIL → overall FAIL
+- any WARN → overall WARN (advance, log)
+- otherwise (PASS or UNKNOWN) → PASS
+
+Every state transition writes to `rollout_events` (migration 006) — `started`, `stage_advanced`, `gate_evaluated`, `paused`, `resumed`, `failed`, `completed`. Full audit trail.
+
+### 30.4 HTTP API (`control_plane/server.py`)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `POST /api/v1/rollouts` | auth | Begin (`409` if active, `404` if target not registered) |
+| `GET /api/v1/rollouts/active` | auth | Current state or `{"active": false}` |
+| `POST /api/v1/rollouts/pause` | auth | Pause with reason |
+| `POST /api/v1/rollouts/resume` | auth | Resume from PAUSED |
+| `POST /api/v1/rollouts/abort` | auth | Mark FAILED |
+| `GET /api/v1/rollouts/{id}/events` | auth | Audit log |
+
+Startup creates a fresh `_canary` per process startup — test contexts get clean in-memory state every time.
+
+### 30.5 Monitoring
+
+| Artifact | Purpose |
+|----------|---------|
+| `memopt/canary/metrics.py` | `STAGE_TO_INT` mapping (PENDING=0, STAGE_1=1, …, FAILED=7, no_active=-1). `update_rollout_metrics()` writes to `prometheus_client` Gauge if installed; no-op otherwise |
+| `deploy/prometheus/alert_rules.yml` | 5 rules: `MemoptRolloutPaused` (stage=6, 1 m), `MemoptRolloutFailed` (stage=7, 0 m, critical), `MemoptCertFailureHigh` (>5 % cert failure rate / 5 m), `MemoptNodeUnhealthy` (`up{job="memopt-serving"}==0`), `MemoptHighDrift` (`memopt_drift_pct > 10`) |
+| `deploy/prometheus/prometheus.yml` | `rule_files: ["alert_rules.yml"]` + alertmanager stub |
+| `deploy/grafana/dashboards/canary_rollout.json` | 6 panels: Rollout Stage (with all 9 -1..7 mappings), Progress %, Healthy Nodes, Request Error Rate, Cert Pass Rate, HBM Usage |
+
+### 30.6 Test coverage
+
+54 tests across `memopt/canary/tests/` + `memopt/control_plane/tests/test_canary_api.py` + `tests/test_canary_monitoring.py`. Every state transition, gate decision, aggregation rule, dashboard mapping, and YAML structure tested.
+
+---
+
+## 31. Global-Scale Database (CockroachDB)
+
+### 31.1 Backend tier
+
+| Backend | Use | Config |
+|---------|-----|--------|
+| `SQLiteBackend` | Dev, test, single-node prod | empty `DATABASE_URL` or `sqlite:///path` |
+| `PostgreSQLBackend` | Single-region, < 10 K nodes | `postgresql://...` |
+| `CockroachDBBackend` | 10 K – 1 M nodes, multi-region | `cockroachdb://...` |
+
+`make_backend(url)` falls back to SQLite on any connection / import failure — never raises. `make_backend_for_scale(url, expected_nodes)` chooses pool sizing:
+
+| Expected nodes | min_conn | max_conn |
+|:---------------|---------:|---------:|
+| < 100 | 2 | 5 |
+| < 1 000 | 5 | 20 |
+| < 10 000 | 10 | 50 |
+| ≥ 10 000 | 20 | 100 |
+
+CRDB URL is normalized to `postgresql://` (psycopg2 doesn't understand `cockroachdb://`); `application_name=memopt` appended for server-side observability.
+
+### 31.2 CRDB-optimized schema (`memopt/control_plane/crdb_schema.py`)
+
+Applied once via `python -m memopt.control_plane.crdb_schema --database-url ...`. Differences from the SQLite/PG migration chain:
+
+- **UUID primary keys** (`gen_random_uuid()`) on append-only tables (`events`, `boot_events`, `rollout_events`, `metrics`, `canary_baselines`, `rollback_intents`) — prevents insert hotspots. Natural-key tables (`pods`, `image_versions`) keep `TEXT PRIMARY KEY`.
+- **Composite indexes** for hot query paths declared inline (e.g. `idx_boot_node_time (node_id, booted_at DESC)`)
+- Geo-partition columns (`region`, `pod`, `rack`) ready; `PARTITION BY LIST (region)` documented but not auto-applied (Enterprise license required)
+
+### 31.3 Migrations 001-007
+
+| # | Adds |
+|---|------|
+| 001 | nodes, events, metrics |
+| 002 | pods |
+| 003 | boot_events + nodes columns (mac/version/rack/pod/region) via `alter_columns` |
+| 004 | image_versions |
+| 005 | rollback_intents |
+| 006 | rollout_events + canary_baselines |
+| 007 | composite + degradation indexes; ensures pre-migration-003 dev DBs have `is_degraded` column via `alter_columns` + `post_sql` |
+
+The migration runner now supports `alter_columns` (per-column DDL with duplicate-column tolerance) and `post_sql` (DDL that runs after column adds — lets indexes reference just-added columns).
+
+### 31.4 Query optimization (`docs/query_optimization.md`)
+
+Four hot queries (`get_boot_status`, `get_nodes_by_version`, `get_version_node_count`, `get_nodes_on_version`) branch on `Database.dialect`:
+
+```python
+if self.dialect == "sqlite":
+    # MAX(id) subquery (covering scan with idx_boot_events_node_time)
+else:
+    # SELECT DISTINCT ON (node_id) ... ORDER BY node_id, booted_at DESC
+    # O(distinct_nodes) skip scan on Postgres / CRDB
+```
+
+At 100 M `boot_events` rows the difference is ~30 s vs ~30 ms.
+
+### 31.5 Heartbeat batcher (`control_plane/server.py`, `HeartbeatBatcher`)
+
+Coalesces drift-status writes (`/api/v1/nodes/{name}/status`). At 1 M nodes the naive one-INSERT-per-heartbeat saturates the writer. Batching reduces roundtrips by the batch size with no data loss.
+
+```python
+batcher.record(node_id, healthy, degraded, drift_pct, reason)
+# returns immediately; daemon thread flushes every MEMOPT_HEARTBEAT_BATCH_S (default 1 s)
+```
+
+`stop()` does a final flush. Errors are counted, not raised. Stats: `pending`, `flushed`, `errors`, `interval`. Surfaced via `GET /api/v1/heartbeat-batcher/stats`.
+
+### 31.6 Migration tooling (`scripts/migrate_to_crdb.sh`)
+
+Six-step migration from SQLite or PostgreSQL to CRDB:
+
+1. Validate source/target URLs + connectivity (aborts if `make_backend` silently falls back to SQLite)
+2. `apply_schema()` on target (idempotent)
+3. `SELECT *` from each source table
+4. `INSERT INTO target_table` (column-name based; tolerates `duplicate`/`unique` errors on re-runs)
+5. Verify per-table row counts (target ≥ source); exit 2 on any deficit
+6. Print summary
+
+`--dry-run` connects to both but writes nothing. `--help` works without any DB. The bash script delegates the data-shoveling to inline Python (`python3 -u - <<PYEOF`) so the dialect handling reuses `memopt.control_plane.database`.
+
+### 31.7 Observability
+
+`GET /api/v1/database/health` (auth required) returns:
+```json
+{"status": "ok", "dialect": "sqlite|postgresql|cockroachdb",
+ "read_ms": 0.5, "ping_ms": 0.1, "node_count": 42,
+ "batcher": {"pending": 0, "flushed": 12345, "errors": 0, "interval": 1.0}}
+```
+
+### 31.8 Test coverage
+
+37 tests in `control_plane/tests/test_crdb_backend.py` — URL normalization, fallback, schema parse, batcher (queue/flush/stop/never-raise/multi-flush/endpoint), pool sizing, dialect detection, hot-query latest-only correctness on SQLite, migration script syntax/help/required-args/bad-scheme. Three CRDB integration tests (`@requires_crdb`) auto-skip without `COCKROACHDB_TEST_URL`.
+
+`docs/cockroachdb_deployment.md` documents when to use CRDB, architecture, schema differences, connection string, schema apply, migration, monitoring, and 6 honest known limitations.
+
+---
+
+## 32. Hardware Abstraction Layer
+
+`memopt/vmm/hal.py` (Phase 9a) provides a single source of truth for "what hardware is on this node?" across NVIDIA, AMD, CPU-only, and stubs for Intel Gaudi / Google TPU. The legacy `backend` / `tiers` / `tier_names` / `get_backend()` exports are preserved alongside the new HAL surface.
+
+### 32.1 HAL detection
+
+```python
+from memopt.vmm.hal import get_hal, HardwareBackend
+hal = get_hal()                  # singleton, thread-safe, never raises
+hal.backend                      # HardwareBackend.NVIDIA_CUDA | AMD_ROCM | CPU_ONLY | UNKNOWN
+hal.gpu_count, hal.total_hbm_bytes, hal.free_hbm_bytes
+hal.gpus                         # list[GPUInfo(index, name, total_bytes, free_bytes, compute_cap, backend)]
+hal.is_gpu_available()
+hal.stats()                      # JSON-friendly dict
+```
+
+Detection order:
+1. **NVIDIA via pynvml** — most reliable, exposes compute capability + memory info
+2. **NVIDIA via torch.cuda** — fallback when pynvml missing; skips when `torch.version.hip` is set (defer to AMD detector)
+3. **AMD ROCm** — `/opt/rocm` + `rocm-smi --showmeminfo vram --csv` parsing; fallback to torch HIP build (`torch.version.hip is not None`)
+4. **Default: CPU_ONLY** — first-class state, not an error
+
+`reset_hal()` exists for testing only. Wired into `vmm.discovery.NodeCapabilities` (`hardware_backend` field round-trips through `to_dict` / `from_dict`) and `serving/server.py`'s `/healthz` (`hardware_backend`, `gpu_count` keys in the response).
+
+### 32.2 AMD ROCm backend
+
+| Layer | File | Purpose |
+|-------|------|---------|
+| C++ HIP | `csrc/rocm/rocm_backend.cpp` | Real HIP wrappers (alloc/free/memcpy/sync) + 4-stream pool. Conditional on `MEMOPT_ROCM_AVAILABLE`; compiles to a stub on non-AMD hosts so `import memopt._memopt_rocm` always succeeds |
+| CMake | `csrc/CMakeLists.txt` | `MEMOPT_ENABLE_ROCM` option; `find_package(hip)`; falls back to stub if HIP missing; `HIP_ARCHITECTURES "gfx90a;gfx940;gfx941;gfx942"` |
+| Python shim | `memopt/vmm/backends/_rocm_backend_py.py` | `ROCmBackend` class — `detect_tiers()` for legacy VMM, `allocate_hbm`/`free_hbm`/`copy_to_device`/`copy_from_device`/`synchronize`/`stats` for HAL. Uses C++ when present, simulates otherwise |
+
+**Unified-memory detection:** `is_unified_arch()` checks for `gfx94` substring in `gcnArchName` — covers MI300A (`gfx940`), MI300X (`gfx941`), MI300X-B (`gfx942`); excludes MI210/MI250X (`gfx90a`). `ROCmBackend.is_unified_memory` exposes this so callers can skip H2D copies on MI300X.
+
+### 32.3 Stubs: Intel Gaudi & Google TPU
+
+| File | Class | Detection |
+|------|-------|-----------|
+| `memopt/vmm/backends/_gaudi_backend_py.py` | `GaudiBackend` | `habana_frameworks.torch` import → `/dev/accel/accel0` → `hl-smi` |
+| `memopt/vmm/backends/_tpu_backend_py.py` | `TPUBackend` | `jax.devices("tpu")` → `torch_xla` xla_device check |
+
+Both implement the full HAL contract with no-op / `None` / `False` returns. `stats()` reports `implemented: False` and a `note` explaining what hardware + SDK is required. The classes never raise — they're safe to import on any platform. When real hardware arrives the stub methods are the only thing that needs replacement; HAL detection, NodeCapabilities round-trip, control-plane reporting all stay unchanged.
+
+### 32.4 GPU_SPECS extensions (`memopt/profiler/hardware_counters.py`)
+
+`GPUSpec` dataclass extended with: `vendor`, `architecture`, `arch_tag`, `hbm_size_gb`, `measured`, `source`. All defaults preserve existing NVIDIA entries.
+
+Three AMD entries added (`measured=False` — datasheet only):
+
+| Entry | HBM BW | HBM size | Arch tag | Architecture |
+|:------|:------:|:--------:|:--------:|:-------------|
+| `AMD Instinct MI300X` | 5300 GB/s | 192 GB | `gfx942` | CDNA3 |
+| `AMD Instinct MI250X` | 3276.8 GB/s | 128 GB | `gfx90a` | CDNA2 |
+| `AMD Instinct MI210` | 1638.4 GB/s | 64 GB | `gfx90a` | CDNA2 |
+
+`compute_capability=(0, 0)` is the sentinel for non-NVIDIA; `arch_tag` carries the GCN identifier. `sm_count` holds the AMD CU count (semantically equivalent for roofline math).
+
+### 32.5 `docs/hardware_support.md`
+
+Honest support matrix with status vocabulary (Implemented / Validated / Stub / Planned / Untested) per component per vendor. Includes the 7-step "Adding a new hardware backend" checklist that mirrors the real code layout.
+
+### 32.6 Test coverage
+
+- 17 HAL tests (`vmm/tests/test_hal.py`) — singleton, CPU-only fallback, NVIDIA mock, AMD mock, rocm-smi CSV parsing edge cases, NodeCapabilities round-trip, `/healthz` integration
+- 15 ROCm tests (`vmm/tests/test_rocm_backend.py`) — 11 always-on (Python shim correctness, fallback contracts, env override, `detect_tiers`); 4 hardware-only auto-skip
+- 15 hardware-support tests (`tests/test_hardware_support.py`) — Gaudi / TPU stubs, GPU_SPECS AMD entries + `measured` field contract, `hardware_support.md` content checks, HAL consistency
+
+All run on a CPU-only macOS box without crashing.
+
+---
+
+**End of architecture reference.** For code-level detail on any module mentioned above, see the source. For deployment runbooks, see `docs/cockroachdb_deployment.md`, `docs/hardware_support.md`, `docs/query_optimization.md`, and `scripts/*.sh`.

@@ -1,0 +1,22 @@
+{
+  "node_id":       "{{NODE_ID}}",
+  "mac_address":   "{{MAC_ADDRESS}}",
+  "image_url":     "{{IMAGE_REGISTRY}}/memopt-golden:{{IMAGE_VERSION}}",
+  "image_version": "{{IMAGE_VERSION}}",
+  "rack":          "{{RACK}}",
+  "pod":           "{{POD}}",
+  "region":        "{{REGION}}",
+  "kernel_args": [
+    "memopt.node_id={{NODE_ID}}",
+    "memopt.rack={{RACK}}",
+    "memopt.pod={{POD}}",
+    "memopt.region={{REGION}}",
+    "memopt.boot_server={{BOOT_SERVER_URL}}",
+    "memopt.control_plane={{CONTROL_PLANE_URL}}",
+    "memopt.redis_url={{REDIS_URL}}",
+    "systemd.unit=multi-user.target",
+    "console=tty0",
+    "console=ttyS0,115200n8"
+  ],
+  "ipxe_script": "{{BOOT_SERVER_URL}}/boot/ipxe/{{NODE_ID}}"
+}

@@ -1,0 +1,37 @@
+# Production overrides — use with:
+#   helm install memopt deploy/helm/memopt/ \
+#     -f deploy/helm/memopt/values.production.yaml \
+#     --set redis.url=redis://redis:6379
+
+serving:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "4000m"
+      memory: "16Gi"
+      nvidia.com/gpu: 1
+    limits:
+      cpu: "8000m"
+      memory: "32Gi"
+      nvidia.com/gpu: 1
+
+controlPlane:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"
+
+storage:
+  nvmeSize: 500Gi
+  nvmeStorageClass: local-nvme
+
+memopt:
+  evictHigh: "0.85"
+  evictLow: "0.70"
+  gossipFanout: "5"
+  certifyOnStartup: "true"
+  logLevel: WARNING
