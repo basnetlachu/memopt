@@ -1366,6 +1366,19 @@ Existing callers that omit these kwargs get identical behaviour (returns None, n
 | LocalBlockDirectory | register/lookup, missing, expired, lease lifecycle, lease denied for missing, release safe on missing, multiple leases, deregister, stats, list_node_blocks, make_directory |
 | RemoteBlock | full round-trip with data integrity (SHA-256), not-found returns None, server unreachable returns None, lease round-trip, 5 concurrent clients |
 
+### 7a.6 Validation status (honest)
+
+| Component | Validated | Notes |
+|-----------|:---------:|-------|
+| `BlockEntry` + `LocalBlockDirectory` logic | ✅ | 19 unit tests, full coverage of lease/TTL/expiry state machine |
+| `RemoteBlockServer` / `RemoteBlockClient` TCP protocol | ✅ | Round-trip + concurrency tested over loopback (stdlib `socket`) |
+| `RedisBlockDirectory` | Partial | Unit-tested via mock; not exercised against a live multi-node Redis cluster |
+| Cross-node NVMe block transfer on real hardware | ❌ | Never run on a multi-node GPU cluster. Protocol is wire-compatible with the tested loopback path, but NIC / MTU / jumbo-frame / large-block behavior is unmeasured |
+| Fetch latency and throughput | ❌ | No numbers published. `MEMOPT_RBP_MAX_BLOCK_MB=256` is a ceiling, not a measurement |
+| Integration with `TierManager._fetch_from_lower_tier` | ✅ code path, ❌ end-to-end | All three kwargs (`content_hash`, `remote_client`, `block_directory`) are accepted and routed correctly; end-to-end "Node A evicts, Node B fetches" needs real 2+ GPU hosts to validate |
+
+**Bottom line:** the protocol, directory, and lease state machine are correct under unit+loopback testing. Hardware validation (multi-node GPU cluster with NVMe eviction traffic) is the design-partner phase's responsibility. Nothing in this codebase publishes GUM performance numbers.
+
 ---
 
 ## 7b. Pillar 6: Silicon Certification Suite
@@ -1828,14 +1841,23 @@ The completions endpoint integrates GKD lookup and registration:
 ```
 Request → tokenize → GKD lookup
                          │
-                    hit? ──→ (stats tracked; compute-skip pending engine integration)
-                    miss? ─→ engine.run_sync() → GKD register → ledger.record()
+                    exact hit? ─→ _gkd_store.get_output(block_ref)
+                         │              │
+                         │          cached?  ─→ return CompletionResponse (SKIPS INFERENCE)
+                         │              │
+                         │              └──→ fall through to inference
+                         │
+                    partial hit / miss ─→ engine.run_sync()
+                                            → _gkd_store.register(...)
+                                            → _gkd_store.register_output(...)
+                                            → ledger.record()
 ```
 
-1. **GKD lookup** — `_gkd_store.lookup(token_ids, seq_len)` before inference. On hit (exact or LCP), stats are tracked in `GKDStore` counters. On miss, inference runs normally.
-2. **Inference** — `engine.run_sync()` always runs. Actual compute-skip on GKD hit requires engine-level integration (not yet implemented — the GKD lookup currently builds the dedup index and tracks hit rate).
-3. **GKD register** — on miss, the token sequence is registered into GKD for future dedup: `_gkd_store.register(token_ids, seq_len, block_ref, node_id)`.
-4. **Ledger** — records `tokens_generated` and `gkd_hit_rate_pct` (from live `_gkd_store.stats()`). No `actual_j_per_token` is passed — the field defaults to `None` (unmeasured) to avoid fake numbers.
+1. **GKD lookup** — `_gkd_store.lookup(token_ids, seq_len)` before inference. Returns a `GKDHit` with `is_partial: bool` and a `block_ref` identifier, or `None`.
+2. **Exact-hit compute-skip** (serving/server.py lines 597-643) — when `gkd_hit is not None and not gkd_hit.is_partial`, the handler calls `_gkd_store.get_output(block_ref)` to retrieve the previously stored completion and returns a `CompletionResponse` directly **without calling `engine.run_sync()`**. This is the core deduplication value prop — the hit rate directly translates to compute saved. Hit events are recorded with `gkd_hit_rate_pct=100.0`. A failure at either stage (`lookup` or `get_output`) falls through to full inference so GKD never blocks a request.
+3. **Partial-hit path** — when `gkd_hit.is_partial is True` (LCP match over part of the prefix), inference still runs; the partial match is logged but the engine has no API today to accept a pre-populated partial KV cache. This is the one remaining GKD integration gap — tracked as a future optimization once the continuous-batching engine exposes a per-sequence KV-import hook.
+4. **Miss path** — `engine.run_sync()` runs normally. Afterward both the token hash and the generated text are registered: `_gkd_store.register(token_ids, seq_len, block_ref, node_id)` followed by `_gkd_store.register_output(block_ref, {"text": ..., "completion_tokens": ...})` — so the next identical request takes the skip path.
+5. **Ledger** — records `tokens_generated` and `gkd_hit_rate_pct` (from live `_gkd_store.stats()`). `actual_j_per_token` is passed when `PowerSampler` is active; otherwise defaults to `None` (unmeasured) to avoid fake numbers.
 
 #### `/report/found-capacity` endpoint
 
