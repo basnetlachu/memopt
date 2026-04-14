@@ -1,5 +1,12 @@
 # memopt — Complete Technical Reference
 
+> **memopt is a memory fabric for AI infrastructure.** It turns a fleet of
+> GPU nodes into a single addressable memory plane across HBM, DRAM, NVMe,
+> and peer HBM — with deduplication, paging, prefetch, silicon
+> certification, and fleet orchestration built in. Profiling, kernel
+> synthesis, and OpenAI-compatible serving are *consumers* of the fabric,
+> not its identity.
+
 **Language:** Python 3.10+ (control plane), C++17 (data plane), CUDA 12.4+ (GPU kernels)
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
 **Test suite:** 688 Python tests pass (21 skipped — clean skips for CockroachDB / AMD ROCm hardware paths), 7 C++ GoogleTest suites, 0 failures
@@ -9,7 +16,7 @@
 
 ## Table of Contents
 
-1. [What memopt Does](#1-what-memopt-does)
+1. [What memopt Is](#1-what-memopt-is)
 2. [Repository Layout](#2-repository-layout)
 2a. [C++ Acceleration Layer](#2a-c-acceleration-layer)
 3. [Six-Pillar Architecture](#3-six-pillar-architecture)
@@ -47,32 +54,44 @@
 
 ---
 
-## 1. What memopt Does
+## 1. What memopt Is
 
-memopt is a GPU memory profiling, optimization, and serving toolkit for PyTorch models built around three pillars:
+memopt is a **memory fabric for AI infrastructure** — the layer between accelerator hardware and the workloads that run on it. Where storage fabrics like Ceph turn independent disks into one addressable storage plane, memopt turns independent GPU nodes into one addressable **memory plane**: HBM, DRAM, NVMe, and peer HBM all participate, blocks flow between tiers automatically, and the same block is never materialized twice across the cluster.
 
-1. **Measure** — hardware counters (DRAM traffic, stall cycles, L2 hit rates, arithmetic intensity, achieved occupancy) via CUDA events, PyTorch profiler, and optionally Nsight Compute.
-2. **Identify** — bottleneck type (DRAM-bound, cache-bound, compute-bound, pipeline-bound) with confidence score, severity, root cause string, and ranked recommendations.
-3. **Apply** — automatic optimizations with a test-measure-commit safety loop that rolls back on regression.
+**memopt is NOT**:
+- A profiler — profiling exists, but as a *consumer* of fabric telemetry
+- An optimization toolkit — optimizations apply *to* workloads running on the fabric, not the fabric itself
+- An inference server — serving is one of several runtimes that plug into the fabric; the fabric outlives it
 
-Beyond single-model optimization, memopt provides:
+**memopt IS**:
 
-- **Infinite Context VMM** — multi-tier (HBM → DRAM → NVMe) KV-block paging with predictive prefetch so long-context inference never OOMs. Includes a Markov chain Memory Oracle (Layer 2), TCP gossip federation for cross-node transition sharing, elastic tier allocation, and HBM pressure-aware horizon scaling (Layer 3).
-- **Global KV Cache Deduplication (GKD)** — cluster-wide content-addressed cache that eliminates redundant KV recomputation for shared prompt prefixes (90%+ hit rate in production).
-- **Self-Synthesizing Kernels** — detects HBM memory stalls at runtime, calls the Claude API to synthesise a fused Triton kernel, validates and hot-swaps it without interrupting inference. Feedback loop: each re-synthesis reads the previous attempt's speedup, bottleneck type, and tiling config to produce a better kernel. Hardware drift triggers automatic re-synthesis of active kernels.
-- **Proof of Efficiency** — Prometheus metrics aggregator, per-batch energy/CO₂/cost savings ledger (SQLite, write-buffered), HMAC-signed optimization certificates, and GPU price arbitrage engine.
-- **Global Unified Memory (GUM)** — turns N independent GPU nodes into one logical memory space; NVMe-evicted blocks are content-addressed and fetchable from any peer over TCP via optimistic lease protocol.
-- **Silicon Certification Suite** — correctness and throughput battery (rope, layer_norm_residual, scaled_softmax + memcpy/GEMM benchmarks) producing a signed `SiliconCertificate` JSON that proves hardware behaviour before deployment.
-- **Background daemon** — zero-touch GPU process monitor via NVML.
-- **Serving runtime** — OpenAI-compatible HTTP interface with paged attention, continuous batching, GKD dedup on every request, and `/report/found-capacity` endpoint for real-time savings reporting.
-- **Control plane** — lightweight FastAPI server for cluster node reporting, status, serving engine registration, and node degradation tracking (drift → automatic traffic rerouting).
-- **Three-tier oracle hierarchy** — node → pod → global oracles share high-confidence transitions across the cluster (1s pod-pull cadence, 60s global-pull cadence, gate evaluation with confidence + node-coverage filters).
-- **Kubernetes operator** — `MemoptCluster` / `MemoptNode` CRDs + a polling reconcile loop that watches both, ensures one `MemoptNode` per matching node, drives drift→evict at >15%, and runs in dry-run on machines without `kubernetes` installed.
-- **Golden image + PXE boot** — `Dockerfile.golden` bakes Ubuntu 22.04 + CUDA runtime + memopt + pre-compiled C++ extensions + systemd units + `first_boot.sh` so nodes boot from an image in < 60 s with no compiler at boot. iPXE script + `/boot/config/{mac}` + `/boot/callback` + `/boot/status` close the loop with the control plane.
-- **Image registry + rollback** — every golden image is registered with `git_commit`, `cuda_version`, `sm_targets`, `digest`; a per-node rollback intent overrides the served image_version on the next PXE boot.
-- **Canary rollouts** — 1-10-100-All progressive deployment with real gate evaluation (cert pass rate, error rate, latency vs baseline, GKD hit rate). HTTP API + Prometheus alerts (`MemoptRolloutPaused`, `MemoptRolloutFailed`, `MemoptCertFailureHigh`) + Grafana dashboard.
-- **Global-scale database** — `SQLite` for dev, `PostgreSQL` for single-region prod, `CockroachDB` for 100K+ node fleets. Dialect-aware queries (DISTINCT ON for PG/CRDB, MAX-id subquery for SQLite), composite indexes for hot paths, heartbeat batcher coalescing 1M-node drift writes, `migrate_to_crdb.sh` migration tool.
-- **Hardware Abstraction Layer (HAL)** — runtime detection of NVIDIA CUDA / AMD ROCm / CPU-only / unknown via `pynvml` → `torch.cuda` → `rocm-smi` → fallback. Real C++ HIP backend for AMD MI300X (`gfx94x` unified-memory aware), Intel Gaudi + Google TPU stubs defining the contract for future hardware.
+### What the fabric provides
+
+- **Tiered memory addressing** — every KV block lives in exactly one of {HBM, DRAM, NVMe, peer-HBM-via-GUM}; `TierManager` moves it on demand. Callers never think about where a block physically is.
+- **Cluster-wide deduplication** — GKD (Global KV Dedup) content-addresses every block by SHA-256 so a block paid for once is never recomputed anywhere in the fleet. 90%+ hit rate observed in 1000-user simulation (Section 5.8).
+- **Predictive paging** — a three-tier Markov oracle (node → pod → global) predicts the next blocks a sequence will need and prefetches them before they're requested. Transitions that survive confidence + coverage filters propagate up and back down the hierarchy (Section 26).
+- **Silicon certification as a gate** — nodes don't join the fabric until their kernels prove numerical correctness against tolerance; drift > 15% evicts them automatically (Section 7b).
+- **One logical memory space (GUM)** — NVMe-evicted blocks on Node A are fetchable over TCP by Node B via optimistic lease protocol. N nodes present as one pool (Section 7a).
+
+### What the fleet plane on top provides
+
+- **Kubernetes operator** — `MemoptCluster` / `MemoptNode` CRDs drive reconciliation (Section 27).
+- **Golden image + PXE boot** — nodes boot from a pre-baked image in seconds, register with the control plane, receive their rack/pod/region assignment (Section 28).
+- **Image registry + rollback** — every image is versioned, rollback is a per-node intent that overrides the next PXE boot (Section 29).
+- **Canary rollouts** — 1-10-100-All progressive rollout with real gate evaluation (cert pass rate, error rate, latency delta, GKD hit rate); Prometheus alerts + Grafana dashboard (Section 30).
+- **Horizontally scalable control plane** — SQLite → PostgreSQL → CockroachDB depending on fleet size; dialect-aware hot queries, heartbeat batching (Section 31).
+- **Hardware abstraction** — NVIDIA CUDA + AMD ROCm real backends; Intel Gaudi + Google TPU stubs define the contract for future silicon (Section 32).
+
+### What runs on the fabric (consumers)
+
+These ship with memopt but are *applications* of the fabric, not the fabric itself:
+
+- **Inference runtime** — OpenAI-compatible serving with paged attention + continuous batching; GKD exact-hit short-circuits compute entirely (Section 16).
+- **Hardware-counter profiling** — DRAM traffic, stall cycles, L2 hit rates via CUDA events / PyTorch profiler / NCU (Section 8).
+- **Bottleneck classification** — DRAM-bound / cache-bound / compute-bound / pipeline-bound with confidence score and ranked recommendations (Section 9).
+- **Self-synthesizing kernels** — HBM stalls trigger Claude-API kernel synthesis; new kernels are validated and hot-swapped without interrupting inference (Section 6).
+- **Observability** — Prometheus metrics, per-batch energy/CO₂/cost ledger, HMAC-signed optimization certificates, GPU price arbitrage (Section 7).
+- **Background daemon** — zero-touch GPU process monitor via NVML (Section 17).
 
 ---
 
