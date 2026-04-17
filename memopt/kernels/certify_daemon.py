@@ -347,6 +347,23 @@ class CertifyDaemon:
 
             self._write_status(healthy, passed, drifted, result)
 
+            # Persist certification run to SLA history
+            try:
+                from memopt.kernels.certification import SLACertificate
+                SLACertificate.append_run(
+                    history_path=os.environ.get(
+                        "MEMOPT_CERT_HISTORY_PATH",
+                        os.path.expanduser("~/.memopt/cert_history.json")),
+                    node_id=self._node_id,
+                    cert=cert,
+                    drift_detected=drifted)
+            except Exception as e:
+                logger.debug("SLA history append failed: %s", e)
+
+            # Emit Prometheus metrics
+            _drift_pct = self._drift.drift_pct() or 0.0
+            self._emit_prometheus_metrics(cert, _drift_pct)
+
             if not passed:
                 failed_count = sum(
                     1 for t in cert.correctness_tests if not t.passed
@@ -379,6 +396,46 @@ class CertifyDaemon:
             with self._lock:
                 self._certified = False
             self._write_status(False, False, False, {"error": str(exc)})
+
+    def _emit_prometheus_metrics(self, cert, drift_pct: float) -> None:
+        """Emit Prometheus metrics after each certification run. Never raises."""
+        try:
+            import prometheus_client as prom
+        except ImportError:
+            return
+
+        try:
+            node = self._node_id
+
+            prom.Gauge(
+                "memopt_cert_passed",
+                "1 if last certification passed",
+                ["node_id"],
+            ).labels(node_id=node).set(1 if cert.all_passed else 0)
+
+            if cert.throughput_tests:
+                pct = getattr(cert.throughput_tests[0], "pct_of_peak", None)
+                if pct is not None:
+                    prom.Gauge(
+                        "memopt_bandwidth_pct_of_peak",
+                        "Achieved bandwidth pct of peak",
+                        ["node_id"],
+                    ).labels(node_id=node).set(pct)
+
+            prom.Gauge(
+                "memopt_drift_pct",
+                "Hardware bandwidth drift pct",
+                ["node_id"],
+            ).labels(node_id=node).set(drift_pct)
+
+            prom.Counter(
+                "memopt_cert_runs_total",
+                "Total certification runs",
+                ["node_id"],
+            ).labels(node_id=node).inc()
+
+        except Exception as e:
+            logger.debug("Prometheus emit failed: %s", e)
 
     def _fire_alert(self, result: dict) -> None:
         if self._alert:

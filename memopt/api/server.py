@@ -899,6 +899,130 @@ async def ledger_verify(
     return _p4_ledger.verify_and_certify(tenant_id=tenant_id)
 
 
+# ── Export endpoints ─────────────────────────────────────────────────────────
+
+from fastapi import Query
+
+@app.get("/ledger/export/csv")
+async def export_ledger_csv(
+    period_hours: int = Query(default=24),
+    tenant_id: str = Depends(get_tenant),
+):
+    """Export ledger as CSV file download. Tenant-scoped."""
+    if _p4_ledger is None:
+        return Response(content="", media_type="text/csv")
+
+    filter_tenant = "" if is_admin(tenant_id) else tenant_id
+    start_time = time.time() - period_hours * 3600
+
+    csv_data = _p4_ledger.export_csv(
+        tenant_id=filter_tenant, start_time=start_time)
+
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=memopt_ledger_"
+                f"{tenant_id}_{int(time.time())}.csv")
+        })
+
+
+@app.get("/ledger/export/report.html")
+async def export_report_html(
+    period_hours: int = Query(default=24),
+    tenant_id: str = Depends(get_tenant),
+):
+    """Export savings report as HTML."""
+    from memopt.observability.report_exporter import generate_report
+    from fastapi.responses import HTMLResponse
+
+    report = generate_report(
+        ledger=_p4_ledger if _p4_ledger is not None else _EmptyLedger(),
+        tenant_id=tenant_id,
+        period_hours=period_hours)
+
+    return HTMLResponse(content=report.to_html())
+
+
+@app.get("/ledger/export/report.pdf")
+async def export_report_pdf(
+    period_hours: int = Query(default=24),
+    tenant_id: str = Depends(get_tenant),
+):
+    """Export savings report as PDF. Falls back to HTML if reportlab unavailable."""
+    from memopt.observability.report_exporter import generate_report
+
+    report = generate_report(
+        ledger=_p4_ledger if _p4_ledger is not None else _EmptyLedger(),
+        tenant_id=tenant_id,
+        period_hours=period_hours)
+
+    pdf_bytes = report.to_pdf()
+    if pdf_bytes:
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename=memopt_report_"
+                    f"{tenant_id}_{int(time.time())}.pdf")
+            })
+
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(
+        content=report.to_html()
+        + "\n<!-- PDF export requires: pip install reportlab -->")
+
+
+@app.get("/ledger/export/carbon")
+async def export_carbon(
+    period_hours: int = Query(default=24 * 30),
+    tenant_id: str = Depends(get_tenant),
+):
+    """Export carbon savings summary with annual projection."""
+    from memopt.observability.ledger import CarbonCalculator
+
+    filter_tenant = "" if is_admin(tenant_id) else tenant_id
+
+    totals = (_p4_ledger.totals(tenant_id=filter_tenant or None)
+              if _p4_ledger is not None else {})
+
+    energy_kwh = totals.get("energy_saved_kwh") or 0.0
+
+    calc = CarbonCalculator()
+    co2_kg = calc.kwh_to_co2_kg(energy_kwh)
+
+    daily_kwh = (energy_kwh / period_hours * 24
+                 if period_hours > 0 else 0)
+    projection = calc.annual_projection(daily_kwh_saved=daily_kwh)
+
+    return {
+        "tenant_id": tenant_id,
+        "period_hours": period_hours,
+        "energy_saved_kwh": energy_kwh,
+        "co2_saved_kg": co2_kg,
+        "co2_saved_tonnes": calc.kg_to_tonnes(co2_kg),
+        "annual_projection": projection,
+        "carbon_calculator": calc.stats(),
+        "energy_source_breakdown": totals.get(
+            "energy_source_breakdown", {}),
+        "disclaimer": (
+            "CO2 estimates based on regional grid intensity. "
+            "Not certified carbon credits. Configure "
+            "MEMOPT_GRID_REGION or MEMOPT_GRID_INTENSITY_KG_KWH "
+            "for your deployment region."),
+    }
+
+
+class _EmptyLedger:
+    """Stub ledger for when _p4_ledger is None."""
+    def totals(self, tenant_id=None):
+        return {}
+    def export_csv(self, **kwargs):
+        return ""
+
+
 # ── Tenant management (admin only) ───────────────────────────────────────────
 
 @app.post("/tenants/{new_tenant_id}", status_code=201)
@@ -933,6 +1057,33 @@ async def revoke_tenant_endpoint(
 async def list_tenants_endpoint(_admin: str = Depends(require_admin)):
     """List all active tenants. Admin only."""
     return {"tenants": list_tenants()}
+
+
+@app.get("/hardware/specs")
+async def hardware_specs(tenant_id: str = Depends(get_tenant)):
+    """
+    GPU hardware specifications with honest audit trail.
+
+    measured=False means the number comes from the vendor datasheet
+    and has not been validated by memopt on real hardware.
+    """
+    from memopt.profiler.hardware_counters import (
+        GPU_SPECS, get_spec_with_audit)
+
+    result = {}
+    for name in GPU_SPECS:
+        result[name] = get_spec_with_audit(name)
+
+    return {
+        "specs": result,
+        "total": len(result),
+        "measured_count": sum(
+            1 for v in result.values() if v.get("measured")),
+        "note": (
+            "measured=False means the bandwidth number is from "
+            "the vendor datasheet. memopt updates this after "
+            "running certification on that hardware."),
+    }
 
 
 @app.get("/health")

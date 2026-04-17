@@ -93,6 +93,9 @@ class LedgerEntry:
     electricity_price_used: float
     gpu_price_hr_used:    float
 
+    # Measurement provenance
+    energy_source:        str = "unmeasured"  # nvml_measured | estimated | unmeasured
+
 
 def _compute_savings(
     tokens:              int,
@@ -308,6 +311,14 @@ class OptimizationLedger:
                     "CREATE INDEX IF NOT EXISTS idx_tenant "
                     "ON entries(tenant_id)"
                 )
+                # Migration: add energy_source column if not present
+                try:
+                    conn.execute(
+                        "ALTER TABLE entries ADD COLUMN "
+                        "energy_source TEXT DEFAULT 'unmeasured'"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
         except Exception as e:
             logger.warning(f"Ledger DB init failed: {e} — ledger disabled")
 
@@ -351,6 +362,7 @@ class OptimizationLedger:
         speedup_ratio:       Optional[float] = None,
         hbm_saved_bytes:     Optional[float] = None,
         baseline_j_per_token: float          = _BASELINE_J_PER_TOKEN,
+        energy_source:       str             = "unmeasured",
     ) -> LedgerEntry:
         """
         Record one batch and compute its savings.
@@ -389,6 +401,12 @@ class OptimizationLedger:
             gkd_hit_rate_pct=gkd_hit_rate_pct,
         )
 
+        # Determine energy_source if not explicitly set
+        if energy_source == "unmeasured" and actual_j_per_token is not None:
+            energy_source = "nvml_measured"
+        elif energy_source == "unmeasured" and gkd_hit_rate_pct is not None:
+            energy_source = "estimated"
+
         entry = LedgerEntry(
             batch_id=batch_id,
             timestamp=time.time(),
@@ -403,6 +421,7 @@ class OptimizationLedger:
             energy_saved_kwh=savings["energy_saved_kwh"],
             co2_saved_kg=savings["co2_saved_kg"],
             cost_saved_usd=savings["cost_saved_usd"],
+            energy_source=energy_source,
             grid_intensity_used=_GRID_INTENSITY,
             electricity_price_used=_ELECTRICITY_PRICE,
             gpu_price_hr_used=_GPU_PRICE_HR,
@@ -419,7 +438,21 @@ class OptimizationLedger:
                     prev_hash  = _get_latest_hash(conn)
                     entry_hash = _compute_entry_hash(d, prev_hash)
                     conn.execute("""
-                        INSERT INTO entries VALUES (
+                        INSERT INTO entries (
+                            batch_id, timestamp, node_id, tenant_id,
+                            tokens_generated,
+                            actual_j_per_token, baseline_j_per_token,
+                            gkd_hit_rate_pct, speedup_ratio,
+                            hbm_saved_bytes,
+                            energy_saved_kwh, co2_saved_kg,
+                            cost_saved_usd,
+                            grid_intensity_used,
+                            electricity_price_used,
+                            gpu_price_hr_used,
+                            prev_hash, entry_hash,
+                            raw_json,
+                            energy_source
+                        ) VALUES (
                             :batch_id, :timestamp, :node_id, :tenant_id,
                             :tokens_generated,
                             :actual_j_per_token, :baseline_j_per_token,
@@ -431,13 +464,15 @@ class OptimizationLedger:
                             :electricity_price_used,
                             :gpu_price_hr_used,
                             :prev_hash, :entry_hash,
-                            :raw_json
+                            :raw_json,
+                            :energy_source
                         )
                     """, {
                         **d,
                         "prev_hash":  prev_hash,
                         "entry_hash": entry_hash,
                         "raw_json":   json.dumps(d),
+                        "energy_source": d.get("energy_source", "unmeasured"),
                     })
         except sqlite3.IntegrityError:
             logger.debug(f"Ledger write rejected duplicate batch_id: {entry.batch_id}")
@@ -536,7 +571,32 @@ class OptimizationLedger:
             keys = ["n_batches", "tokens_total", "energy_saved_kwh",
                     "co2_saved_kg", "cost_saved_usd", "hbm_saved_bytes",
                     "avg_gkd_hit_rate_pct", "avg_speedup_ratio"]
-            return {k: v for k, v in zip(keys, row)}
+            result = {k: v for k, v in zip(keys, row)}
+
+            # Energy source breakdown
+            try:
+                if tenant_id is not None:
+                    es_rows = conn.execute(
+                        "SELECT energy_source, COUNT(*) FROM entries "
+                        "WHERE tenant_id = ? GROUP BY energy_source",
+                        (tenant_id,)).fetchall()
+                else:
+                    es_rows = conn.execute(
+                        "SELECT energy_source, COUNT(*) FROM entries "
+                        "GROUP BY energy_source").fetchall()
+                breakdown = {"nvml_measured": 0, "estimated": 0, "unmeasured": 0}
+                for src, cnt in es_rows:
+                    key_name = src or "unmeasured"
+                    if key_name in breakdown:
+                        breakdown[key_name] = cnt
+                    else:
+                        breakdown["unmeasured"] += cnt
+                result["energy_source_breakdown"] = breakdown
+            except Exception:
+                result["energy_source_breakdown"] = {
+                    "nvml_measured": 0, "estimated": 0, "unmeasured": 0}
+
+            return result
         except Exception as e:
             logger.debug(f"Ledger totals failed: {e}")
             return {}
@@ -589,6 +649,98 @@ class OptimizationLedger:
             payload["signature_status"] = "unsigned"
 
         return payload
+
+    def export_csv(
+        self,
+        tenant_id: str = "",
+        start_time: float = 0.0,
+        end_time: float = 0.0,
+        max_rows: int = 100_000,
+    ) -> str:
+        """
+        Export ledger entries as CSV string. One row per batch.
+
+        energy_source column shows:
+          nvml_measured - real GPU power reading
+          estimated     - calculated from hit rate
+          unmeasured    - no measurement available
+
+        Never raises. Returns empty CSV on error.
+        """
+        try:
+            import csv
+            import io
+
+            rows = self._fetch_rows(
+                tenant_id=tenant_id,
+                start_time=start_time,
+                end_time=end_time,
+                max_rows=max_rows)
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            writer.writerow([
+                "batch_id", "timestamp", "tenant_id",
+                "tokens_generated", "actual_j_per_token",
+                "energy_source", "energy_saved_kwh",
+                "co2_saved_kg", "cost_saved_usd", "entry_hash",
+            ])
+
+            for row in rows:
+                writer.writerow([
+                    row.get("batch_id", ""),
+                    row.get("timestamp", ""),
+                    row.get("tenant_id", ""),
+                    row.get("tokens_generated", 0),
+                    row.get("actual_j_per_token", ""),
+                    row.get("energy_source", "unmeasured"),
+                    row.get("energy_saved_kwh", ""),
+                    row.get("co2_saved_kg", ""),
+                    row.get("cost_saved_usd", ""),
+                    str(row.get("entry_hash", ""))[:16],
+                ])
+
+            return output.getvalue()
+
+        except Exception as e:
+            logger.debug("CSV export failed: %s", e)
+            return ""
+
+    def _fetch_rows(
+        self,
+        tenant_id: str = "",
+        start_time: float = 0.0,
+        end_time: float = 0.0,
+        max_rows: int = 100_000,
+    ) -> List[dict]:
+        """Fetch ledger rows with optional filters. Never raises."""
+        try:
+            query = "SELECT * FROM entries"
+            params: list = []
+            conditions = []
+
+            if tenant_id:
+                conditions.append("tenant_id = ?")
+                params.append(tenant_id)
+            if start_time > 0:
+                conditions.append("timestamp >= ?")
+                params.append(start_time)
+            if end_time > 0:
+                conditions.append("timestamp <= ?")
+                params.append(end_time)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += f" ORDER BY timestamp ASC LIMIT {max_rows}"
+
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(query, params)
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.debug("Fetch rows failed: %s", e)
+            return []
 
     def verify_chain(self, tenant_id: Optional[str] = None) -> dict:
         """
@@ -650,3 +802,90 @@ class OptimizationLedger:
         except Exception as e:
             logger.debug(f"Ledger verify_chain failed: {e}")
             return {"ok": False, "entries_checked": 0, "reason": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Carbon calculator
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CarbonCalculator:
+    """
+    Calculates CO2 avoided from energy savings.
+
+    Uses regional grid intensity factors.
+
+    HONEST: These are estimates based on average grid carbon intensity.
+    They are NOT certified carbon credits, regulatory compliance instruments,
+    or audited environmental claims. They ARE reasonable estimates for
+    reporting, directionally correct, and configurable per deployment region.
+
+    Grid intensity sources:
+      EU average:  0.233 kg/kWh (IEA 2024)
+      US average:  0.380 kg/kWh (EPA 2024)
+      China:       0.581 kg/kWh (IEA 2024)
+      UK:          0.148 kg/kWh (National Grid 2024)
+      France:      0.052 kg/kWh (RTE 2024, nuclear)
+    """
+
+    GRID_INTENSITIES = {
+        "eu":     0.233,
+        "us":     0.380,
+        "china":  0.581,
+        "uk":     0.148,
+        "france": 0.052,
+        "global": 0.475,
+    }
+
+    def __init__(self):
+        self._region = os.environ.get(
+            "MEMOPT_GRID_REGION", "eu").lower()
+
+        env_intensity = os.environ.get("MEMOPT_GRID_INTENSITY_KG_KWH")
+        if env_intensity:
+            try:
+                self._intensity = float(env_intensity)
+            except ValueError:
+                self._intensity = self.GRID_INTENSITIES.get(
+                    self._region, 0.233)
+        else:
+            self._intensity = self.GRID_INTENSITIES.get(
+                self._region, 0.233)
+
+    def kwh_to_co2_kg(self, energy_kwh: float) -> float:
+        """Convert kWh saved to kg CO2 avoided. Returns 0.0 for negative energy."""
+        if energy_kwh <= 0:
+            return 0.0
+        return round(energy_kwh * self._intensity, 6)
+
+    def kg_to_tonnes(self, co2_kg: float) -> float:
+        return round(co2_kg / 1000, 6)
+
+    def annual_projection(self, daily_kwh_saved: float) -> dict:
+        """
+        Project annual CO2 savings.
+
+        HONEST: This is a linear projection. Actual savings depend on
+        workload staying consistent. We do not guarantee these numbers.
+        """
+        annual_kwh = daily_kwh_saved * 365
+        annual_co2_kg = self.kwh_to_co2_kg(annual_kwh)
+
+        return {
+            "annual_kwh_saved": round(annual_kwh, 4),
+            "annual_co2_kg": round(annual_co2_kg, 4),
+            "annual_co2_tonnes": self.kg_to_tonnes(annual_co2_kg),
+            "grid_region": self._region,
+            "grid_intensity_kg_kwh": self._intensity,
+            "projection_basis": "linear",
+            "disclaimer": (
+                "Linear projection from daily average. "
+                "Not a certified carbon credit."),
+        }
+
+    def stats(self) -> dict:
+        return {
+            "region": self._region,
+            "intensity": self._intensity,
+            "source": "configured",
+            "available_regions": list(self.GRID_INTENSITIES.keys()),
+        }

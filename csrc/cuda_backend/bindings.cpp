@@ -15,6 +15,7 @@
 
 #include "gds.h"
 #include "nvme_io.h"
+#include "nvme_async.h"
 #include "stream_pool.h"
 
 #include <vector>
@@ -104,6 +105,65 @@ PYBIND11_MODULE(_memopt_cuda, m) {
         return false;
         #endif
     }, "True if compiled with cuFile GDS support.");
+
+    // ── Capability flags ─────────────────────────────────────────────
+    // ── Async NVMe I/O (io_uring) ─────────────────────────────────────
+    py::class_<memopt::AsyncNVMeReader>(m, "AsyncNVMeReader")
+        .def(py::init<bool>(), py::arg("force_sync") = false)
+        .def("read_async",
+            [](memopt::AsyncNVMeReader& self,
+               const std::string& path,
+               size_t offset,
+               size_t size,
+               std::function<void(bool, size_t)> cb)
+            {
+                // Note: this binding is for testing only.
+                // Production uses the C++ layer directly from
+                // the tier manager. buf=nullptr here because
+                // Python-side reads use read_block() instead.
+                py::gil_scoped_release release;
+                return self.read_async(
+                    path, nullptr, offset, size, cb);
+            },
+            py::arg("path"), py::arg("offset"),
+            py::arg("size"), py::arg("callback"))
+        .def("poll",
+            [](memopt::AsyncNVMeReader& self) {
+                py::gil_scoped_release release;
+                return self.poll();
+            })
+        .def("wait",
+            [](memopt::AsyncNVMeReader& self, int timeout_ms) {
+                py::gil_scoped_release release;
+                return self.wait(timeout_ms);
+            },
+            py::arg("timeout_ms") = 100)
+        .def("drain",
+            [](memopt::AsyncNVMeReader& self) {
+                py::gil_scoped_release release;
+                self.drain();
+            })
+        .def("is_async", &memopt::AsyncNVMeReader::is_async)
+        .def("stats",
+            [](memopt::AsyncNVMeReader& self) {
+                auto s = self.stats();
+                py::dict d;
+                d["reads_submitted"] = s.reads_submitted;
+                d["reads_completed"] = s.reads_completed;
+                d["reads_failed"]    = s.reads_failed;
+                d["bytes_read"]      = s.bytes_read;
+                d["sync_fallbacks"]  = s.sync_fallbacks;
+                return d;
+            });
+
+    py::class_<memopt::AsyncNVMeWriter>(m, "AsyncNVMeWriter")
+        .def(py::init<bool>(), py::arg("force_sync") = false)
+        .def("is_async", &memopt::AsyncNVMeWriter::is_async)
+        .def("drain",
+            [](memopt::AsyncNVMeWriter& self) {
+                py::gil_scoped_release release;
+                self.drain();
+            });
 
     // ── Capability flags ─────────────────────────────────────────────
     m.def("cuda_is_available", []() -> bool {

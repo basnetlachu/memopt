@@ -46,6 +46,112 @@ _DTYPE_TOLERANCES = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Flash attention synthesis prompt
+# ═══════════════════════════════════════════════════════════════════════════
+
+FLASH_ATTENTION_PROMPT = """\
+Write a fused multi-head attention kernel in Triton.
+
+Hardware: {hardware}
+Query shape: {q_shape}  (batch, heads, seq, dim)
+Key shape:   {k_shape}
+Value shape: {v_shape}
+dtype:       {dtype}
+causal mask: {causal}
+
+Requirements:
+1. Fused QK^T matmul + scale + softmax + V matmul
+   in a single Triton kernel.
+2. Use tiling to keep SRAM usage bounded.
+   Tile size should fit in shared memory.
+3. The kernel must be numerically stable.
+   Use the online softmax algorithm
+   (track running max and sum).
+4. Handle causal masking inside the kernel
+   when causal=True.
+5. Output shape must match input Q shape.
+
+The function signature must be:
+  def run_kernel(q, k, v, scale=None):
+    # q, k, v: torch.Tensor
+    # returns: torch.Tensor same shape as q
+
+Do not import torch inside the kernel.
+Use triton.language as tl.
+Use @triton.jit decorator.
+
+Return only the Python/Triton code.
+No explanation. No markdown.
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Custom op synthesis prompt and spec
+# ═══════════════════════════════════════════════════════════════════════════
+
+CUSTOM_OP_PROMPT = """\
+Write a fused CUDA kernel in Triton for the following operation:
+
+{description}
+
+Hardware: {hardware}
+Input shapes: {input_shapes}
+Input dtypes: {input_dtypes}
+Output shape: {output_shape}
+
+Requirements:
+1. Implement the exact mathematical operation described above.
+2. Use tiling appropriate for the input size.
+3. The kernel must be numerically correct within float16 tolerances.
+4. Use @triton.jit and triton.language as tl.
+
+The function signature must be:
+  def run_kernel(*inputs):
+    # inputs: list of torch.Tensor
+    # returns: torch.Tensor
+
+Return only the Python/Triton code.
+No explanation. No markdown.
+"""
+
+
+class CustomOpSpec:
+    """
+    Specification for a custom op to synthesize.
+
+    Callers describe their op and we attempt to synthesize a faster
+    Triton kernel. No guarantee of success or speedup. The synthesized
+    kernel is validated and benchmarked. Only a correct + faster kernel
+    is kept.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        input_shapes: list,
+        input_dtypes: list,
+        output_shape: tuple,
+        reference_fn=None,
+        atol: float = 1e-2,
+        rtol: float = 1e-2,
+    ):
+        if not name:
+            raise ValueError("name required")
+        if not description:
+            raise ValueError("description required")
+
+        self.name = name
+        self.description = description
+        self.input_shapes = input_shapes
+        self.input_dtypes = input_dtypes
+        self.output_shape = output_shape
+        self.reference_fn = reference_fn
+        self.atol = atol
+        self.rtol = rtol
+
+
 class JITGenerator:
     """
     Synthesises hardware-specific fused kernels for detected bottlenecks.
@@ -564,6 +670,333 @@ class JITGenerator:
             return mapping.get(op_name)
         except Exception:
             return None
+
+    # ── Flash attention synthesis ─────────────────────────────────────
+
+    def synthesize_flash_attention(
+        self,
+        q_shape: tuple,
+        k_shape: tuple,
+        v_shape: tuple,
+        dtype: str = "float16",
+        causal: bool = False,
+        hardware_profile=None,
+    ) -> Optional[str]:
+        """
+        Synthesize a fused attention kernel.
+
+        Returns Triton source code or None.
+
+        HONEST NOTE: Whether the resulting kernel compiles, is correct,
+        or is faster is unknown until GPU validation. Do not claim
+        speedup before measuring. Never raises.
+        """
+        try:
+            hw = hardware_profile or self._get_hardware_description()
+
+            prompt = FLASH_ATTENTION_PROMPT.format(
+                hardware=hw,
+                q_shape=q_shape,
+                k_shape=k_shape,
+                v_shape=v_shape,
+                dtype=dtype,
+                causal=causal,
+            )
+
+            source = self._call_api_simple(prompt)
+            if source:
+                logger.info("Flash attention synthesis: source received from API")
+            return source
+
+        except Exception as e:
+            logger.debug("Flash attention synthesis failed: %s", e)
+            return None
+
+    def validate_attention(
+        self,
+        module,
+        q_shape: tuple,
+        dtype_str: str = "float16",
+    ) -> bool:
+        """
+        Validate synthesized attention kernel against PyTorch reference
+        (F.scaled_dot_product_attention).
+
+        Tolerances are looser than other ops because online softmax
+        accumulates floating point error differently.
+
+        Returns True if output is close enough. Returns False on CPU.
+        Never raises.
+        """
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            if not torch.cuda.is_available():
+                logger.debug("Attention validation: skipped (no GPU)")
+                return False
+
+            dtype_map = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float32": torch.float32,
+            }
+            dtype = dtype_map.get(dtype_str, torch.float16)
+
+            b, h, s, d = q_shape
+            q = torch.randn(b, h, s, d, dtype=dtype, device="cuda")
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            scale = d ** -0.5
+
+            with torch.no_grad():
+                ref = F.scaled_dot_product_attention(q, k, v, scale=scale)
+
+            with torch.no_grad():
+                out = module.run_kernel(q, k, v, scale)
+
+            # Looser tolerances for attention (online softmax has more fp error)
+            atol = 1e-1 if dtype != torch.float32 else 1e-3
+            rtol = 1e-1 if dtype != torch.float32 else 1e-3
+
+            ok = torch.allclose(ref.float(), out.float(), atol=atol, rtol=rtol)
+
+            if not ok:
+                max_err = (ref.float() - out.float()).abs().max()
+                logger.warning("Attention validation failed: max_err=%.4f", max_err)
+
+            return ok
+
+        except Exception as e:
+            logger.debug("Attention validation error: %s", e)
+            return False
+
+    # ── Custom op synthesis ────────────────────────────────────────────
+
+    def synthesize_custom_op(self, spec: "CustomOpSpec") -> Optional[object]:
+        """
+        Synthesize a kernel for a custom op.
+
+        Returns compiled module or None.
+
+        Steps: check cache -> build prompt -> API call -> compile ->
+        validate -> benchmark -> cache if correct AND faster.
+
+        Never raises. Returns None if API unavailable, compilation fails,
+        validation fails, or not faster than reference.
+        """
+        cache_key_str = self._cache.make_key(
+            spec.name, spec.input_shapes,
+            self._get_hardware_description()
+        ) if hasattr(self._cache, 'make_key') else f"{spec.name}_custom"
+
+        # Cache hit
+        cached = self._cache.get(cache_key_str) if self._cache else None
+        if cached is not None:
+            logger.debug("Custom op cache hit: %s", spec.name)
+            return cached
+
+        try:
+            hw = self._get_hardware_description()
+
+            prompt = CUSTOM_OP_PROMPT.format(
+                description=spec.description,
+                hardware=hw,
+                input_shapes=spec.input_shapes,
+                input_dtypes=spec.input_dtypes,
+                output_shape=spec.output_shape,
+            )
+
+            source = self._call_api_simple(prompt)
+            if source is None:
+                return None
+
+            module = self._portability.compile(source, hw) if self._portability else None
+            if module is None:
+                logger.debug("Custom op compile failed: %s", spec.name)
+                return None
+
+            valid = self._validate_custom_op(module, spec)
+            if not valid:
+                logger.warning(
+                    "Custom op validation failed: %s. Discarded.", spec.name)
+                return None
+
+            speedup = self._benchmark_custom_op(module, spec)
+            if speedup < 1.05:
+                logger.info(
+                    "Custom op not faster: %s speedup=%.3fx. Discarded.",
+                    spec.name, speedup)
+                return None
+
+            # Keep it
+            metadata = {
+                "op_name": spec.name,
+                "speedup": speedup,
+                "description": spec.description,
+                "synthesized_at": time.time(),
+            }
+            if self._cache:
+                self._cache.put(
+                    cache_key=cache_key_str,
+                    kernel_obj=module,
+                    metadata=metadata)
+
+            logger.info(
+                "Custom op synthesized: %s speedup=%.3fx", spec.name, speedup)
+            return module
+
+        except Exception as e:
+            logger.debug("Custom op synthesis error: %s", e)
+            return None
+
+    def _validate_custom_op(self, module, spec: "CustomOpSpec") -> bool:
+        """
+        Validate synthesized custom op.
+        With reference_fn: compare output. Without: shape/dtype check only.
+        Returns False on CPU (cannot run Triton). Never raises.
+        """
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False
+
+            dtype_map = {
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "float32": torch.float32,
+            }
+
+            inputs = [
+                torch.randn(
+                    *shape,
+                    dtype=dtype_map.get(dtype, torch.float16),
+                    device="cuda")
+                for shape, dtype in zip(spec.input_shapes, spec.input_dtypes)
+            ]
+
+            with torch.no_grad():
+                out = module.run_kernel(*inputs)
+
+            if tuple(out.shape) != tuple(spec.output_shape):
+                logger.warning(
+                    "Shape mismatch: got %s, expected %s",
+                    tuple(out.shape), spec.output_shape)
+                return False
+
+            if spec.reference_fn is not None:
+                with torch.no_grad():
+                    ref = spec.reference_fn(*inputs)
+                ok = torch.allclose(
+                    ref.float(), out.float(),
+                    atol=spec.atol, rtol=spec.rtol)
+                if not ok:
+                    max_err = (ref.float() - out.float()).abs().max().item()
+                    logger.warning(
+                        "Custom op validation: max_err=%.6f atol=%.6f",
+                        max_err, spec.atol)
+                return ok
+
+            return True
+
+        except Exception as e:
+            logger.debug("Custom op validation error: %s", e)
+            return False
+
+    def _benchmark_custom_op(self, module, spec: "CustomOpSpec") -> float:
+        """
+        Measure speedup vs reference_fn. Returns speedup ratio.
+        Returns 0.0 if cannot measure. Uses CUDA events on GPU.
+        """
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return 0.0
+            if spec.reference_fn is None:
+                return 0.0
+
+            dtype_map = {
+                "float16": torch.float16,
+                "float32": torch.float32,
+            }
+
+            inputs = [
+                torch.randn(
+                    *shape,
+                    dtype=dtype_map.get(dtype, torch.float16),
+                    device="cuda")
+                for shape, dtype in zip(spec.input_shapes, spec.input_dtypes)
+            ]
+
+            N_WARMUP = 5
+            N_ITERS = 20
+
+            for _ in range(N_WARMUP):
+                with torch.no_grad():
+                    module.run_kernel(*inputs)
+                    spec.reference_fn(*inputs)
+
+            torch.cuda.synchronize()
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            start.record()
+            for _ in range(N_ITERS):
+                with torch.no_grad():
+                    module.run_kernel(*inputs)
+            end.record()
+            torch.cuda.synchronize()
+            synth_ms = start.elapsed_time(end) / N_ITERS
+
+            start.record()
+            for _ in range(N_ITERS):
+                with torch.no_grad():
+                    spec.reference_fn(*inputs)
+            end.record()
+            torch.cuda.synchronize()
+            ref_ms = start.elapsed_time(end) / N_ITERS
+
+            if synth_ms <= 0:
+                return 0.0
+
+            speedup = ref_ms / synth_ms
+            logger.debug(
+                "Benchmark %s: ref=%.3fms synth=%.3fms speedup=%.3fx",
+                spec.name, ref_ms, synth_ms, speedup)
+            return speedup
+
+        except Exception as e:
+            logger.debug("Benchmark error: %s", e)
+            return 0.0
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    def _get_hardware_description(self) -> str:
+        """Return human-readable hardware description for prompts. Never raises."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                return (
+                    f"{props.name} "
+                    f"({props.total_memory // 1_000_000_000}GB, "
+                    f"SM{props.major}{props.minor}, "
+                    f"shared_memory="
+                    f"{props.max_shared_memory_per_block // 1024}KB)")
+        except Exception:
+            pass
+        return "CPU (no GPU available)"
+
+    def _call_api_simple(self, prompt: str) -> Optional[str]:
+        """
+        Call Claude API with a raw prompt. Returns source string or None.
+        Strips markdown fences. Reuses existing circuit breaker. Never raises.
+        """
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            return None
+        return self._call_api(prompt, api_key)
 
     def stats(self) -> dict:
         with self._lock:

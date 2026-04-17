@@ -118,9 +118,11 @@ class ContinuousBatchingEngine:
         pad_token_id: int = 0,
         eos_token_ids: Optional[List[int]] = None,
         use_paged_attention: bool = False,
+        vmm=None,
     ):
         self.model = model
         self.config = config or BatchingConfig()
+        self._vmm = vmm  # Optional VMM for KV block management
         self.tokenizer = tokenizer
         self.pad_token_id = pad_token_id
         # Use tokenizer eos if available, else common EOS ids
@@ -363,3 +365,67 @@ class ContinuousBatchingEngine:
             return 0.0
         elapsed = time.time() - self.start_time
         return self.total_tokens / elapsed
+
+    def run_with_prefix(
+        self,
+        token_ids: list,
+        seq_id: str = "",
+        prefix_len: int = 0,
+    ) -> Optional[dict]:
+        """
+        Run inference with a pre-populated KV prefix.
+
+        token_ids: only the DELTA tokens (after the cached prefix)
+        seq_id: sequence ID with prefix blocks already injected
+        prefix_len: number of prefix tokens already in KV cache
+
+        Skips recomputing the prefix. Only computes KV for delta tokens.
+        Returns completion dict or None.
+
+        HONEST NOTE: Full prefix-aware inference benefit requires GPU
+        with KV cache in HBM. On CPU the method runs but saves no memory.
+        Models with absolute position embeddings need position_ids to
+        start at prefix_len. Never raises.
+        """
+        if not token_ids:
+            return None
+
+        try:
+            device = next(self.model.parameters()).device \
+                if hasattr(self.model, "parameters") else "cpu"
+
+            input_ids = torch.tensor(
+                [token_ids], dtype=torch.long, device=device)
+
+            # Position IDs start at prefix_len so model uses correct positions
+            position_ids = torch.arange(
+                prefix_len, prefix_len + len(token_ids),
+                dtype=torch.long, device=device).unsqueeze(0)
+
+            with torch.no_grad():
+                try:
+                    output = self.model(
+                        input_ids=input_ids, position_ids=position_ids)
+                except TypeError:
+                    # Model does not accept position_ids
+                    output = self.model(input_ids=input_ids)
+
+            if hasattr(output, "logits"):
+                logits = output.logits
+            elif isinstance(output, tuple):
+                logits = output[0]
+            else:
+                logits = output
+
+            next_token = logits[:, -1, :].argmax(dim=-1)
+
+            return {
+                "tokens": [next_token.item()],
+                "completion_tokens": 1,
+                "prefix_tokens_skipped": prefix_len,
+                "text": "",
+            }
+
+        except Exception as e:
+            log.debug("run_with_prefix failed: %s", e)
+            return None

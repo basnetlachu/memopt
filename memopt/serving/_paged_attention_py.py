@@ -63,6 +63,7 @@ class SequenceState:
     seq_id: str
     block_ids: List[int] = field(default_factory=list)
     current_pos: int = 0  # current token position in sequence
+    is_prefix_injected: bool = False  # True if created via inject_prefix
 
     @property
     def num_blocks(self) -> int:
@@ -135,6 +136,13 @@ class PagedKVCache:
         self.free_block_ids: List[int] = list(range(num_blocks))
         self.sequences: Dict[str, SequenceState] = {}
 
+        # GKD block_ref → block indices mapping
+        self._ref_to_blocks: Dict[str, List[int]] = {}
+        self._ref_lock = threading.Lock()
+
+        # Blocks shared via prefix injection — skip on free
+        self._shared_blocks: set = set()
+
     @classmethod
     def build_for_model(
         cls,
@@ -203,13 +211,19 @@ class PagedKVCache:
             return state
 
     def free_sequence(self, seq_id: str):
-        """Free all blocks held by sequence."""
+        """Free all blocks held by sequence. Skips shared (prefix-injected) blocks."""
         with self._lock:
             state = self.sequences.pop(seq_id, None)
             if state:
-                self.free_block_ids.extend(state.block_ids)
+                freed = 0
+                for block_id in state.block_ids:
+                    if block_id in self._shared_blocks:
+                        continue  # shared block — do not return to free list
+                    self.free_block_ids.append(block_id)
+                    freed += 1
                 log.debug(
-                    f"Freed {len(state.block_ids)} blocks from {seq_id}. "
+                    f"Freed {freed} blocks from {seq_id} "
+                    f"(skipped {len(state.block_ids) - freed} shared). "
                     f"Free blocks: {len(self.free_block_ids)}"
                 )
 
@@ -283,6 +297,86 @@ class PagedKVCache:
                 break
 
         return torch.cat(k_parts, dim=0), torch.cat(v_parts, dim=0)
+
+    def register_block_ref(self, seq_id: str, block_ref: str) -> None:
+        """
+        Register a mapping from GKD block_ref to the block indices used by seq_id.
+
+        Called after a sequence completes and its KV is registered in GKD.
+        This allows future requests with the same prefix to inject those blocks
+        instead of recomputing.
+
+        Thread-safe. Never raises.
+        """
+        try:
+            with self._lock:
+                state = self.sequences.get(seq_id)
+                if state is None:
+                    return
+                blocks = list(state.block_ids)
+
+            with self._ref_lock:
+                self._ref_to_blocks[block_ref] = blocks
+        except Exception:
+            pass
+
+    def get_blocks_for_ref(self, block_ref: str) -> List[int]:
+        """
+        Return block indices for a block_ref.
+        Returns empty list if not found. Thread-safe. Never raises.
+        """
+        try:
+            with self._ref_lock:
+                return list(self._ref_to_blocks.get(block_ref, []))
+        except Exception:
+            return []
+
+    def inject_prefix(
+        self,
+        seq_id: str,
+        prefix_blocks: List[int],
+        prefix_len: int,
+    ) -> bool:
+        """
+        Create a new sequence pre-populated with blocks from a cached sequence.
+
+        The new sequence shares block indices with the cached sequence.
+        The KV tensor data is NOT copied — it stays in the same HBM location.
+
+        Returns True if injection succeeded. Returns False if seq_id already
+        exists, prefix_blocks is empty, or any other error.
+
+        Thread-safe. Never raises.
+
+        Note: True zero-copy requires that the source blocks are not freed
+        while the new sequence is active. This implementation marks injected
+        blocks as shared via _shared_blocks so free_sequence() skips them.
+        Production requires reference counting on blocks.
+        """
+        if not prefix_blocks:
+            return False
+
+        try:
+            with self._lock:
+                if seq_id in self.sequences:
+                    return False
+
+                state = SequenceState(
+                    seq_id=seq_id,
+                    block_ids=list(prefix_blocks),
+                    current_pos=prefix_len,
+                    is_prefix_injected=True,
+                )
+                self.sequences[seq_id] = state
+
+                # Mark blocks as shared so they are not freed with this seq
+                for b in prefix_blocks:
+                    self._shared_blocks.add(b)
+
+                return True
+        except Exception as e:
+            log.debug("inject_prefix failed: %s", e)
+            return False
 
     def free_blocks_count(self) -> int:
         return len(self.free_block_ids)

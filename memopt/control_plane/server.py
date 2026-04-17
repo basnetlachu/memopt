@@ -440,6 +440,57 @@ def update_node_status(node_name: str, payload: dict, _: str = Security(verify_a
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/nodes/{node_name}/healthy")
+def node_healthy(node_name: str):
+    """
+    Returns 200 if node is healthy, 503 if degraded.
+
+    No auth required — designed for load balancer health checks.
+
+    When CertifyDaemon detects drift, it POSTs degraded=True to
+    /api/v1/nodes/{name}/status. Next health check returns 503.
+    Load balancer stops routing to node.
+
+    HONEST: This requires the operator to configure their load balancer
+    to poll this endpoint. memopt provides the signal. Routing is
+    the operator's responsibility.
+    """
+    from fastapi.responses import JSONResponse
+    try:
+        node = db.get_node(node_name)
+        if node is None:
+            return JSONResponse(
+                status_code=404,
+                content={"healthy": False, "reason": "node not found"})
+
+        is_degraded = bool(node.get("is_degraded", 0))
+        drift_pct = node.get("drift_pct", 0.0) or 0.0
+
+        if is_degraded:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "healthy": False,
+                    "node_id": node_name,
+                    "degraded": True,
+                    "drift_pct": drift_pct,
+                    "reason": (
+                        f"Node marked degraded by CertifyDaemon. "
+                        f"drift_pct={drift_pct:.1f}%"),
+                })
+
+        return {
+            "healthy": True,
+            "node_id": node_name,
+            "degraded": False,
+            "drift_pct": drift_pct,
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"healthy": False, "reason": str(e)})
+
+
 @app.get("/api/v1/heartbeat-batcher/stats")
 def heartbeat_batcher_stats(_: str = Security(verify_api_key)):
     """HeartbeatBatcher observability — pending / flushed / errors."""

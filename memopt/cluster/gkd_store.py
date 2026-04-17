@@ -370,6 +370,129 @@ class RedisGKDBackend:
             return [self.get(k) for k in keys]
 
 
+class TenantGKDStats:
+    """
+    Per-tenant GKD statistics.
+
+    Tracks hits, misses, tokens saved per tenant independently.
+    Used by cost savings dashboard. Thread-safe.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stats: Dict[str, dict] = {}
+
+    def record_hit(
+        self, tenant_id: str, tokens_saved: int, is_partial: bool,
+    ) -> None:
+        with self._lock:
+            s = self._get_or_create(tenant_id)
+            if is_partial:
+                s["partial_hits"] += 1
+                s["partial_tokens_saved"] += tokens_saved
+            else:
+                s["exact_hits"] += 1
+                s["exact_tokens_saved"] += tokens_saved
+
+    def record_miss(self, tenant_id: str) -> None:
+        with self._lock:
+            s = self._get_or_create(tenant_id)
+            s["misses"] += 1
+
+    def get_tenant_stats(self, tenant_id: str) -> dict:
+        with self._lock:
+            s = self._get_or_create(tenant_id)
+            total = s["exact_hits"] + s["partial_hits"] + s["misses"]
+            hit_rate = (
+                (s["exact_hits"] + s["partial_hits"]) / total * 100
+                if total > 0 else 0.0)
+            return {
+                **s,
+                "total_requests": total,
+                "hit_rate_pct": round(hit_rate, 2),
+            }
+
+    def get_all_tenants(self) -> Dict[str, dict]:
+        with self._lock:
+            tenants = list(self._stats.keys())
+        return {t: self.get_tenant_stats(t) for t in tenants}
+
+    def _get_or_create(self, tenant_id: str) -> dict:
+        """Must be called under self._lock."""
+        if tenant_id not in self._stats:
+            self._stats[tenant_id] = {
+                "exact_hits": 0,
+                "partial_hits": 0,
+                "misses": 0,
+                "exact_tokens_saved": 0,
+                "partial_tokens_saved": 0,
+            }
+        return self._stats[tenant_id]
+
+
+class HitRateWindow:
+    """
+    Rolling window hit rate counter.
+
+    Tracks hit rate over the last N requests using a circular buffer.
+    Gives a real-time hit rate that reflects current traffic — not a
+    cumulative average that never resets.
+
+    The 90% hit rate in the architecture doc came from a synthetic
+    1000-user simulation. This class measures the ACTUAL hit rate
+    on whatever traffic you are serving.
+    """
+
+    DEFAULT_WINDOW = 10_000
+
+    def __init__(self, window_size: int = DEFAULT_WINDOW):
+        self._window = window_size
+        self._buf = bytearray(window_size)
+        self._pos = 0
+        self._total = 0
+        self._hits = 0
+        self._lock = threading.Lock()
+
+    def record(self, is_hit: bool) -> None:
+        with self._lock:
+            idx = self._pos % self._window
+            old = self._buf[idx]
+            if self._total >= self._window and old == 1:
+                self._hits -= 1
+
+            val = 1 if is_hit else 0
+            self._buf[idx] = val
+            if val == 1:
+                self._hits += 1
+
+            self._pos += 1
+            self._total += 1
+
+    def hit_rate_pct(self) -> float:
+        with self._lock:
+            if self._total == 0:
+                return 0.0
+            n = min(self._total, self._window)
+            return round(self._hits / n * 100, 2)
+
+    def stats(self) -> dict:
+        with self._lock:
+            n = min(self._total, self._window)
+            return {
+                "window_size": self._window,
+                "requests_seen": self._total,
+                "window_filled": self._total >= self._window,
+                "hit_rate_pct": round(
+                    self._hits / n * 100, 2) if n > 0 else 0.0,
+                "hits_in_window": self._hits,
+                "note": (
+                    "Hit rate measured on real traffic. "
+                    "Synthetic benchmark showed 90%+. "
+                    "Production rate depends on workload "
+                    "prefix repetition."),
+            }
+
+
 class GKDStore:
     """
     Global KV Cache Deduplication Store.
@@ -452,6 +575,30 @@ class GKDStore:
         self._output_cache: Dict[str, dict] = {}
         self._output_cache_lock = threading.Lock()
 
+        # Per-tenant stats tracking
+        self._tenant_stats = TenantGKDStats()
+
+        # Rolling hit rate window
+        self._hit_rate_window = HitRateWindow(
+            window_size=int(os.environ.get(
+                "MEMOPT_GKD_WINDOW_SIZE", "10000")))
+
+        # Tenant isolation: when enabled, same tokens from different
+        # tenants produce different hashes (complete data isolation)
+        self._tenant_isolation = os.getenv(
+            "MEMOPT_GKD_TENANT_ISOLATION", "false").lower() == "true"
+        # Thread-local for passing tenant_id to internal LCP lookup
+        self._current_lookup_tenant: str = ""
+
+        if self._tenant_isolation:
+            logger.info(
+                "GKD: tenant isolation ENABLED "
+                "(cross-tenant reuse disabled)")
+        else:
+            logger.info(
+                "GKD: tenant isolation DISABLED "
+                "(cross-tenant reuse enabled)")
+
         # Background TTL enforcement for LocalGKDBackend
         # (RedisGKDBackend uses native Redis EXPIRE)
         self._ttl_thread = threading.Thread(
@@ -492,12 +639,48 @@ class GKDStore:
         except Exception as e:
             logger.debug(f"TTL enforce failed: {e}")
 
+    # ── Tenant-aware hashing ─────────────────────────────────────────
+
+    def _make_hash(
+        self,
+        token_ids: List[int],
+        seq_len: int,
+        tenant_id: str = "",
+    ) -> str:
+        """
+        Compute content hash.
+
+        With tenant isolation: hash includes tenant_id. Same tokens from
+        different tenants produce different hashes. Complete data isolation.
+
+        Without tenant isolation: hash is token-only. Same tokens from any
+        tenant produce the same hash. Maximum deduplication.
+        """
+        if (self._tenant_isolation
+                and tenant_id
+                and tenant_id != "_default"):
+            import hashlib
+            content = json.dumps(
+                {"t": tenant_id, "k": token_ids[:seq_len]},
+                separators=(",", ":"))
+            return hashlib.sha256(content.encode()).hexdigest()
+        return compute_hash(token_ids, seq_len)
+
+    # ── Per-tenant stats ──────────────────────────────────────────────
+
+    def tenant_stats(self, tenant_id: str = "") -> dict:
+        """Return per-tenant stats. Empty tenant_id returns all tenants."""
+        if tenant_id:
+            return self._tenant_stats.get_tenant_stats(tenant_id)
+        return self._tenant_stats.get_all_tenants()
+
     # ── Primary API ────────────────────────────────────────────────────
 
     def lookup(
         self,
         token_ids: List[int],
         sequence_length: int,
+        tenant_id: str = "",
     ) -> Optional[GKDHit]:
         """
         Look up whether a KV block for this token sequence already exists.
@@ -507,7 +690,8 @@ class GKDStore:
         with self._lock:
             self._total_lookups += 1
 
-        content_hash = compute_hash(token_ids, sequence_length)
+        self._current_lookup_tenant = tenant_id or "_default"
+        content_hash = self._make_hash(token_ids, sequence_length, tenant_id)
 
         # Bloom filter pre-check: if definitely absent, skip backend.get().
         # The bloom filter only tracks exact content hashes, not prefix
@@ -540,6 +724,8 @@ class GKDStore:
 
             with self._lock:
                 self._cache_misses += 1
+            self._hit_rate_window.record(False)
+            self._tenant_stats.record_miss(tenant_id or "_default")
             return None
 
         # Collision verification
@@ -564,6 +750,11 @@ class GKDStore:
             self._bytes_saved += raw.get("size_bytes", self._block_size_bytes)
 
         self._backend.increment_hit(content_hash)
+        self._hit_rate_window.record(True)
+        self._tenant_stats.record_hit(
+            tenant_id or "_default",
+            tokens_saved=sequence_length,
+            is_partial=False)
 
         return GKDHit(
             block_ref  = raw["block_ref"],
@@ -623,6 +814,12 @@ class GKDStore:
                     self._lcp_tokens_reused += length
                     self._lcp_tokens_total  += sequence_length
 
+                self._hit_rate_window.record(True)
+                self._tenant_stats.record_hit(
+                    self._current_lookup_tenant or "_default",
+                    tokens_saved=length,
+                    is_partial=True)
+
                 return GKDHit(
                     block_ref   = entry["block_ref"],
                     node_id     = entry["node_id"],
@@ -646,9 +843,10 @@ class GKDStore:
         node_id: str,
         size_bytes: Optional[int] = None,
         ttl_seconds: Optional[int] = None,
+        tenant_id: str = "",
     ):
         """Register a newly computed KV block in the dedup store."""
-        content_hash = compute_hash(token_ids, sequence_length)
+        content_hash = self._make_hash(token_ids, sequence_length, tenant_id)
         fingerprint  = make_fingerprint(token_ids)
 
         # Add to bloom filter so future lookups don't skip backend
@@ -794,6 +992,8 @@ class GKDStore:
             "pod_controller_url":          self._pod_url or "not_configured",
             "bloom_filtered":              self._bloom_filtered,
             "bloom_stats":                 self._bloom.stats(),
+            "tenant_isolation":            self._tenant_isolation,
+            "rolling_hit_rate":            self._hit_rate_window.stats(),
         }
 
     def reset_stats(self):

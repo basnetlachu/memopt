@@ -11,6 +11,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Options — all optional features degrade gracefully
 # ═══════════════════════════════════════════════════════════════════════════
 option(MEMOPT_ENABLE_GDS       "Enable GPUDirect Storage (cuFile)"  OFF)
+option(MEMOPT_ENABLE_IO_URING  "Enable async NVMe via io_uring"     OFF)
 option(MEMOPT_ENABLE_RDMA      "Enable RDMA (libibverbs)"           OFF)
 option(MEMOPT_ENABLE_AVX512    "Enable AVX-512 SIMD"                OFF)
 option(MEMOPT_ENABLE_SANITIZERS "Enable ASan + TSan for testing"    OFF)
@@ -189,6 +190,52 @@ endif()
 if(MEMOPT_GDS_AVAILABLE)
     target_compile_definitions(_memopt_cuda PRIVATE MEMOPT_GDS_AVAILABLE)
     target_link_libraries(_memopt_cuda PRIVATE ${CUFILE_LIB})
+endif()
+
+# ── io_uring (async NVMe) ─────────────────────────────────────────────
+if(MEMOPT_ENABLE_IO_URING)
+    find_library(LIBURING_LIB
+        NAMES uring liburing
+        PATHS /usr/lib /usr/local/lib)
+
+    find_path(LIBURING_INCLUDE
+        NAMES liburing.h
+        PATHS /usr/include /usr/local/include)
+
+    if(LIBURING_LIB AND LIBURING_INCLUDE)
+        message(STATUS "io_uring: found at ${LIBURING_LIB}")
+
+        target_compile_definitions(_memopt_cuda PRIVATE
+            MEMOPT_IO_URING_AVAILABLE=1)
+
+        target_include_directories(_memopt_cuda PRIVATE
+            ${LIBURING_INCLUDE})
+
+        target_link_libraries(_memopt_cuda PRIVATE
+            ${LIBURING_LIB})
+
+        target_sources(_memopt_cuda PRIVATE
+            cuda_backend/nvme_async.cpp)
+
+        message(STATUS "io_uring: async NVMe enabled")
+    else()
+        message(WARNING
+            "liburing not found. "
+            "Async NVMe disabled. "
+            "Install: apt install liburing-dev")
+        set(MEMOPT_ENABLE_IO_URING OFF)
+    endif()
+else()
+    message(STATUS
+        "io_uring: sync fallback "
+        "(use -DMEMOPT_ENABLE_IO_URING=ON to enable)")
+endif()
+
+# Always compile nvme_async.cpp — it degrades to synchronous pread()
+# when MEMOPT_IO_URING_AVAILABLE is not defined.
+if(NOT MEMOPT_ENABLE_IO_URING)
+    target_sources(_memopt_cuda PRIVATE
+        cuda_backend/nvme_async.cpp)
 endif()
 
 install(TARGETS _memopt_cuda

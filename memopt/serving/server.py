@@ -61,6 +61,11 @@ _certify_daemon: object = None
 _power_sampler: object = None
 _pod_controller: object = None
 
+# Partial compute skip counters (from GKD partial hits)
+_partial_skip_count: int = 0
+_partial_skip_tokens_saved: int = 0
+_partial_skip_attempted: int = 0
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="memopt serving", version="1.0") if _HAS_FASTAPI else None
@@ -143,6 +148,65 @@ if _HAS_FASTAPI:
         model:   str
         choices: List[CompletionChoice]
         usage:   CompletionUsage
+
+
+def _try_partial_compute_skip(request, gkd_hit) -> Optional[dict]:
+    """
+    Attempt partial compute skip using cached KV prefix.
+
+    Returns a dict with completion data on success.
+    Returns None on any failure — falls through to full inference.
+    NEVER returns wrong output.
+
+    HONEST NOTE:
+    This requires engine.run_with_prefix() which does not exist yet
+    in ContinuousBatchingEngine. This function implements the full
+    logic. When run_with_prefix is unavailable it returns None and
+    falls through. Tracking: _partial_skip_attempted increments even
+    on fallthrough so we can measure partial skip opportunity rate.
+    """
+    global _partial_skip_count, _partial_skip_tokens_saved
+    global _partial_skip_attempted
+    _partial_skip_attempted += 1
+
+    if _engine is None:
+        return None
+
+    # Check if engine supports prefix injection
+    if not hasattr(_engine, "run_with_prefix"):
+        log.debug(
+            "Partial skip: engine does not support run_with_prefix yet. "
+            "Tracking opportunity (matched %d tokens).",
+            gkd_hit.matched_len)
+        return None
+
+    # Engine supports prefix injection — attempt it
+    try:
+        delta_start = gkd_hit.delta_start or gkd_hit.matched_len or 0
+        tokens_saved = gkd_hit.matched_len or 0
+
+        result = _engine.run_with_prefix(
+            token_ids=request.token_ids[delta_start:],
+            prefix_len=tokens_saved)
+
+        if result is None:
+            return None
+
+        _partial_skip_count += 1
+        _partial_skip_tokens_saved += tokens_saved
+
+        log.info(
+            "Partial skip: saved %d tokens (%d/%d = %d%%)",
+            tokens_saved, tokens_saved,
+            tokens_saved + len(request.token_ids[delta_start:]),
+            tokens_saved * 100 // max(1, tokens_saved + len(
+                request.token_ids[delta_start:])))
+
+        return result
+
+    except Exception as e:
+        log.debug("Partial skip failed: %s", e)
+        return None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -522,6 +586,78 @@ if _HAS_FASTAPI:
             "generated_at": time.time(),
         }
 
+    @app.get("/report/savings")
+    def report_savings(
+        period_hours: int = 24,
+        tenant: str = "",
+    ):
+        """
+        Per-tenant GKD cost savings report.
+
+        Cost assumptions (all configurable via env vars):
+          MEMOPT_COST_PER_1K_TOKENS: what you charge per 1K tokens (default: 0 = no dollar amounts)
+          MEMOPT_COMPUTE_COST_RATIO: fraction of token cost that is compute (default: 0.7)
+
+        Dollar amounts only appear when the operator configures real pricing.
+        """
+        if _gkd_store is None:
+            return {
+                "error": "GKD store not active",
+                "gkd_enabled": False,
+            }
+
+        # Get stats — tenant-scoped or all
+        if tenant:
+            tenant_data = {tenant: _gkd_store.tenant_stats(tenant)}
+        else:
+            tenant_data = _gkd_store.tenant_stats()
+
+        # Cost configuration
+        cost_per_1k = float(os.getenv("MEMOPT_COST_PER_1K_TOKENS", "0"))
+        compute_ratio = float(os.getenv("MEMOPT_COMPUTE_COST_RATIO", "0.7"))
+        has_pricing = cost_per_1k > 0
+
+        tenant_reports = {}
+        for tid, stats in tenant_data.items():
+            tokens_saved = (
+                stats.get("exact_tokens_saved", 0)
+                + stats.get("partial_tokens_saved", 0))
+
+            report = {
+                "exact_hits":           stats.get("exact_hits", 0),
+                "partial_hits":         stats.get("partial_hits", 0),
+                "misses":               stats.get("misses", 0),
+                "hit_rate_pct":         stats.get("hit_rate_pct", 0.0),
+                "exact_tokens_saved":   stats.get("exact_tokens_saved", 0),
+                "partial_tokens_saved": stats.get("partial_tokens_saved", 0),
+                "total_tokens_saved":   tokens_saved,
+            }
+
+            if has_pricing:
+                compute_cost_saved = (
+                    tokens_saved / 1000 * cost_per_1k * compute_ratio)
+                report["compute_cost_saved_usd"] = round(
+                    compute_cost_saved, 6)
+                report["pricing_note"] = (
+                    f"Based on ${cost_per_1k}/1K tokens, "
+                    f"{compute_ratio * 100:.0f}% compute ratio")
+            else:
+                report["compute_cost_saved_usd"] = None
+                report["pricing_note"] = (
+                    "Set MEMOPT_COST_PER_1K_TOKENS to see dollar savings")
+
+            tenant_reports[tid] = report
+
+        return {
+            "period_hours":     period_hours,
+            "generated_at":     time.time(),
+            "tenant_isolation": getattr(
+                _gkd_store, "_tenant_isolation", False),
+            "tenants":          tenant_reports,
+            "total_tenants":    len(tenant_reports),
+            "global_gkd_stats": _gkd_store.stats(),
+        }
+
     @app.get("/metrics")
     def metrics():
         """
@@ -559,8 +695,48 @@ if _HAS_FASTAPI:
                               + kernel_stats.get("softmax_fallbacks", 0),
             "collector":        collector_metrics,
             "kernel_hooks":     kernel_stats,
+            "partial_skip_count":        _partial_skip_count,
+            "partial_skip_tokens_saved": _partial_skip_tokens_saved,
+            "partial_skip_attempted":    _partial_skip_attempted,
+            "partial_skip_opportunity_rate": round(
+                _partial_skip_attempted / max(1,
+                    gkd_stats.get("total_lookups", 1)) * 100, 2),
             "node_id":          _node_id,
         }
+
+    @app.get("/kernels/library")
+    def kernel_library():
+        """
+        List kernels in the shared library.
+        Returns op names, hardware targets, speedups, and synthesis dates.
+        Source code is NOT returned — only metadata.
+        """
+        try:
+            from memopt.kernels.kernel_cache import get_kernel_library
+            library = get_kernel_library()
+            kernels = library.list_kernels()
+
+            safe_kernels = []
+            for k in kernels:
+                safe_kernels.append({
+                    "op_name": k.get("op_name"),
+                    "hardware_hash": k.get("hardware_hash", "")[:8],
+                    "speedup": k.get("speedup"),
+                    "saved_at": k.get("saved_at"),
+                })
+
+            return {
+                "total": len(safe_kernels),
+                "kernels": safe_kernels,
+                "library_stats": library.stats(),
+                "note": (
+                    "Kernels are shared across deployments. "
+                    "Every synthesis makes future deployments faster. "
+                    "Source code not included in this response."),
+            }
+
+        except Exception as e:
+            return {"total": 0, "kernels": [], "error": str(e)}
 
     @app.post("/v1/completions", response_model=CompletionResponse)
     async def completions(request: CompletionRequest):
@@ -643,9 +819,15 @@ if _HAS_FASTAPI:
                 pass  # get_output failure → fall through to inference
 
         if gkd_hit is not None and gkd_hit.is_partial:
+            # Attempt partial compute skip
+            partial_result = _try_partial_compute_skip(request, gkd_hit)
+            if partial_result is not None:
+                return partial_result
+
+            # Partial skip failed or engine not ready — fall through
             log.debug(
-                "GKD partial hit: %s/%d tokens cached "
-                "(full inference still required)",
+                "GKD partial hit fallthrough: running full inference. "
+                "Matched %s/%d tokens would have been saved.",
                 gkd_hit.matched_len, seq_len)
 
         # ── Full miss or partial hit: run inference ───────────────────
@@ -719,11 +901,16 @@ if _HAS_FASTAPI:
                 _p4_collector.record_request(result.tokens_generated)
             if _p4_ledger is not None:
                 gkd_stats = _gkd_store.stats() if _gkd_store else {}
+                _energy_source = (
+                    "nvml_measured" if actual_j_per_token is not None
+                    else "estimated" if gkd_stats.get("hit_rate_pct")
+                    else "unmeasured")
                 _p4_ledger.record(
                     tokens=result.tokens_generated,
                     tenant_id="_default",
                     actual_j_per_token=actual_j_per_token,
                     gkd_hit_rate_pct=gkd_stats.get("hit_rate_pct"),
+                    energy_source=_energy_source,
                 )
         except Exception:
             pass
@@ -851,6 +1038,23 @@ if _HAS_FASTAPI:
                 content={"error": str(e)})
 
 
+    @app.get("/gum/stats")
+    def gum_stats():
+        """
+        GUM bandwidth and latency statistics.
+
+        Shows per-peer and global transfer metrics.
+        All numbers from real timed transfers.
+        transport field shows "tcp" or "rdma".
+        """
+        try:
+            from memopt.cluster.gum_metrics import get_gum_metrics
+            metrics = get_gum_metrics()
+            return metrics.dashboard_data()
+        except Exception as e:
+            return {"error": str(e), "global": {}, "peers": {}}
+
+
 # ── Engine builder ────────────────────────────────────────────────────────────
 
 def _build_engine(
@@ -865,8 +1069,18 @@ def _build_engine(
     from memopt.api.server import load_model_safe
     model: nn.Module = load_model_safe(model_path, device)
     model = model.to(device).eval()
-    _engine = ContinuousBatchingEngine(model=model, config=config)
-    log.info("ContinuousBatchingEngine ready (device=%s)", device)
+    # Initialize VMM for KV block management
+    _vmm_instance = None
+    try:
+        from memopt.vmm import VMM
+        _vmm_instance = VMM()
+        log.info("VMM initialized for serving engine")
+    except Exception as e:
+        log.debug("VMM init skipped: %s", e)
+
+    _engine = ContinuousBatchingEngine(model=model, config=config, vmm=_vmm_instance)
+    log.info("ContinuousBatchingEngine ready (device=%s, vmm=%s)",
+             device, "active" if _vmm_instance else "disabled")
 
     # Pillar 1+2 — GKD store for KV cache deduplication
     try:

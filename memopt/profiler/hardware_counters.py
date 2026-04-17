@@ -491,6 +491,98 @@ GPU_SPECS = {
 }
 
 
+# =============================================================================
+# GPU Specifications Audit — honest provenance for every number
+# =============================================================================
+
+GPU_SPECS_AUDIT = {
+    "H100": {
+        "datasheet_bw_gbps": 3350.0,
+        "measured_bw_gbps": None,
+        "measured_on_date": None,
+        "notes": (
+            "Datasheet: 3.35 TB/s HBM3. "
+            "Not yet measured by memopt."),
+    },
+    "H100-SXM5": {
+        "datasheet_bw_gbps": 3350.0,
+        "measured_bw_gbps": None,
+        "measured_on_date": None,
+        "notes": (
+            "Datasheet: 3.35 TB/s HBM3. "
+            "Not yet measured by memopt."),
+    },
+    "A100": {
+        "datasheet_bw_gbps": 2039.0,
+        "measured_bw_gbps": None,
+        "measured_on_date": None,
+        "notes": (
+            "Datasheet: 2 TB/s HBM2e. "
+            "Real workload typically 1800-2050 GB/s "
+            "depending on access pattern. "
+            "Not yet measured by memopt."),
+    },
+    "A100-SXM4-80GB": {
+        "datasheet_bw_gbps": 2039.0,
+        "measured_bw_gbps": None,
+        "measured_on_date": None,
+        "notes": (
+            "Datasheet: 2 TB/s HBM2e. "
+            "Not yet measured by memopt."),
+    },
+    "V100": {
+        "datasheet_bw_gbps": 900.0,
+        "measured_bw_gbps": None,
+        "measured_on_date": None,
+        "notes": (
+            "Datasheet: 900 GB/s HBM2. "
+            "Not yet measured by memopt."),
+    },
+    "AMD Instinct MI300X": {
+        "datasheet_bw_gbps": 5300.0,
+        "measured_bw_gbps": None,
+        "measured_on_date": None,
+        "notes": (
+            "AMD datasheet: 5.3 TB/s HBM3. "
+            "Not yet measured by memopt."),
+    },
+}
+
+
+def get_spec_with_audit(device_name: str) -> dict:
+    """
+    Returns GPU spec with honest audit info.
+
+    Shows datasheet number AND whether it has been measured by memopt.
+    Never returns fake measurements. If measured_bw_gbps is None,
+    the number is from the datasheet only.
+    """
+    spec = GPU_SPECS.get(device_name)
+    audit = GPU_SPECS_AUDIT.get(device_name, {})
+
+    if spec is None:
+        return {
+            "device_name": device_name,
+            "found": False,
+            "note": "Device not in GPU_SPECS. Add it after measurement.",
+        }
+
+    result = {
+        "device_name": device_name,
+        "found": True,
+        "hbm_bandwidth_gbps": spec.peak_memory_bandwidth_gbps,
+        "measured": spec.measured,
+        "source": spec.source or "datasheet (vendor)",
+    }
+
+    if audit:
+        result["audit"] = audit
+        result["measured_bw_gbps"] = audit.get("measured_bw_gbps")
+        result["datasheet_bw_gbps"] = audit.get("datasheet_bw_gbps")
+
+    return result
+
+
 def get_gpu_spec() -> GPUSpec:
     """Detect GPU and return specifications with robust matching."""
     if not torch.cuda.is_available():

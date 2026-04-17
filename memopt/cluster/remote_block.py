@@ -454,6 +454,109 @@ class RemoteBlockClient:
                 f"for {content_hash[:16] if len(content_hash) >= 16 else content_hash}...: {e}"
             )
 
+    def fetch_block_with_failover(
+        self,
+        content_hash: str,
+        candidates: list,
+        geo_router: "GeoRouter | None" = None,
+        metrics=None,
+        max_attempts: int = 3,
+    ) -> Optional[bytes]:
+        """
+        Fetch from multiple candidates with automatic failover.
+
+        candidates: list of dicts with node_id, host, port, rack, pod, region.
+        Tries candidates in locality order. Stops after max_attempts or first success.
+
+        Returns bytes or None. None = all candidates failed, caller must recompute.
+
+        FAILOVER CONTRACT:
+        - Never returns wrong data
+        - Never blocks indefinitely (each attempt has timeout)
+        - Records every attempt in metrics
+        - Falls back gracefully
+        """
+        if not candidates:
+            return None
+
+        if geo_router:
+            candidates = geo_router.sort_peers(candidates)
+
+        attempts = min(max_attempts, len(candidates))
+
+        for i, candidate in enumerate(candidates[:attempts]):
+            node_id = candidate.get("node_id", "unknown")
+            host = candidate.get("host", "")
+            port = candidate.get("port", _RBP_PORT)
+
+            if not host:
+                continue
+
+            start = time.perf_counter()
+            result = None
+
+            try:
+                result = self._try_fetch_once(content_hash, host, port)
+            except Exception as e:
+                logger.debug(
+                    "GUM fetch attempt %d failed (%s): %s", i + 1, node_id, e)
+
+            elapsed_ms = (time.perf_counter() - start) * 1000
+
+            if metrics is not None:
+                try:
+                    from memopt.cluster.gum_metrics import TransferMeasurement
+                    locality = "unknown"
+                    if geo_router:
+                        locality = geo_router.locality_label(candidate)
+
+                    metrics.record_transfer(TransferMeasurement(
+                        peer_node_id=node_id,
+                        bytes_transferred=len(result) if result else 0,
+                        latency_ms=elapsed_ms,
+                        success=result is not None,
+                        transport=self._transport_type(),
+                        rack=candidate.get("rack", "unknown"),
+                        pod=candidate.get("pod", "unknown"),
+                        region=candidate.get("region", "unknown"),
+                    ))
+                except Exception:
+                    pass
+
+            if result is not None:
+                if i > 0:
+                    logger.info(
+                        "GUM failover: succeeded on attempt %d "
+                        "(first %d failed)", i + 1, i)
+                return result
+
+        # All candidates failed
+        if metrics is not None:
+            try:
+                metrics.record_fallback()
+            except Exception:
+                pass
+
+        logger.debug(
+            "GUM: all %d candidates failed for %s. Caller will recompute.",
+            attempts, content_hash[:8])
+        return None
+
+    def _transport_type(self) -> str:
+        """Returns 'rdma' or 'tcp' based on which transport is active."""
+        try:
+            # Check if RDMA transport daemon is running
+            import os
+            import socket
+            node_id = os.environ.get(
+                "MEMOPT_NODE_ID", socket.gethostname())
+            req_path = f"/dev/shm/memopt_transport_{node_id}_req"
+            if os.path.exists(req_path):
+                return "rdma"
+        except Exception:
+            pass
+        return "tcp"
+
     def stats(self) -> dict:
         with self._lock:
             return {
@@ -461,3 +564,82 @@ class RemoteBlockClient:
                 "failures":      self._failures,
                 "bytes_fetched": self._bytes_fetched,
             }
+
+
+class GeoRouter:
+    """
+    Routes block fetch requests to the geographically nearest peer first.
+
+    Locality order (nearest first):
+      1. Same rack     (IB: ~1us, TCP: ~0.1ms)
+      2. Same pod      (IB: ~5us, TCP: ~0.5ms)
+      3. Same region   (IB: ~20us, TCP: ~1ms)
+      4. Cross-region  (WAN: ~10ms+)
+
+    HONEST: The latency numbers above are typical values. We do not
+    hardcode them. We measure them via GUMMetrics. The routing LOGIC
+    is hardware-agnostic. The routing BENEFIT depends on hardware.
+    """
+
+    def __init__(
+        self,
+        local_node_id: str,
+        local_rack: str = "unknown",
+        local_pod: str = "unknown",
+        local_region: str = "unknown",
+    ):
+        self._node_id = local_node_id
+        self._rack = local_rack
+        self._pod = local_pod
+        self._region = local_region
+
+    def sort_peers(self, peers: list) -> list:
+        """
+        Sort peers by proximity. Nearest first.
+
+        Each peer dict must have node_id, and optionally rack, pod, region.
+        Returns sorted list. Thread-safe (no state mutation). Never raises.
+        """
+        def locality_score(peer: dict) -> int:
+            rack = peer.get("rack", "unknown")
+            pod = peer.get("pod", "unknown")
+            region = peer.get("region", "unknown")
+
+            if rack == self._rack and rack != "unknown":
+                return 0  # Same rack (best)
+            if pod == self._pod and pod != "unknown":
+                return 1  # Same pod
+            if region == self._region and region != "unknown":
+                return 2  # Same region
+            return 3  # Cross-region (worst)
+
+        try:
+            return sorted(peers, key=locality_score)
+        except Exception:
+            return list(peers)
+
+    def locality_label(self, peer: dict) -> str:
+        """Human-readable locality label."""
+        rack = peer.get("rack", "unknown")
+        pod = peer.get("pod", "unknown")
+        region = peer.get("region", "unknown")
+
+        if rack == self._rack and rack != "unknown":
+            return "same_rack"
+        if pod == self._pod and pod != "unknown":
+            return "same_pod"
+        if region == self._region and region != "unknown":
+            return "same_region"
+        return "cross_region"
+
+    @classmethod
+    def from_env(cls) -> "GeoRouter":
+        """Create from environment variables."""
+        import socket as _socket
+        return cls(
+            local_node_id=os.environ.get(
+                "MEMOPT_NODE_ID", _socket.gethostname()),
+            local_rack=os.environ.get("MEMOPT_RACK", "unknown"),
+            local_pod=os.environ.get("MEMOPT_POD", "unknown"),
+            local_region=os.environ.get("MEMOPT_REGION", "unknown"),
+        )

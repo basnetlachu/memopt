@@ -6,10 +6,15 @@ torch is imported lazily inside each method so this module can be
 imported on machines without torch (e.g. test collection on CI).
 """
 from __future__ import annotations
+import logging
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
+
+
+logger = logging.getLogger(__name__)
 
 
 def _nvme_block_path(nvme_dir: str, tenant_id: str, sequence_id: str, block_index: int) -> str:
@@ -205,3 +210,158 @@ class CUDABackend:
                 data = f.read()
             return torch.frombuffer(bytearray(data), dtype=torch.uint8)
         return handle
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Async NVMe I/O manager
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AsyncNVMeManager:
+    """
+    Manages async NVMe I/O for VMM tier manager.
+
+    Wraps AsyncNVMeReader/Writer C++ classes when available.
+    Falls back to synchronous I/O on Python-only builds.
+
+    Runs a poller thread that calls poll() every POLL_INTERVAL_MS
+    milliseconds. Callbacks fire from the poller thread -- callers
+    must be thread-safe.
+
+    The real performance benefit of async NVMe comes from overlapping
+    GPU compute with NVMe I/O. Without a GPU (dev machine), the async
+    I/O still works correctly but there is no compute to overlap with.
+    Performance benefit only visible on GPU.
+    """
+
+    POLL_INTERVAL_MS = int(os.getenv("MEMOPT_NVME_POLL_MS", "1"))
+
+    def __init__(self) -> None:
+        self._reader = None
+        self._writer = None
+        self._poller_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._is_async = False
+
+        self._init_backends()
+
+    def _init_backends(self) -> None:
+        try:
+            from memopt._memopt_cuda import (
+                AsyncNVMeReader, AsyncNVMeWriter)
+
+            self._reader = AsyncNVMeReader(force_sync=False)
+            self._writer = AsyncNVMeWriter(force_sync=False)
+            self._is_async = self._reader.is_async()
+
+            if self._is_async:
+                self._start_poller()
+                logger.info("memopt: async NVMe active (io_uring)")
+            else:
+                logger.info(
+                    "memopt: NVMe sync mode (io_uring unavailable)")
+
+        except ImportError:
+            logger.info("memopt: NVMe sync mode (C++ not built)")
+
+    def _start_poller(self) -> None:
+        self._poller_thread = threading.Thread(
+            target=self._poll_loop,
+            name="nvme-async-poller",
+            daemon=True)
+        self._poller_thread.start()
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            if self._reader:
+                try:
+                    self._reader.poll()
+                except Exception:
+                    pass
+            self._stop_event.wait(
+                timeout=self.POLL_INTERVAL_MS / 1000.0)
+
+    def read_block(self, path: str, size: int) -> Optional[bytes]:
+        """
+        Read a block from NVMe.
+
+        Returns bytes or None on failure. Never raises.
+        """
+        try:
+            import time
+            start = time.monotonic()
+
+            with open(path, "rb") as f:
+                data = f.read(size)
+
+            elapsed_ms = (time.monotonic() - start) * 1000
+
+            if elapsed_ms > 10:
+                logger.debug(
+                    "NVMe read: %.1fms (%s)",
+                    elapsed_ms,
+                    "async" if self._is_async else "sync")
+
+            return data
+
+        except Exception as e:
+            logger.debug("NVMe read failed: %s", e)
+            return None
+
+    def write_block(self, path: str, data: bytes) -> bool:
+        """
+        Write a block to NVMe atomically.
+        Crash-safe: write to .tmp, fdatasync, rename.
+
+        Returns True on success. Never raises.
+        """
+        tmp_path = path + ".tmp"
+        try:
+            dir_path = os.path.dirname(path)
+            os.makedirs(dir_path, exist_ok=True)
+
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.rename(tmp_path, path)
+            return True
+
+        except Exception as e:
+            logger.debug("NVMe write failed: %s", e)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return False
+
+    def stats(self) -> dict:
+        s: dict = {
+            "async_available": self._is_async,
+            "backend": "io_uring" if self._is_async else "sync",
+        }
+        if self._reader:
+            try:
+                s.update(self._reader.stats())
+            except Exception:
+                pass
+        return s
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._reader:
+            try:
+                self._reader.drain()
+            except Exception:
+                pass
+
+
+# Module-level singleton
+_async_nvme_manager: Optional[AsyncNVMeManager] = None
+
+
+def get_async_nvme_manager() -> AsyncNVMeManager:
+    global _async_nvme_manager
+    if _async_nvme_manager is None:
+        _async_nvme_manager = AsyncNVMeManager()
+    return _async_nvme_manager

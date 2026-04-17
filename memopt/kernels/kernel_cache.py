@@ -108,7 +108,32 @@ class KernelCache:
                 self._hits += 1
                 return module
             self._misses += 1
-            return None
+
+        # Check shared kernel library
+        try:
+            library = get_kernel_library()
+            hw_hash = key[:16]
+            # Scan library entries — key is a sha256, so try matching by prefix
+            for entry_data in library.list_kernels():
+                op_name = entry_data.get("op_name", "")
+                lib_hw = entry_data.get("hardware_hash", "")[:16]
+                if lib_hw == hw_hash or key.startswith(op_name):
+                    lib_entry = library.get(op_name, lib_hw)
+                    if lib_entry is not None:
+                        source = lib_entry.get("source", "")
+                        if source:
+                            module = self._reexec(source)
+                            if module is not None:
+                                with self._lock:
+                                    self._memory[key] = (module, CacheEntry(
+                                        key=key, op_name=op_name,
+                                        hardware="", source=source))
+                                logger.info("Kernel loaded from library: %s", op_name)
+                                return module
+        except Exception as e:
+            logger.debug("Library fallback failed: %s", e)
+
+        return None
 
     def invalidate(self, key: str) -> None:
         with self._lock:
@@ -222,6 +247,10 @@ class KernelCache:
             except Exception as e:
                 logger.debug(f"KernelCache: failed to load {fname}: {e}")
 
+    def make_key(self, op_name: str, input_shapes, hardware: str) -> str:
+        """Public interface to create a cache key."""
+        return cache_key(op_name, input_shapes, hardware)
+
     def _reexec(self, source: str) -> Optional[types.ModuleType]:
         """Re-execute kernel source into a fresh module namespace."""
         try:
@@ -236,3 +265,238 @@ class KernelCache:
         except Exception as e:
             logger.debug(f"KernelCache: re-exec failed: {e}")
             return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Kernel library — persistent, cross-deployment, shared kernel storage
+# ═══════════════════════════════════════════════════════════════════════════
+
+class KernelLibrary:
+    """
+    Persistent kernel library shared across deployments and customers.
+
+    Different from KernelCache:
+      KernelCache: per-process, per-deployment
+      KernelLibrary: shared, cross-customer
+
+    A kernel synthesized for Customer A is available to Customer B
+    if the hardware and op signature match. This is the network effect:
+    every synthesis makes the next customer's deployment faster.
+
+    Storage: MEMOPT_KERNEL_LIBRARY_PATH (default: ~/.memopt/kernel_library/)
+
+    Each entry:
+      library/{op_name}/{hardware_hash[:16]}/
+        kernel.py     - Triton source
+        metadata.json - speedup, timestamps
+        source.sha256 - integrity check
+
+    Integrity: every load verifies SHA-256. Corrupted entries are deleted.
+    Privacy: kernels are pure Triton code. No customer data is stored.
+
+    HONEST NOTE: The library grows over time. Initial deployment has
+    zero entries. Value increases with usage.
+    """
+
+    DEFAULT_PATH = os.path.expanduser("~/.memopt/kernel_library")
+
+    def __init__(self, library_path: str = ""):
+        self._path = library_path or os.getenv(
+            "MEMOPT_KERNEL_LIBRARY_PATH", self.DEFAULT_PATH)
+        os.makedirs(self._path, exist_ok=True)
+
+        self._lock = threading.RLock()
+        self._stats = {
+            "entries": 0,
+            "loads": 0,
+            "load_hits": 0,
+            "saves": 0,
+            "corrupted": 0,
+        }
+
+        self._catalog = self._load_catalog()
+
+    def get(self, op_name: str, hardware_hash: str) -> Optional[dict]:
+        """
+        Look up a kernel by op + hardware.
+
+        Returns dict with 'source' and 'metadata' keys, or None if
+        not found or corrupted. Thread-safe. Never raises.
+        """
+        key = f"{op_name}_{hardware_hash}"
+
+        with self._lock:
+            self._stats["loads"] += 1
+
+            if key not in self._catalog:
+                return None
+
+            entry_path = self._catalog[key]
+            return self._load_entry(op_name, hardware_hash, entry_path)
+
+    def save(
+        self,
+        op_name: str,
+        hardware_hash: str,
+        source: str,
+        metadata: dict,
+    ) -> bool:
+        """
+        Save a validated kernel to library.
+        Only call after kernel passes both correctness and benchmark checks.
+        Returns True on success. Thread-safe. Never raises.
+        """
+        try:
+            entry_dir = os.path.join(
+                self._path, op_name, hardware_hash[:16])
+            os.makedirs(entry_dir, exist_ok=True)
+
+            source_hash = hashlib.sha256(source.encode()).hexdigest()
+
+            # Write source
+            src_path = os.path.join(entry_dir, "kernel.py")
+            with open(src_path, "w") as f:
+                f.write(source)
+
+            # Write hash
+            hash_path = os.path.join(entry_dir, "source.sha256")
+            with open(hash_path, "w") as f:
+                f.write(source_hash)
+
+            # Write metadata
+            meta = {
+                **metadata,
+                "op_name": op_name,
+                "hardware_hash": hardware_hash,
+                "saved_at": time.monotonic(),
+                "source_sha256": source_hash,
+            }
+            meta_path = os.path.join(entry_dir, "metadata.json")
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+            # Update catalog
+            key = f"{op_name}_{hardware_hash}"
+            with self._lock:
+                self._catalog[key] = entry_dir
+                self._stats["entries"] += 1
+                self._stats["saves"] += 1
+
+            logger.info(
+                "Kernel library: saved %s for %s...",
+                op_name, hardware_hash[:8])
+            return True
+
+        except Exception as e:
+            logger.debug("Library save failed: %s", e)
+            return False
+
+    def list_kernels(self) -> list:
+        """
+        List all kernels in library.
+        Returns list of metadata dicts. Thread-safe. Never raises.
+        """
+        results = []
+        with self._lock:
+            catalog_copy = dict(self._catalog)
+
+        for key, entry_dir in catalog_copy.items():
+            try:
+                meta_path = os.path.join(entry_dir, "metadata.json")
+                if os.path.exists(meta_path):
+                    with open(meta_path) as f:
+                        results.append(json.load(f))
+            except Exception:
+                pass
+        return results
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                **self._stats,
+                "library_path": self._path,
+                "catalog_size": len(self._catalog),
+            }
+
+    def _load_entry(
+        self, op_name: str, hardware_hash: str, entry_dir: str,
+    ) -> Optional[dict]:
+        """Load and verify a library entry."""
+        try:
+            src_path = os.path.join(entry_dir, "kernel.py")
+            hash_path = os.path.join(entry_dir, "source.sha256")
+            meta_path = os.path.join(entry_dir, "metadata.json")
+
+            if not all(os.path.exists(p) for p in [src_path, hash_path, meta_path]):
+                return None
+
+            with open(src_path) as f:
+                source = f.read()
+
+            with open(hash_path) as f:
+                stored_hash = f.read().strip()
+
+            # Verify integrity
+            actual_hash = hashlib.sha256(source.encode()).hexdigest()
+
+            if actual_hash != stored_hash:
+                logger.warning(
+                    "Library: integrity check failed for %s. Entry deleted.",
+                    op_name)
+                self._delete_entry(op_name, hardware_hash, entry_dir)
+                with self._lock:
+                    self._stats["corrupted"] += 1
+                return None
+
+            with open(meta_path) as f:
+                metadata = json.load(f)
+
+            with self._lock:
+                self._stats["load_hits"] += 1
+            return {"source": source, "metadata": metadata}
+
+        except Exception as e:
+            logger.debug("Library load error: %s", e)
+            return None
+
+    def _delete_entry(
+        self, op_name: str, hardware_hash: str, entry_dir: str,
+    ) -> None:
+        """Remove corrupted entry."""
+        import shutil
+        key = f"{op_name}_{hardware_hash}"
+        try:
+            shutil.rmtree(entry_dir, ignore_errors=True)
+            with self._lock:
+                self._catalog.pop(key, None)
+        except Exception:
+            pass
+
+    def _load_catalog(self) -> dict:
+        """Scan disk and build catalog of known entries."""
+        catalog = {}
+        try:
+            for op_dir in os.listdir(self._path):
+                op_path = os.path.join(self._path, op_dir)
+                if not os.path.isdir(op_path):
+                    continue
+                for hw_dir in os.listdir(op_path):
+                    hw_path = os.path.join(op_path, hw_dir)
+                    if not os.path.isdir(hw_path):
+                        continue
+                    key = f"{op_dir}_{hw_dir}"
+                    catalog[key] = hw_path
+        except Exception:
+            pass
+        return catalog
+
+
+# Module-level library singleton
+_kernel_library: Optional[KernelLibrary] = None
+
+
+def get_kernel_library() -> KernelLibrary:
+    global _kernel_library
+    if _kernel_library is None:
+        _kernel_library = KernelLibrary()
+    return _kernel_library

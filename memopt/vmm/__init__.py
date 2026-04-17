@@ -14,6 +14,9 @@ The VMM is opt-in and lazy — nothing here runs at import time beyond
 backend detection, which is free (a few os.path checks + one torch call).
 """
 from __future__ import annotations
+import logging
+import os
+import socket
 import threading
 from typing import TYPE_CHECKING, Optional
 from .hal import backend, tiers, tier_names
@@ -25,6 +28,8 @@ from .oracle import MemoryOracle
 
 if TYPE_CHECKING:
     from memopt.cluster import GKDStore
+
+logger = logging.getLogger(__name__)
 
 
 class VMM:
@@ -40,7 +45,33 @@ class VMM:
 
     def __init__(self, gkd: Optional["GKDStore"] = None) -> None:
         self.page_table   = PageTable()
-        self.tier_manager = TierManager(self.page_table)
+
+        # Build GUM remote block client when peers are configured
+        _remote_client = None
+        _block_directory = None
+        _node_id = os.environ.get("MEMOPT_NODE_ID", socket.gethostname())
+        node_hosts = os.environ.get("MEMOPT_NODE_HOSTS", "")
+
+        if node_hosts:
+            try:
+                from memopt.cluster.remote_block import RemoteBlockClient
+                from memopt.cluster.block_directory import make_directory
+
+                _remote_client = RemoteBlockClient(
+                    node_id=_node_id,
+                    timeout_s=float(os.environ.get("MEMOPT_RBP_TIMEOUT_S", "2.0")))
+                _block_directory = make_directory(_node_id)
+                logger.info("VMM: GUM enabled (peers: %s)", node_hosts)
+            except Exception as e:
+                logger.debug("VMM: GUM init failed: %s", e)
+                _remote_client = None
+                _block_directory = None
+
+        self.tier_manager = TierManager(
+            self.page_table,
+            remote_client=_remote_client,
+            block_directory=_block_directory,
+            node_id=_node_id)
         self.oracle       = MemoryOracle()
         self.prefetch     = PrefetchEngine(self.tier_manager, oracle=self.oracle)
         self.gkd          = gkd   # None = GKD disabled (backwards compatible)
@@ -90,11 +121,17 @@ class VMM:
                 f"Sequence {sequence_id!r} owned by tenant {owner!r}; "
                 f"access denied for tenant {tenant_id!r}"
             )
-        # TODO Phase 2: GKD lookup — requires serving layer to pass token_ids through
-        # if self.gkd is not None:
-        #     hit = self.gkd.lookup(token_ids, sequence_length)
-        #     if hit: return hit.block_ref
-        self.prefetch.record_access(sequence_id, block_index)
+        # Determine tier before promotion for accuracy tracking
+        tier_at_access = "unknown"
+        try:
+            entry = self.page_table.lookup(sequence_id, block_index)
+            if entry is not None:
+                tier_at_access = entry.tier
+        except Exception:
+            pass
+
+        self.prefetch.record_access(
+            sequence_id, block_index, tier_at_access=tier_at_access)
         return self.tier_manager.fetch(sequence_id, block_index)
 
     def free_sequence(

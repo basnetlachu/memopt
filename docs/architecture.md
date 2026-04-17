@@ -51,6 +51,7 @@
 30. [Canary Rollouts](#30-canary-rollouts)
 31. [Global-Scale Database (CockroachDB)](#31-global-scale-database-cockroachdb)
 32. [Hardware Abstraction Layer](#32-hardware-abstraction-layer)
+33. [Operational Scripts](#33-operational-scripts)
 
 ---
 
@@ -58,10 +59,6 @@
 
 memopt is a **memory fabric for AI infrastructure** — the layer between accelerator hardware and the workloads that run on it. Where storage fabrics like Ceph turn independent disks into one addressable storage plane, memopt turns independent GPU nodes into one addressable **memory plane**: HBM, DRAM, NVMe, and peer HBM all participate, blocks flow between tiers automatically, and the same block is never materialized twice across the cluster.
 
-**memopt is NOT**:
-- A profiler — profiling exists, but as a *consumer* of fabric telemetry
-- An optimization toolkit — optimizations apply *to* workloads running on the fabric, not the fabric itself
-- An inference server — serving is one of several runtimes that plug into the fabric; the fabric outlives it
 
 **memopt IS**:
 
@@ -314,6 +311,7 @@ Build options (all optional, degrade gracefully):
 |-------------|---------|--------|
 | `MEMOPT_ENABLE_GDS` | OFF | cuFile GPUDirect Storage |
 | `MEMOPT_ENABLE_RDMA` | OFF | libibverbs transport |
+| `MEMOPT_ENABLE_IO_URING` | OFF | liburing-backed async NVMe (Linux 5.1+); sync `pread`/`pwrite` fallback when off |
 | `MEMOPT_ENABLE_AVX512` | OFF | Explicit AVX-512 (else `-march=native` in Release) |
 | `MEMOPT_ENABLE_SANITIZERS` | OFF | ASan + UBSan for testing |
 | `MEMOPT_ENABLE_TESTS` | OFF | GoogleTest C++ test suites |
@@ -416,6 +414,55 @@ All writes to NVMe-tier block files are crash-safe:
 3. **Crash recovery on startup** — `UnifiedBackend.__init__()` calls `_recover_nvme_dir(tempfile.gettempdir())` which removes any `*.vmm_block.tmp` files left by a previous crash before the process begins serving.
 
 The CUDA backend applies the same fsync-on-allocation and atomic-rename-on-eviction pattern.
+
+### 4.5a Async NVMe I/O (`csrc/cuda_backend/nvme_async.{h,cpp}` + `vmm/backends/_cuda_backend_py.py::AsyncNVMeManager`)
+
+NVMe read/write is the slowest memory tier and synchronous `pread`/`pwrite` blocks the promotion path. The async NVMe layer adds a non-blocking submit/poll interface backed by Linux `io_uring` (kernel ≥ 5.1) with a transparent synchronous fallback on every other platform.
+
+**C++ classes** (`csrc/cuda_backend/nvme_async.{h,cpp}`):
+
+| Class | Submit API | Completion API |
+|-------|-----------|----------------|
+| `AsyncNVMeReader` | `read_async(path, offset, size, cb)` | `poll()` (non-blocking), `wait(timeout_ms)`, `drain()` |
+| `AsyncNVMeWriter` | `write_async(path, data, cb)` — writes to `path.tmp` + `fdatasync` + atomic `rename` | same as reader |
+
+Both use `using AsyncIOCallback = std::function<void(bool ok, size_t bytes)>` for completion. Queue depth is 64 per instance. `stats()` reports `reads_submitted`, `reads_completed`, `reads_failed`, `bytes_read`, and `sync_fallbacks` (count of ops that fell through to `pread`/`pwrite` because the io_uring SQ was full or the kernel was too old).
+
+**Build plumbing** — `MEMOPT_ENABLE_IO_URING` (CMake, default OFF) finds `liburing` via `find_library` with `/usr/lib` and `/usr/local/lib` fallbacks; defines `MEMOPT_IO_URING_AVAILABLE=1` when present. `nvme_async.cpp` is always compiled — when the macro is undefined the implementation is a thin wrapper over sync `pread`/`pwrite` so the Python side never branches on build flavor.
+
+**pybind11 bindings** (`csrc/cuda_backend/bindings.cpp`) — release the GIL across every `read_async` / `poll` / `wait` / `drain` call. C++ owns the callback dispatch thread; Python gets a thread-safe future-like handle.
+
+**Python wrapper** — `AsyncNVMeManager` in `vmm/backends/_cuda_backend_py.py`:
+
+- Construction picks `_memopt_cuda.AsyncNVMeReader/Writer` when available, falls back to an in-process synchronous implementation otherwise.
+- Runs one background poller thread per manager instance. Poll interval comes from `MEMOPT_NVME_POLL_MS` (default `1`).
+- `read_block(path, size) -> bytes | None` and `write_block(path, data) -> bool` never raise — errors are counted, the caller falls back to its synchronous path.
+- `stats()` surfaces `async_available`, `backend="io_uring"|"sync"`, and the underlying C++ counters.
+- Thread-safety: each `AsyncNVMeManager` owns its own ring — the library does not share rings between threads (io_uring is not MT-safe per the kernel contract).
+
+`TierManager.stats()` merges `async_nvme` into its output so the `/metrics` endpoint can surface `memopt_nvme_reads_submitted`, `memopt_nvme_sync_fallbacks_total`, etc.
+
+### 4.5b Prefetch Accuracy Tracker (`vmm/prefetch_engine.py::PrefetchAccuracyTracker`)
+
+The oracle previously reported a **simulated** accuracy number. `PrefetchAccuracyTracker` replaces that with real-traffic measurement: every prefetch is recorded when fired, and outcomes are classified when the subsequent access lands.
+
+Three outcomes per prediction:
+
+| Outcome | Meaning |
+|---------|---------|
+| `accurate` | Prefetched block is actually accessed within the window (`MEMOPT_PREFETCH_WINDOW_S`, default 5 s) |
+| `wasted` | Prefetched block evicted before any access arrived |
+| `missed` | Access arrived with the block not prefetched |
+
+API:
+
+```python
+tracker.record_prefetch(seq_id, block_idx)         # called when PrefetchEngine fires
+tracker.record_access(seq_id, block_idx, tier)     # called on every VMM access
+tracker.stats()   # {accuracy_pct, waste_pct, miss_pct, accurate, wasted, missed, pending, window_s}
+```
+
+The tracker is a `RLock`-guarded dict of pending prefetches plus three counters. Every 1,000 accesses it sweeps expired pending entries (prefetch fired > `window_s` ago with no access), counting them as `wasted`. `VMM.__init__()` creates one tracker per node and passes it into `PrefetchEngine`; its stats propagate up through `vmm.stats()["prefetch_accuracy"]` and the Pillar 4 collector.
 
 ### 4.6 VMM Tenant Isolation (`vmm/__init__.py`)
 
@@ -728,6 +775,33 @@ Redis backend degrades gracefully to local if Redis is unreachable — inference
 
 **TTL enforcement** — a background daemon thread (`gkd-ttl`) runs every 5 minutes and removes expired entries from `LocalGKDBackend`. TTL is configurable via `MEMOPT_GKD_ENTRY_TTL_S` (default: same as `default_ttl_seconds` constructor arg, typically 3600). For `RedisGKDBackend`, Redis native `EXPIRE` handles TTL — the background thread only applies to the local fallback.
 
+### 5.4a Per-Tenant GKD Stats (`cluster/gkd_store.py::TenantGKDStats`)
+
+The original GKD counters were fleet-global — useful for Grafana but unable to answer "how much compute is customer X saving?" `TenantGKDStats` adds per-tenant tracking that runs alongside the global counters.
+
+| Method | Purpose |
+|--------|---------|
+| `record_hit(tenant_id, tokens_saved, is_partial)` | Bumps `exact_hits` or `partial_hits` + `tokens_saved` for the tenant |
+| `record_miss(tenant_id)` | Bumps `misses` for the tenant |
+| `get_tenant_stats(tenant_id)` | Returns `{exact_hits, partial_hits, misses, tokens_saved, hit_rate_pct}` |
+| `get_all_tenants()` | Dict of all tenants (admin-only export) |
+
+Wired into `GKDStore.lookup()` and `GKDStore.register()`; the serving endpoint passes the authenticated `tenant_id` through so hits are attributed correctly. The per-tenant totals feed the `/report/savings` endpoint (Section 19) and the HTML savings report (Section 7.9).
+
+**Tenant isolation in hashing** — when `MEMOPT_GKD_TENANT_ISOLATION=true`, the content hash is computed over `(tenant_id, token_ids)` instead of `token_ids` alone, so identical prompts from different tenants produce different hashes and never cross-pollinate the KV cache. Off by default — most deployments prefer cross-tenant dedup on shared system prompts.
+
+### 5.4b Rolling Hit-Rate Window (`cluster/gkd_store.py::HitRateWindow`)
+
+`GKDStore.stats()["hit_rate_pct"]` was previously cumulative over the process lifetime, which hides regressions: a node that starts at 95 % and drifts to 50 % after a workload change still reports > 90 % for days. `HitRateWindow` is a circular buffer of the last N request outcomes (default 10,000, `MEMOPT_GKD_WINDOW_SIZE`).
+
+```python
+window.record(is_hit: bool)          # O(1), RLock-guarded
+window.hit_rate_pct()                # hit rate over the last N requests
+window.stats()                       # {hit_rate_pct, window_size, window_filled, requests_seen, note}
+```
+
+`window.stats()` always includes a `note` string explaining whether the number is from real traffic (`window_filled=True`) or a partially filled window. Exposed in `GKDStore.stats()` under `"hit_rate_window"` so dashboards can distinguish "real 95 %" from "3 requests seen, 100 % hit rate."
+
 ### 5.5 Transport (`cluster/transport.py`)
 
 The transport layer implements a typed `AbstractTransport` ABC with three concrete backends selected automatically at runtime:
@@ -988,6 +1062,57 @@ Cache key: `SHA-256(op_name | sorted(input_shapes) | hardware)`.
 
 **`get_metadata(op_name)`** — scans disk cache for the most recent entry matching `op_name` and returns its metadata dict. Survives process restarts (reads from disk, not memory). Returns `None` if no previous attempt exists. Never raises — all exceptions are caught and logged at `DEBUG`.
 
+**`make_key(op_name, input_shapes, hardware)`** — public helper exposed so callers (tests, library lookups, manual synthesis flows) can compute a cache key without duplicating the hashing logic.
+
+### 6.5a Cross-Deployment Kernel Library (`kernels/kernel_cache.py::KernelLibrary`)
+
+`KernelCache` is per-process: every fresh container re-synthesises the same kernels. `KernelLibrary` is a shared, persistent, cross-deployment store — a synthesised `apply_rope` kernel that was validated on Blackwell can be reused by every Blackwell node in the fleet (and by every other deployment that ships from the same artifact).
+
+**Lookup order on `KernelCache.get(key)` miss:**
+1. In-memory dict — current process
+2. Disk cache — `~/.memopt/kernel_cache/` (TTL 7 days, SHA-256 verified)
+3. **Kernel library** — `MEMOPT_KERNEL_LIBRARY_PATH` (default `~/.memopt/kernel_library/`) — scans entries matching `op_name` and `hardware_hash[:16]` prefix, validates `source.sha256`, loads Triton source, stores into the in-memory cache.
+
+**Directory layout:**
+```
+<library>/{op_name}/{hardware_hash[:16]}/
+  kernel.py        # Triton source (never bytecode)
+  metadata.json    # speedup, is_memory_bound, tiling_config, issued_at
+  source.sha256    # SHA-256 of kernel.py — verified on every load
+```
+
+**Privacy contract** — only Triton source and numeric metadata are written. No tokens, no tensor contents, no model identifiers, no tenant IDs. The library is safe to vendor across deployments because it carries no customer data.
+
+**Corruption handling** — mismatched `source.sha256` → entry deleted, `corrupted` counter incremented, caller falls through as if the entry did not exist. A tampered library cannot `exec()` unexpected code.
+
+**Stats:** `entries`, `loads`, `load_hits`, `saves`, `corrupted`. Surfaced via `KernelCache.stats()["library"]`.
+
+### 6.5b Additional Synthesis Targets
+
+`kernels/jit_generator.py` gains two new prompt templates alongside the existing fused-op prompts:
+
+| Constant | Target op | Notes |
+|----------|-----------|-------|
+| `FLASH_ATTENTION_PROMPT` | Fused multi-head attention (Triton) | Emits a FlashAttention-shaped kernel with mask + scale fused; correctness checked against `F.scaled_dot_product_attention` |
+| `CUSTOM_OP_PROMPT` | Arbitrary user-defined op | Consumed by `CustomOpSpec` |
+
+**`CustomOpSpec` dataclass** — lets callers request synthesis for ops memopt does not ship prompts for:
+
+```python
+spec = CustomOpSpec(
+    name="fused_gelu_bias",
+    description="y = gelu(x + bias), contiguous x [B, D], bias [D]",
+    input_shapes=[(B, D), (D,)],
+    input_dtypes=["float16", "float16"],
+    output_shape=(B, D),
+    reference_fn=lambda x, b: F.gelu(x + b),   # used for correctness validation
+    atol=1e-2, rtol=1e-2,
+)
+module = generator.synthesise_custom(spec, hardware_profile)
+```
+
+Validation uses the dtype-aware tolerances from 6.3, falling back to `spec.atol`/`spec.rtol` when supplied. The synthesised kernel writes into `KernelLibrary` under `op_name = spec.name` so every other node can reuse it.
+
 ### 6.6 Design Constraints
 
 - No top-level `torch` or `triton` imports — all lazy inside functions. Package imports cleanly on CPU-only machines.
@@ -1185,6 +1310,16 @@ Environment overrides: `MEMOPT_BASELINE_J_PER_TOKEN`, `MEMOPT_GRID_INTENSITY_KG_
 
 **Disk space safety** — `record()` calls `_has_disk_space()` before every write. If free disk is below `MEMOPT_LEDGER_MIN_FREE_MB` (default 500 MB), the write is skipped and `_entries_skipped` counter is incremented. A `LedgerEntry` with `batch_id="skipped_..."` is returned so callers never get `None`. `size_bytes()` returns the current SQLite file size.
 
+**Measurement provenance (`energy_source`)** — every row carries an `energy_source` string so downstream reports can never silently mix real and estimated numbers:
+
+| Value | Meaning |
+|-------|---------|
+| `"nvml_measured"` | `actual_j_per_token` came from a live `PowerSampler` reading (NVML) |
+| `"estimated"` | Derived from `gkd_hit_rate_pct` and the baseline J/token curve |
+| `"unmeasured"` | No energy signal available; cost/CO₂ columns are 0 and marked as such in the report |
+
+`record()` auto-detects the source from which fields are populated; callers may override by passing `energy_source=` explicitly. The column is added by an in-place `ALTER TABLE` on existing databases (caught and ignored if already present), so upgrading a running node does not require a migration step.
+
 Survives SQLite errors gracefully — writes are non-fatal, `totals()` returns empty dict on DB failure.
 
 **Chain verification and certification** — `verify_and_certify(tenant_id=None)` walks the hash chain via `verify_chain()`, then wraps the result in a signed certificate via `sign_entry()`. Returns `chain_valid`, `entries_checked`, `issued_at`, `signature`, and `signature_status`. The `GET /ledger/verify` endpoint exposes this — non-admin callers can only verify their own tenant; admins verify all entries.
@@ -1259,6 +1394,30 @@ The existing 9-panel dashboard was updated with real Pillar 4 metric names and 3
 | VMM Virtual/Physical Ratio | `memopt_vmm_virtual_physical_ratio` | Stat |
 | Kernel Synthesis Outcomes | `memopt_kernel_synthesis_succeeded` | Pie chart |
 | Cross-Node Borrows Total | `memopt_cluster_borrows_total` | Stat |
+
+### 7.7a Customer Savings Report (`observability/report_exporter.py`)
+
+Operators need a report they can hand to a customer showing *their* savings, with honest labeling of what was measured vs. estimated. `SavingsReport` produces that report in three formats.
+
+```python
+from memopt.observability.report_exporter import generate_report
+report = generate_report(ledger, tenant_id="acme", period_hours=720)   # 30 days
+html_bytes = report.to_html()
+csv_row    = report.to_csv_summary()
+pdf_bytes  = report.to_pdf()   # None if reportlab not installed
+```
+
+`SavingsReport` fields:
+- `tenant_id`, `period_label` — human-readable period
+- `totals` — `tokens_generated`, `energy_saved_kwh`, `co2_saved_kg`, `cost_saved_usd`
+- `source_breakdown` — `{nvml_measured: {...}, estimated: {...}, unmeasured: {...}}` with tokens and energy split by provenance
+- `config` — `grid_intensity_kg_kwh`, `electricity_price_usd`, `cost_per_1k_tokens`
+
+**Honest labeling** — the HTML includes a "Measurement Transparency" block that shows the share of tokens from each `energy_source`. When > 50 % of tokens are `unmeasured`, the report prints a banner saying the savings number is a lower bound. When `MEMOPT_COST_PER_1K_TOKENS` is unset (default 0), dollar amounts are omitted rather than shown as $0.
+
+**Config env vars:** `MEMOPT_GRID_INTENSITY_KG_KWH` (default 0.233 — IEA EU 2024), `MEMOPT_COST_PER_1K_TOKENS`, `MEMOPT_COMPUTE_COST_RATIO` (default 0.7).
+
+**Graceful degradation** — `to_pdf()` returns `None` when `reportlab` is not installed; the `/ledger/export/report.pdf` endpoint falls back to HTML with a `text/html` content type. `generate_report()` on an empty ledger returns a valid `SavingsReport` with zero totals (not an error).
 
 ### 7.8 Test Coverage
 
@@ -1360,6 +1519,65 @@ Environment variables:
 | `MEMOPT_RBP_MAX_BLOCK_MB` | 256.0 | Maximum accepted frame size |
 | `MEMOPT_NODE_HOSTS` | — | `"node-a:192.168.1.10,node-b:192.168.1.11"` — maps node IDs to IPs |
 
+### 7a.3a Geo-Routed Failover (`cluster/remote_block.py::GeoRouter`, `fetch_block_with_failover`)
+
+Fetching a block from the first peer that advertised it is wrong in a multi-rack / multi-pod / multi-region fleet — latency and cost both scale with network distance. `GeoRouter` sorts candidate peers by locality before the fetch loop touches any of them.
+
+**Locality levels (nearest first):**
+1. Same rack (`MEMOPT_RACK`)
+2. Same pod (`MEMOPT_POD`)
+3. Same region (`MEMOPT_REGION`)
+4. Cross-region
+
+```python
+router = GeoRouter(
+    local_node_id=os.getenv("MEMOPT_NODE_ID"),
+    local_rack=os.getenv("MEMOPT_RACK"),
+    local_pod=os.getenv("MEMOPT_POD"),
+    local_region=os.getenv("MEMOPT_REGION"),
+)
+ordered = router.sort_peers(candidates)   # stable sort, locality-first
+label   = router.locality_label(cand)     # "same_rack" | "same_pod" | "same_region" | "cross_region"
+```
+
+No latency number is hardcoded — labels are strings for metrics attribution only. Real latencies are measured per-transfer via `GUMMetrics`.
+
+**`RemoteBlockClient.fetch_block_with_failover(content_hash, candidates, geo_router, metrics, max_attempts)`** — single-call failover:
+
+1. `geo_router.sort_peers(candidates)` produces a locality-ordered list.
+2. Loop: `acquire_lease` → `fetch_block` → `release_lease`. On any failure (timeout, not-found, transport error) record the failure in `metrics` and advance to the next candidate.
+3. Stops after `max_attempts` (`MEMOPT_GUM_MAX_ATTEMPTS`, default 3) or exhaustion. Returns `bytes | None` — never wrong data.
+
+**Transport detection** — `RemoteBlockClient._transport_type()` returns `"rdma"` when the transport sidecar is running (`/dev/shm/memopt_transport_*` marker present), otherwise `"tcp"`. The label is attached to every `TransferMeasurement` so the Grafana dashboard can split p99 by transport.
+
+### 7a.3b GUM Metrics (`cluster/gum_metrics.py`)
+
+Per-peer and global rolling metrics over recent block transfers. One singleton per process (`get_gum_metrics()`), lock-protected, configurable window (`MEMOPT_GUM_METRICS_WINDOW`, default 1000 measurements).
+
+**`TransferMeasurement(frozen)`** — one transfer: `peer_node_id`, `bytes_transferred`, `latency_ms`, `success`, `transport ∈ {tcp, rdma}`, `rack`, `pod`, `region`, `timestamp`.
+
+**`GUMMetrics` API:**
+
+| Method | Returns |
+|--------|---------|
+| `record_transfer(m)` | Thread-safe append to rolling window |
+| `record_fallback()` | Increments fetch-fallback counter (GUM miss → local recompute) |
+| `peer_stats(peer_id)` | `{total_attempts, successes, failures, success_rate_pct, lat_p50/p99/min/max_ms, transport}` |
+| `global_stats()` | Aggregate across all peers + fallback count |
+| `dashboard_data()` | `{per_peer: {...}, global: {...}}` — consumed by Grafana |
+
+**Integration** — `TierManager._try_gum_fetch()` now calls `fetch_block_with_failover(candidates, geo_router, metrics, max_attempts)`. The metrics singleton is registered with the Pillar 4 collector at startup, so `memopt_gum_fetch_latency_ms` and `memopt_gum_fetch_success_rate_pct` show up in `/metrics` per peer and per transport.
+
+**Environment summary:**
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `MEMOPT_RACK` | `"unknown"` | Local rack identifier |
+| `MEMOPT_POD` | `"unknown"` | Local pod identifier |
+| `MEMOPT_REGION` | `"unknown"` | Local region identifier |
+| `MEMOPT_GUM_MAX_ATTEMPTS` | `3` | Max failover hops per fetch |
+| `MEMOPT_GUM_METRICS_WINDOW` | `1000` | Rolling window size for per-peer percentiles |
+
 ### 7a.4 TierManager Integration (`vmm/tier_manager.py`)
 
 `TierManager._fetch_from_lower_tier()` accepts three optional kwargs added for GUM:
@@ -1374,6 +1592,12 @@ tier_manager._fetch_from_lower_tier(
 ```
 
 Existing callers that omit these kwargs get identical behaviour (returns None, no remote call). When all three are supplied and the directory has an entry on a different node, the method acquires a lease, fetches the block bytes, and releases the lease.
+
+**Peer resolution order** (`_get_node_host`):
+1. Dynamic `NodeDiscovery` peers (Redis-backed; picks up new nodes without restart)
+2. `MEMOPT_NODE_HOSTS` static env var (fallback for deployments without Redis)
+
+**Failover path** — when `geo_router` and `gum_metrics` are also supplied, the fetch call is routed through `RemoteBlockClient.fetch_block_with_failover()` (Section 7a.3a) so the first peer is the locality-nearest one and failures cascade through up to `MEMOPT_GUM_MAX_ATTEMPTS` candidates. Each attempt is recorded in `GUMMetrics` for the Grafana dashboard.
 
 ### 7a.5 Test Coverage (`cluster/tests/test_pillar5_gum.py`)
 
@@ -1427,6 +1651,10 @@ memopt certify --node-id a100-prod-01 --output-dir /etc/memopt/certs
 | `rope` | Rotary position embedding: with `cos=1, sin=0` output must equal input |
 | `layer_norm_residual` | Layer norm + residual add: deterministic recomputation matches reference |
 | `scaled_softmax` | Scaled dot-product softmax: two identical calls produce identical output |
+| `matmul` | FP32 matmul determinism: repeated multiply of the same inputs must produce bit-identical results |
+| `embedding` | Embedding lookup: must be *exactly* equal (zero tolerance) — any drift signals broken memory ordering |
+| `attention` | Scaled dot-product attention on fp16 (GPU-only): reference vs. our path within dtype tolerance |
+| `layer_norm_standalone` | Layer norm alone (no residual): verifies `mean`/`rsqrt` are well-formed on silicon |
 
 Tolerances from `_TOLERANCES` (same as `jit_generator._DTYPE_TOLERANCES`): float16/bfloat16 → `(1e-2, 1e-2)`, float32 → `(1e-5, 1e-5)`, float64 → `(1e-8, 1e-8)`.
 
@@ -1517,6 +1745,41 @@ When `MEMOPT_CONTROL_PLANE_URL` is not set, the HTTP POST is skipped (re-synthes
 This is the default `alert_callback` used when `CertifyDaemon` is wired into `serving/server.py`'s `_build_engine()`.
 
 Environment variables: `MEMOPT_CERTIFY_INTERVAL_H` (default 24h), `MEMOPT_CERTIFY_ON_STARTUP`, `MEMOPT_NODE_STATUS_PATH`, `MEMOPT_NODE_ID`, `MEMOPT_CONTROL_PLANE_URL`, `MEMOPT_API_KEY`.
+
+**SLA history append** — after each run, `_run_once()` calls `SLACertificate.append_run(node_id, cert, drift_detected)` to persist the outcome to `~/.memopt/cert_history.json` (or `MEMOPT_CERT_HISTORY_PATH`). Survives process restart.
+
+**Prometheus emission** — `_emit_prometheus_metrics(cert, drift_pct)` publishes per-run metrics if `prometheus_client` is installed (no-op otherwise):
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `memopt_cert_passed` | Gauge (`node_id`) | 1 if the last run passed, 0 if any test failed |
+| `memopt_bandwidth_pct_of_peak` | Gauge (`node_id`) | Most recent `memory_bandwidth` benchmark result |
+| `memopt_drift_pct` | Gauge (`node_id`) | Current drift vs. baseline |
+| `memopt_cert_runs_total` | Counter (`node_id`) | Total certifications executed since process start |
+
+All gauges are labeled with `node_id` so the Grafana cert panel can show the whole fleet on one chart.
+
+### 7b.4a 30-Day SLA Certificate (`kernels/certification.py::SLACertificate`)
+
+`SiliconCertificate` is a point-in-time attestation. `SLACertificate` aggregates a rolling window (default 30 days) of those attestations into a single claim operators can share with customers.
+
+```python
+sla = SLACertificate(node_id="a100-prod-01", period_days=30)
+report = sla.generate()
+# {
+#   "node_id": "...",
+#   "period_days": 30,
+#   "hardware_correctness_pct": 99.7,   # % of runs that passed all correctness tests
+#   "bandwidth_pct_of_peak": 54.8,      # mean achieved vs. theoretical peak
+#   "drifts": 1,                        # count of drift detections in the window
+#   "runs": 30,
+#   "issued_at": 1742200000.0
+# }
+```
+
+**Honest phrasing** — `hardware_correctness_pct` is the fraction of scheduled runs that passed, not uptime. A node that was powered off for 12 hours is not penalised — the SLA only speaks to runs that actually executed. The report header makes this explicit.
+
+History persists at `MEMOPT_CERT_HISTORY_PATH` (default `~/.memopt/cert_history.json`); rotate manually if retention beyond 30 days is required.
 
 ### 7b.5 CLI (`memopt certify`)
 
@@ -1803,6 +2066,30 @@ report = sampler.report()
 
 `ContinuousBatchingEngine` maintains a request queue. On each iteration it collects all ready requests into a single padded batch, calls the model once, and returns outputs to individual waiters. `BatchingConfig` controls `max_batch_size` and `max_wait_ms`.
 
+### 16.3a Prefix Injection — `run_with_prefix()`
+
+When GKD returns a partial (LCP) hit the serving path must reuse the cached KV for the matched prefix and only compute the delta tokens. Two coordinated changes make that possible:
+
+**`ContinuousBatchingEngine.__init__(..., vmm=None)`** — optional VMM handle so the engine can resolve cached KV block references without going through the GKD round-trip.
+
+**`run_with_prefix(token_ids, seq_id, prefix_len) -> dict | None`** — runs the model on the delta tokens only:
+
+- Sequence state is constructed with `is_prefix_injected=True`
+- Cached blocks are attached to the new sequence via `PagedKVCache.register_block_ref(seq_id, block_ref)` — the KV memory is shared, not copied
+- `position_ids` start at `prefix_len` so absolute position embeddings are correct
+- Returns a completion dict on success, `None` when the model lacks the necessary hooks (e.g. an older HF model without an explicit `position_ids` argument). The caller treats `None` as "fall through to full recompute."
+
+**`PagedKVCache` bookkeeping:**
+
+| Addition | Purpose |
+|----------|---------|
+| `_ref_to_blocks: Dict[str, List[int]]` | Maps a GKD `block_ref` to the owning block indices |
+| `_shared_blocks: set` | Block indices that are aliased into a prefix-injected sequence |
+| `register_block_ref(seq_id, block_ref)` | Called after the original sequence is registered in GKD |
+| `get_blocks_for_ref(block_ref)` | Lookup used by `run_with_prefix` |
+
+`free_sequence(seq_id)` is now aware of `_shared_blocks`: it frees blocks that belong solely to the ending sequence and skips any block that is still referenced by another sequence. This keeps the shared prefix resident across the lifetime of every consumer that re-used it.
+
 ### 16.4 Serving Server (`serving/server.py`)
 
 FastAPI app with OpenAI-compatible `/v1/completions` and `/v1/chat/completions` endpoints. Launched via `memopt serve --model <path> --port 8080`.
@@ -1874,7 +2161,7 @@ Request → tokenize → GKD lookup
 
 1. **GKD lookup** — `_gkd_store.lookup(token_ids, seq_len)` before inference. Returns a `GKDHit` with `is_partial: bool` and a `block_ref` identifier, or `None`.
 2. **Exact-hit compute-skip** (serving/server.py lines 597-643) — when `gkd_hit is not None and not gkd_hit.is_partial`, the handler calls `_gkd_store.get_output(block_ref)` to retrieve the previously stored completion and returns a `CompletionResponse` directly **without calling `engine.run_sync()`**. This is the core deduplication value prop — the hit rate directly translates to compute saved. Hit events are recorded with `gkd_hit_rate_pct=100.0`. A failure at either stage (`lookup` or `get_output`) falls through to full inference so GKD never blocks a request.
-3. **Partial-hit path** — when `gkd_hit.is_partial is True` (LCP match over part of the prefix), inference still runs; the partial match is logged but the engine has no API today to accept a pre-populated partial KV cache. This is the one remaining GKD integration gap — tracked as a future optimization once the continuous-batching engine exposes a per-sequence KV-import hook.
+3. **Partial-hit path** — when `gkd_hit.is_partial is True` (LCP match over part of the prefix), the handler calls `_try_partial_compute_skip(request, gkd_hit)` which invokes `engine.run_with_prefix(token_ids, seq_id, prefix_len)` on the continuous-batching engine (Section 16.3a). The engine reuses the cached KV blocks for the matched prefix and only computes the delta `[prefix_len:seq_len]`. On success, the request completes with partial compute savings recorded in three module-level counters: `_partial_skip_count`, `_partial_skip_tokens_saved`, `_partial_skip_attempted`. When `run_with_prefix` is not available or returns `None` (e.g. model without position-id support), the handler falls through to a full-prefix recompute so GKD never blocks a request.
 4. **Miss path** — `engine.run_sync()` runs normally. Afterward both the token hash and the generated text are registered: `_gkd_store.register(token_ids, seq_len, block_ref, node_id)` followed by `_gkd_store.register_output(block_ref, {"text": ..., "completion_tokens": ...})` — so the next identical request takes the skip path.
 5. **Ledger** — records `tokens_generated` and `gkd_hit_rate_pct` (from live `_gkd_store.stats()`). `actual_j_per_token` is passed when `PowerSampler` is active; otherwise defaults to `None` (unmeasured) to avoid fake numbers.
 
@@ -1901,6 +2188,25 @@ Request → tokenize → GKD lookup
 ```
 
 All values are measured from live counters — no hardcoded numbers.
+
+#### `/report/savings` endpoint
+
+`GET /report/savings?period_hours=720` returns a tenant-scoped savings summary computed from the Pillar 4 ledger + per-tenant GKD stats (Section 5.4a). Non-admin callers always see only their own tenant; admins can pass `?tenant_id=` to scope to any tenant.
+
+```json
+{
+  "tenant_id": "acme",
+  "period_hours": 720,
+  "tokens_generated": 12345678,
+  "gkd_tokens_saved": 8700000,
+  "energy_saved_kwh": 4.2,
+  "co2_saved_kg": 0.98,
+  "cost_saved_usd": 12.34,
+  "source_breakdown": {"nvml_measured": 70, "estimated": 25, "unmeasured": 5}
+}
+```
+
+Dollar amounts are included only when `MEMOPT_COST_PER_1K_TOKENS` is set (default 0 → omitted rather than shown as 0). `MEMOPT_COMPUTE_COST_RATIO` (default 0.7) controls how much of the token cost is attributed to compute vs. overhead.
 
 ---
 
@@ -1969,6 +2275,7 @@ FastAPI with endpoints (all except `/health` and `/` require `X-Memopt-API-Key` 
 | `GET` | `/api/v1/nodes/{name}` | Single node detail with recent events |
 | `POST` | `/api/v1/nodes/{name}/status` | Update node degradation status (called by CertifyDaemon) |
 | `GET` | `/api/v1/nodes/degraded` | List all nodes currently flagged as degraded |
+| `GET` | `/api/v1/nodes/{name}/healthy` | Load-balancer health probe (no auth) — 200 if healthy, 503 if degraded |
 | `GET` | `/api/v1/events` | Optimization event history (filterable by node, status) |
 | `POST` | `/api/v1/events` | Record new optimization event |
 | `POST` | `/api/v1/preflight` | Pre-flight static graph analysis |
@@ -1982,6 +2289,8 @@ FastAPI with endpoints (all except `/health` and `/` require `X-Memopt-API-Key` 
 **`POST /api/v1/nodes/{name}/status`** — accepts `{"healthy": bool, "degraded": bool, "drift_pct": float, "reason": str}`. Input validated: non-numeric `drift_pct` returns HTTP 400. Called by `make_control_plane_callback()` when CertifyDaemon detects drift.
 
 **`GET /api/v1/nodes/degraded`** — returns `{"degraded_nodes": [...], "total": int}`. Used by load balancers to route traffic away from degraded nodes.
+
+**`GET /api/v1/nodes/{name}/healthy`** — dedicated per-node liveness/health probe intended for LB/Kubernetes-style checks. **No auth** so the load balancer does not need an API key. Returns HTTP 200 with `{"healthy": true, "node_id": ..., "degraded": false, "drift_pct": 0.0, "reason": ""}` when the node is healthy, or HTTP 503 with `degraded=true` and the most recent drift reason when `CertifyDaemon` has flagged it. Operators point their LB probe at this endpoint and it automatically drains drifted nodes.
 
 ### 18.3 CLI
 
@@ -2008,6 +2317,11 @@ FastAPI application with Prometheus metrics. Key endpoints:
 | `GET` | `/metrics` | Admin | Prometheus text format (Pillar 4 collector + prometheus_client) |
 | `GET` | `/ledger` | Any (tenant-scoped) | Per-batch energy/CO₂/cost savings JSON |
 | `GET` | `/ledger/verify` | Any (tenant-scoped) | Hash chain integrity certificate (HMAC-SHA256 signed) |
+| `GET` | `/ledger/export/csv` | Any (tenant-scoped) | CSV download of ledger entries for `period_hours` |
+| `GET` | `/ledger/export/report.html` | Any (tenant-scoped) | Styled HTML savings report (Section 7.7a) |
+| `GET` | `/ledger/export/report.pdf` | Any (tenant-scoped) | PDF savings report; falls back to HTML when `reportlab` is not installed |
+| `GET` | `/ledger/export/carbon` | Any (tenant-scoped) | Carbon summary: kWh + kg CO₂ for the period, with annual projection |
+| `GET` | `/report/savings` | Any (tenant-scoped) | Structured tenant savings summary (Section 16.4) |
 | `POST` | `/tenants/{id}` | Admin | Create tenant, returns API key |
 | `DELETE` | `/tenants/{id}` | Admin | Revoke tenant API key |
 | `GET` | `/tenants` | Admin | List active tenants |
@@ -2215,6 +2529,13 @@ Regime gate: `seq >= 1024 AND batch×seq <= 4096`. Above 4096 total tokens, cuBL
 | `kernels/tests/test_synthesis_hardening.py` | 4 | 4 PASS (circuit breaker, tolerances) |
 | `kernels/tests/test_drift_hardening.py` | 7 | 7 PASS (drift detector, certify_now) |
 | `observability/tests/test_ledger_hardening.py` | 6 | 6 PASS (disk space, size_bytes) |
+| `tests/test_async_nvme.py` | 16 | 16 PASS (AsyncNVMeManager + PrefetchAccuracyTracker, sync fallback when liburing absent) |
+| `tests/test_integration_gaps.py` | 15 | 15 PASS (cross-layer wiring: geo-routed failover, partial compute skip, tenant stats) |
+| `tests/test_pillar2_enhanced.py` | 25 | 25 PASS (per-tenant GKD, hit-rate window, LCP, tenant isolation hashing) |
+| `tests/test_pillar3_enhanced.py` | 22 | 22 PASS (kernel library load/store/corrupt-handling, custom op spec) |
+| `tests/test_pillar4_enhanced.py` | 21 | 21 PASS (energy_source column + auto-migration, report_exporter HTML/CSV/PDF, carbon endpoint) |
+| `tests/test_pillar5_enhanced.py` | 21 | 21 PASS (GeoRouter sort, GUMMetrics rolling window, fetch_block_with_failover, run_with_prefix) |
+| `tests/test_pillar6_enhanced.py` | 17 | 17 PASS (SLACertificate rolling window, Prometheus emission, new correctness tests) |
 
 All TCP tests use dynamic port assignment via `_get_free_port()` — no port reuse races.
 
@@ -2234,6 +2555,17 @@ Reliability engineering applied across all pillars. No new features, no API chan
 | `MEMOPT_FETCH_RETRIES` | 0 | RemoteBlockClient | Retry count for fetch_block (set 2 in prod) |
 | `MEMOPT_FETCH_RETRY_DELAY_S` | 0.5 | RemoteBlockClient | Delay between retries |
 | `MEMOPT_GOSSIP_FANOUT` | 5 | Federation | Peers per gossip round |
+| `MEMOPT_NVME_POLL_MS` | 1 | AsyncNVMeManager | Poller interval for io_uring completions |
+| `MEMOPT_PREFETCH_WINDOW_S` | 5 | PrefetchAccuracyTracker | Time window for classifying prefetch outcome |
+| `MEMOPT_GKD_WINDOW_SIZE` | 10000 | HitRateWindow | Rolling GKD hit-rate window size |
+| `MEMOPT_GKD_TENANT_ISOLATION` | false | GKDStore | Hash over (tenant_id, tokens) when true |
+| `MEMOPT_GUM_MAX_ATTEMPTS` | 3 | fetch_block_with_failover | Max locality hops per fetch |
+| `MEMOPT_GUM_METRICS_WINDOW` | 1000 | GUMMetrics | Rolling window for per-peer percentiles |
+| `MEMOPT_RACK` / `MEMOPT_POD` / `MEMOPT_REGION` | unknown | GeoRouter | Locality attribution |
+| `MEMOPT_KERNEL_LIBRARY_PATH` | ~/.memopt/kernel_library | KernelLibrary | Cross-deployment kernel store |
+| `MEMOPT_CERT_HISTORY_PATH` | ~/.memopt/cert_history.json | SLACertificate | 30-day cert history file |
+| `MEMOPT_COST_PER_1K_TOKENS` | 0 | SavingsReport | Dollar amount per 1000 tokens (0 → omit $) |
+| `MEMOPT_COMPUTE_COST_RATIO` | 0.7 | SavingsReport | Fraction of token cost attributed to compute |
 | `REDIS_URL` | — | GKD, Federation, BlockDir | Redis for cluster state |
 
 ### 25.2 Health Checks
@@ -2756,6 +3088,50 @@ Honest support matrix with status vocabulary (Implemented / Validated / Stub / P
 - 15 hardware-support tests (`tests/test_hardware_support.py`) — Gaudi / TPU stubs, GPU_SPECS AMD entries + `measured` field contract, `hardware_support.md` content checks, HAL consistency
 
 All run on a CPU-only macOS box without crashing.
+
+---
+
+## 33. Operational Scripts
+
+Small, single-purpose scripts that live outside the Python package. They import `memopt` where useful but are safe to run on any machine the package is installed on.
+
+### 33.1 `scripts/benchmark_kernels.py`
+
+Measures synthesised-kernel speedup vs. the PyTorch reference for the three serving hooks and any registered `CustomOpSpec`. Outputs a table of `{op, reference_ms, synthesised_ms, speedup, status}` where `status ∈ {faster, tied, slower, discarded}`.
+
+```bash
+python scripts/benchmark_kernels.py --op all --seq-len 2048 --batch 8
+# --op ∈ {all, matmul, embedding, attention, custom}
+```
+
+Reports "GPU required" cleanly on a CPU-only host. Never exits non-zero for "slower than reference" — that's a valid outcome (and one we log honestly).
+
+### 33.2 `scripts/benchmark_nvme.py`
+
+Stand-alone NVMe benchmark that drives `AsyncNVMeManager` (Section 4.5a) end-to-end on whatever directory the operator wants to validate as a KV-tier.
+
+```bash
+python scripts/benchmark_nvme.py --dir /var/memopt/nvme --block-size 131072 --blocks 1000
+```
+
+Measures sequential read MB/s, sequential write MB/s, random read IOPS, and async-vs-sync latency (`p50` / `p99` / `max`). Useful as a pre-flight check before deploying memopt on a new NVMe tier.
+
+### 33.3 `scripts/check_rdma.sh`
+
+Readiness probe for cross-node block transfer. Checks, in order: `libibverbs`, IB device state via `ibv_devinfo`, `ucx_info`, `nvidia_peermem` kernel module, the `memopt-transport` binary, and TCP reachability to every peer in `MEMOPT_NODE_HOSTS`.
+
+```
+$ scripts/check_rdma.sh
+[PASS] libibverbs installed
+[PASS] IB port state: ACTIVE
+[WARN] ucx_info not found — falling back to raw ibverbs
+[PASS] nvidia_peermem loaded
+[PASS] memopt-transport binary present
+[PASS] TCP reachability to node-b:18516
+Summary: RDMA ready
+```
+
+Exit code reflects the worst tier: `0 = RDMA ready`, `1 = partial RDMA (some hops fall back to TCP)`, `2 = TCP fallback only`.
 
 ---
 

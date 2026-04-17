@@ -156,6 +156,11 @@ class TierManager:
         s["tiers_available"] = tier_names
         s["gum_enabled"] = (self._remote_client is not None
                             and self._block_directory is not None)
+        try:
+            from memopt.vmm.backends._cuda_backend_py import get_async_nvme_manager
+            s["nvme_async"] = get_async_nvme_manager().stats()
+        except Exception:
+            s["nvme_async"] = {"async_available": False}
         return s
 
     # ── Internal ──────────────────────────────────────────────────────────
@@ -225,7 +230,7 @@ class TierManager:
 
     def _try_gum_fetch(self, sequence_id: str,
                         block_index: int) -> Optional[bytes]:
-        """Try to fetch a block from a remote peer via GUM."""
+        """Try to fetch a block from a remote peer via GUM with geo routing."""
         try:
             content_hash = self._compute_block_hash(
                 sequence_id, block_index)
@@ -244,20 +249,49 @@ class TierManager:
                 "GUM: fetching block %s from peer %s",
                 content_hash[:16], dir_entry.node_id)
 
-            leased = self._remote_client.acquire_lease(
-                content_hash, remote_host)
+            # Use geo-routed failover fetch
             try:
+                from memopt.cluster.remote_block import GeoRouter
+                from memopt.cluster.gum_metrics import get_gum_metrics
+
+                geo_router = GeoRouter(
+                    local_node_id=self._node_id,
+                    local_rack=os.environ.get("MEMOPT_RACK", "unknown"),
+                    local_pod=os.environ.get("MEMOPT_POD", "unknown"),
+                    local_region=os.environ.get("MEMOPT_REGION", "unknown"))
+
+                candidates = [{
+                    "node_id": dir_entry.node_id,
+                    "host": remote_host,
+                    "port": int(os.environ.get("MEMOPT_RBP_PORT", "18516")),
+                    "rack": getattr(dir_entry, "rack", "unknown"),
+                    "pod": getattr(dir_entry, "pod", "unknown"),
+                    "region": getattr(dir_entry, "region", "unknown"),
+                }]
+
+                data = self._remote_client.fetch_block_with_failover(
+                    content_hash=content_hash,
+                    candidates=candidates,
+                    geo_router=geo_router,
+                    metrics=get_gum_metrics(),
+                    max_attempts=int(os.environ.get(
+                        "MEMOPT_GUM_MAX_ATTEMPTS", "3")))
+
+                if data is not None:
+                    logger.info(
+                        "GUM: fetched block %s from %s (%d bytes)",
+                        content_hash[:16], dir_entry.node_id, len(data))
+                return data
+
+            except ImportError:
+                # GeoRouter/GUMMetrics not available — direct fetch fallback
                 data = self._remote_client.fetch_block(
                     content_hash, remote_host)
                 if data is not None:
                     logger.info(
                         "GUM: fetched block %s from %s (%d bytes)",
                         content_hash[:16], dir_entry.node_id, len(data))
-                    return data
-            finally:
-                if leased:
-                    self._remote_client.release_lease(
-                        content_hash, remote_host)
+                return data
 
         except Exception as e:
             logger.debug("GUM fetch failed: %s", e)
@@ -333,11 +367,30 @@ class TierManager:
 
     def _get_node_host(self, node_id: str) -> Optional[str]:
         """
-        Look up the hostname/IP for a node_id.
-        Reads from MEMOPT_NODE_HOSTS environment variable:
-          MEMOPT_NODE_HOSTS="node-a:192.168.1.10,node-b:192.168.1.11"
-        Returns None if node_id is not in the map.
+        Resolve node_id to host string.
+
+        Resolution order:
+          1. NodeDiscovery peers (Redis-backed, dynamic)
+          2. MEMOPT_NODE_HOSTS env var (static fallback)
+        Returns None if node_id not resolvable.
         """
+        # Try discovery first (dynamic peer resolution)
+        try:
+            from memopt.vmm.discovery import NodeDiscovery, NodeCapabilities
+            # Check if any running discovery instance has this peer
+            # Use static peers from env as discovery fallback
+            caps = NodeCapabilities()
+            caps.detect()
+            discovery = NodeDiscovery(caps)
+            for peer in discovery.peers():
+                peer_id = peer.node_id if hasattr(peer, 'node_id') else peer.get("node_id", "")
+                peer_host = peer.host if hasattr(peer, 'host') else peer.get("host", "")
+                if peer_id == node_id and peer_host:
+                    return peer_host
+        except Exception:
+            pass
+
+        # Fall back to static env var
         hosts_env = os.environ.get("MEMOPT_NODE_HOSTS", "")
         if not hosts_env:
             return None
@@ -352,6 +405,34 @@ class TierManager:
 
     @staticmethod
     def _sync_copy(src, dst) -> None:
+        # Use AsyncNVMeManager for NVMe file paths when available
+        if isinstance(src, str) or isinstance(dst, str):
+            try:
+                from memopt.vmm.backends._cuda_backend_py import get_async_nvme_manager
+                mgr = get_async_nvme_manager()
+
+                if isinstance(src, str):
+                    # NVMe → tensor: read via async manager
+                    data = mgr.read_block(src, os.path.getsize(src))
+                    if data is not None:
+                        import torch
+                        if hasattr(dst, 'copy_'):
+                            src_tensor = torch.frombuffer(
+                                bytearray(data), dtype=torch.uint8)
+                            dst.copy_(src_tensor)
+                            return
+                elif isinstance(dst, str):
+                    # tensor → NVMe: write via async manager
+                    if hasattr(src, 'cpu'):
+                        cpu = src.cpu() if src.is_cuda else src
+                        block_data = cpu.numpy().tobytes()
+                    else:
+                        block_data = bytes(src)
+                    if mgr.write_block(dst, block_data):
+                        return
+            except Exception:
+                pass  # fall through to original path
+
         result = backend.async_copy(src, dst)
         if hasattr(backend, "record_event"):
             backend.record_event(result).synchronize()

@@ -92,7 +92,9 @@ def test_certification_has_correctness_tests():
     assert len(cert.correctness_tests) > 0
     for t in cert.correctness_tests:
         assert isinstance(t, TestResult)
-        assert t.name in ("rope", "layer_norm_residual", "scaled_softmax")
+        assert t.name in (
+            "rope", "layer_norm_residual", "scaled_softmax",
+            "matmul", "embedding_lookup", "attention", "layer_norm")
 
 
 def test_certification_has_throughput_tests():

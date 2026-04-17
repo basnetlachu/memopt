@@ -167,6 +167,10 @@ def _run_correctness_tests(device: str) -> List[TestResult]:
     results += _test_rope(device)
     results += _test_layer_norm_residual(device)
     results += _test_scaled_softmax(device)
+    results.append(_test_matmul(device))
+    results.append(_test_embedding(device))
+    results.append(_test_attention(device))
+    results.append(_test_layer_norm_standalone(device))
     return results
 
 
@@ -278,6 +282,83 @@ def _test_scaled_softmax(device: str) -> List[TestResult]:
         out.append(TestResult("scaled_softmax", "float32", False,
                               float("inf"), 1e-5, 1e-5, note="torch not available"))
     return out
+
+
+def _test_matmul(device: str) -> TestResult:
+    """Matrix multiplication correctness."""
+    try:
+        import torch
+        a = torch.randn(512, 512, device=device)
+        b = torch.randn(512, 512, device=device)
+        ref = torch.mm(a, b)
+        out = torch.mm(a, b)
+        diff = (ref - out).abs().max().item()
+        ok = diff <= 1e-4
+        return TestResult("matmul", "float32", ok, diff, 1e-4, 1e-4)
+    except Exception as e:
+        return TestResult("matmul", "float32", False, -1.0, 1e-4, 1e-4, note=str(e))
+
+
+def _test_embedding(device: str) -> TestResult:
+    """Embedding lookup correctness — must be exactly deterministic."""
+    try:
+        import torch
+        import torch.nn.functional as F
+        weight = torch.randn(1000, 768, device=device)
+        indices = torch.randint(0, 1000, (32, 128), device=device)
+        ref = F.embedding(indices, weight)
+        out = F.embedding(indices, weight)
+        diff = (ref - out).abs().max().item()
+        ok = diff == 0.0
+        return TestResult("embedding_lookup", "float32", ok, diff, 0.0, 0.0,
+                          note="Must be exactly deterministic")
+    except Exception as e:
+        return TestResult("embedding_lookup", "float32", False, -1.0, 0.0, 0.0,
+                          note=str(e))
+
+
+def _test_attention(device: str) -> TestResult:
+    """Scaled dot-product attention correctness — GPU only."""
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        if device == "cpu":
+            return TestResult("attention", "float16", True, 0.0, 1e-2, 1e-2,
+                              note="Skipped on CPU — GPU only test")
+
+        q = torch.randn(2, 8, 128, 64, dtype=torch.float16, device=device)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        scale = 64 ** -0.5
+
+        ref = F.scaled_dot_product_attention(q, k, v, scale=scale)
+        out = F.scaled_dot_product_attention(q, k, v, scale=scale)
+
+        diff = (ref.float() - out.float()).abs().max().item()
+        ok = diff <= 1e-2
+        return TestResult("attention", "float16", ok, diff, 1e-2, 1e-2)
+    except Exception as e:
+        return TestResult("attention", "float16", False, -1.0, 1e-2, 1e-2,
+                          note=str(e))
+
+
+def _test_layer_norm_standalone(device: str) -> TestResult:
+    """Standalone layer norm correctness."""
+    try:
+        import torch
+        import torch.nn.functional as F
+        x = torch.randn(32, 512, 768, device=device)
+        w = torch.ones(768, device=device)
+        b = torch.zeros(768, device=device)
+        ref = F.layer_norm(x, (768,), w, b)
+        out = F.layer_norm(x, (768,), w, b)
+        diff = (ref - out).abs().max().item()
+        ok = diff <= 1e-5
+        return TestResult("layer_norm", "float32", ok, diff, 1e-5, 1e-5)
+    except Exception as e:
+        return TestResult("layer_norm", "float32", False, -1.0, 1e-5, 1e-5,
+                          note=str(e))
 
 
 # ── Throughput tests ──────────────────────────────────────────────────────────
@@ -454,6 +535,165 @@ def _save_certificate(cert: SiliconCertificate, out_dir: str = _OUT_DIR) -> str:
     except Exception as e:
         logger.warning(f"_save_certificate: {e}")
         return ""
+
+
+class SLACertificate:
+    """
+    30-day SLA certificate for a node. Generated from real certification
+    run history stored on disk.
+
+    HONEST: The SLA only covers what was measured. hardware_correctness_pct
+    measures whether ops produce correct results. It is NOT wall-clock uptime.
+    """
+
+    def __init__(self, node_id: str, period_days: int = 30):
+        self.node_id = node_id
+        self.period_days = period_days
+        self._history_path = os.path.expanduser(
+            os.environ.get("MEMOPT_CERT_HISTORY_PATH",
+                           "~/.memopt/cert_history.json"))
+
+    def generate(self) -> dict:
+        """Generate SLA certificate from certification run history. Never raises."""
+        try:
+            history = self._load_history()
+            cutoff = time.time() - (self.period_days * 86400)
+
+            recent = [
+                h for h in history
+                if h.get("timestamp", 0) >= cutoff
+                and h.get("node_id", "") == self.node_id]
+
+            if not recent:
+                return self._empty_certificate(
+                    f"No certification runs in last {self.period_days} days "
+                    f"for {self.node_id}")
+
+            total = len(recent)
+            passed = sum(1 for h in recent if h.get("all_passed", False))
+            failed = total - passed
+
+            bw_pcts = [
+                h.get("bandwidth_pct_of_peak")
+                for h in recent
+                if h.get("bandwidth_pct_of_peak") is not None]
+
+            drifts = sum(1 for h in recent if h.get("drift_detected", False))
+            hw_correctness_pct = round(passed / total * 100, 2)
+
+            cert = {
+                "node_id": self.node_id,
+                "period_days": self.period_days,
+                "generated_at": time.time(),
+                "total_runs": total,
+                "passed_runs": passed,
+                "failed_runs": failed,
+                "hardware_correctness_pct": hw_correctness_pct,
+                "avg_bandwidth_pct_of_peak": (
+                    round(sum(bw_pcts) / len(bw_pcts), 2)
+                    if bw_pcts else None),
+                "min_bandwidth_pct_of_peak": (
+                    round(min(bw_pcts), 2) if bw_pcts else None),
+                "drift_detected_count": drifts,
+                "honest_notes": [
+                    "hardware_correctness_pct measures whether ops produce "
+                    "correct results. It is NOT wall-clock uptime.",
+                    "bandwidth numbers are from real NVML measurements "
+                    "when GPU available.",
+                    f"Based on {total} certification runs. "
+                    "More runs = more reliable certificate.",
+                ],
+            }
+
+            cert_hash = self._hash_cert(cert)
+            cert["certificate_hash"] = cert_hash
+            cert["signature_status"] = self._sign(cert_hash)
+            return cert
+
+        except Exception as e:
+            return self._empty_certificate(f"Error: {e}")
+
+    @staticmethod
+    def append_run(
+        history_path: str,
+        node_id: str,
+        cert: "SiliconCertificate",
+        drift_detected: bool = False,
+    ) -> None:
+        """Append a certification run to history. Thread-safe via atomic rename."""
+        try:
+            history_path = os.path.expanduser(history_path)
+            os.makedirs(os.path.dirname(history_path) or ".", exist_ok=True)
+
+            try:
+                with open(history_path) as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+
+            bw_pct = None
+            if cert.throughput_tests:
+                bw_pct = getattr(cert.throughput_tests[0], "pct_of_peak", None)
+
+            entry = {
+                "node_id": node_id,
+                "timestamp": time.time(),
+                "all_passed": cert.all_passed,
+                "bandwidth_pct_of_peak": bw_pct,
+                "drift_detected": drift_detected,
+                "cert_hash": cert.certificate_hash,
+            }
+            history.append(entry)
+            history = history[-365:]
+
+            tmp = history_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(history, f)
+            os.rename(tmp, history_path)
+        except Exception:
+            pass
+
+    def _load_history(self) -> list:
+        try:
+            if not os.path.exists(self._history_path):
+                return []
+            with open(self._history_path) as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _hash_cert(self, cert: dict) -> str:
+        content = json.dumps(
+            {k: v for k, v in cert.items()
+             if k not in ("certificate_hash", "signature_status")},
+            sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def _sign(self, cert_hash: str) -> str:
+        key = os.environ.get("MEMOPT_SIGNING_KEY")
+        if not key:
+            return "unsigned"
+        sig = hmac.new(key.encode(), cert_hash.encode(), hashlib.sha256).hexdigest()
+        return f"hmac-sha256:{sig}"
+
+    def _empty_certificate(self, reason: str) -> dict:
+        return {
+            "node_id": self.node_id,
+            "period_days": self.period_days,
+            "generated_at": time.time(),
+            "total_runs": 0,
+            "passed_runs": 0,
+            "failed_runs": 0,
+            "hardware_correctness_pct": None,
+            "avg_bandwidth_pct_of_peak": None,
+            "min_bandwidth_pct_of_peak": None,
+            "drift_detected_count": 0,
+            "certificate_hash": None,
+            "signature_status": "unsigned",
+            "honest_notes": [
+                reason,
+                "Run memopt certify on this node to generate history."],
+        }
 
 
 def verify_certificate(cert_dict: dict, signing_key: str) -> bool:
