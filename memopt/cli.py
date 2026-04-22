@@ -235,7 +235,14 @@ def _agent_build_sample(model, shape, device):
 
 def cmd_certificates(args):
     """List or inspect optimization certificates."""
-    from memopt.certificates import CertificateStore
+    try:
+        from memopt.certificates import CertificateStore
+    except ImportError:
+        print(
+            "The 'certificates' feature is not available in this build "
+            "(memopt.certificates module is not installed).",
+        )
+        return 1
     import time as _time
 
     store = CertificateStore()

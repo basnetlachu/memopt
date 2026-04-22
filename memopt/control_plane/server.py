@@ -1182,7 +1182,13 @@ def list_certificates(
 
     Each certificate is a signed audit record for a committed speedup.
     """
-    from memopt.certificates import CertificateStore
+    try:
+        from memopt.certificates import CertificateStore
+    except ImportError:
+        raise HTTPException(
+            status_code=501,
+            detail="Certificates feature not installed on this node.",
+        )
     store = CertificateStore()
     certs = store.list_certs(
         limit=limit,

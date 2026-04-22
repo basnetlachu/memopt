@@ -143,7 +143,14 @@ def cmd_migrate(args) -> int:
     Returns exit code (0 = success/no-op, 1 = error).
     """
     from .scanner import GPUScanner
-    from memopt.migration.engine import AutoMigrationEngine
+    try:
+        from memopt.migration.engine import AutoMigrationEngine
+    except ImportError:
+        print(
+            "The 'migrate' feature is not available in this build "
+            "(memopt.migration module is not installed).",
+        )
+        return 1
     from memopt.profiler.roofline import RooflineProfiler
 
     pid = args.pid

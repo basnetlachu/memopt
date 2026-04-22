@@ -7,9 +7,21 @@ All torch ops run on CPU. Async copy is done via a background thread.
 from __future__ import annotations
 import logging
 import os
+import re
 import tempfile
 import threading
 from typing import TYPE_CHECKING, Union
+
+# Tenant and sequence identifiers are used to build filesystem paths. Restrict
+# them to an ASCII whitelist so there is no way a crafted value (e.g. "../",
+# "./..", "foo\x00bar", "a/b") can traverse out of the tenant directory.
+_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+def _sanitize_id(kind: str, value: str) -> str:
+    if not isinstance(value, str) or not _ID_RE.match(value):
+        raise ValueError(f"invalid {kind}: must match [A-Za-z0-9_-]{{1,128}}")
+    return value
 
 if TYPE_CHECKING:
     import torch  # only for type hints; not imported at runtime
@@ -33,10 +45,10 @@ def _nvme_block_path(nvme_dir: str, tenant_id: str, sequence_id: str, block_inde
     share a path prefix, preventing path-traversal or accidental cross-
     tenant reads even if sequence_id values collide across tenants.
     """
-    safe_tenant = tenant_id.replace("/", "_").replace("..", "_")
+    safe_tenant = _sanitize_id("tenant_id", tenant_id)
+    safe_seq    = _sanitize_id("sequence_id", sequence_id)
     tenant_dir  = os.path.join(nvme_dir, safe_tenant)
     os.makedirs(tenant_dir, exist_ok=True)
-    safe_seq = sequence_id.replace("/", "_").replace("..", "_")
     return os.path.join(tenant_dir, f"{safe_seq}_{block_index}.vmm_block")
 
 

@@ -63,6 +63,11 @@ Thumbs.db
 # API keys
 .test_api_key
 
+# Generated test / audit artifacts
+benchmark.txt
+wiring_audit_result.json
+*.audit.json
+
 # Model cache
 models/
 

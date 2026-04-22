@@ -24,6 +24,21 @@
 namespace memopt {
 namespace cuda_backend {
 
+#ifdef MEMOPT_CUDA_AVAILABLE
+// These functions are declared noexcept and return void, so CUDA failures
+// cannot be propagated to the caller. Log to stderr so silent data
+// corruption is at least visible in logs.
+#define MEMOPT_CUDA_LOG(expr)                                               \
+    do {                                                                    \
+        cudaError_t _e = (expr);                                            \
+        if (_e != cudaSuccess) {                                            \
+            std::fprintf(stderr,                                            \
+                "memopt gds: %s failed: %s\n",                              \
+                #expr, cudaGetErrorString(_e));                             \
+        }                                                                   \
+    } while (0)
+#endif
+
 // ═══════════════════════════════════════════════════════════════════════════
 // gds_is_available
 // ═══════════════════════════════════════════════════════════════════════════
@@ -88,7 +103,7 @@ void gds_read_async(const std::string& path,
         // Must synchronize before closing the file handle —
         // cuFileReadAsync uses the fd internally via DMA.
         if (stream) {
-            cudaStreamSynchronize(stream);
+            MEMOPT_CUDA_LOG(cudaStreamSynchronize(stream));
         }
 #else
         // cuFileReadAsync not available — synchronous fallback.
@@ -131,10 +146,12 @@ fallback:
     }
 
     if (stream) {
-        cudaMemcpyAsync(gpu_ptr, mapped, size,
-                        cudaMemcpyHostToDevice, stream);
+        MEMOPT_CUDA_LOG(cudaMemcpyAsync(gpu_ptr, mapped, size,
+                        cudaMemcpyHostToDevice, stream));
+        // mmap is about to be unmapped; ensure the DMA has completed first.
+        MEMOPT_CUDA_LOG(cudaStreamSynchronize(stream));
     } else {
-        cudaMemcpy(gpu_ptr, mapped, size, cudaMemcpyHostToDevice);
+        MEMOPT_CUDA_LOG(cudaMemcpy(gpu_ptr, mapped, size, cudaMemcpyHostToDevice));
     }
 
     ::munmap(mapped, size);
@@ -180,7 +197,7 @@ void gds_write_async(const std::string& path,
             goto write_fallback;
         }
         if (stream) {
-            cudaStreamSynchronize(stream);
+            MEMOPT_CUDA_LOG(cudaStreamSynchronize(stream));
         }
 #else
         static std::once_flag sync_warn_w;
@@ -209,11 +226,11 @@ write_fallback:
     if (!cpu_buf) return;
 
     if (stream) {
-        cudaMemcpyAsync(cpu_buf, gpu_ptr, size,
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
+        MEMOPT_CUDA_LOG(cudaMemcpyAsync(cpu_buf, gpu_ptr, size,
+                        cudaMemcpyDeviceToHost, stream));
+        MEMOPT_CUDA_LOG(cudaStreamSynchronize(stream));
     } else {
-        cudaMemcpy(cpu_buf, gpu_ptr, size, cudaMemcpyDeviceToHost);
+        MEMOPT_CUDA_LOG(cudaMemcpy(cpu_buf, gpu_ptr, size, cudaMemcpyDeviceToHost));
     }
 
     write_block_atomic(path, cpu_buf, size);

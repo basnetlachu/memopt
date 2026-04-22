@@ -331,6 +331,46 @@ import os as _os
 
 _ALLOW_UNSAFE_LOAD: bool = _os.environ.get("MEMOPT_ALLOW_UNSAFE_LOAD") == "1"
 
+_MODEL_ROOT_RAW: Optional[str] = _os.environ.get("MEMOPT_MODEL_ROOT")
+_MODEL_ROOT: Optional[Path] = (
+    Path(_MODEL_ROOT_RAW).resolve() if _MODEL_ROOT_RAW else None
+)
+
+try:
+    from memopt.phase3 import (
+        select_optimizations as _phase3_select,
+        apply_universal_plan as _phase3_apply,
+    )
+    _PHASE3_AVAILABLE = True
+except ImportError as _phase3_err:
+    _PHASE3_AVAILABLE = False
+    _PHASE3_IMPORT_ERROR = str(_phase3_err)
+
+
+def _validate_model_path(raw: str) -> Path:
+    """
+    Canonicalise and authorise a client-supplied model path.
+
+    Raises HTTPException(400/404) on any violation so error messages do not
+    leak filesystem layout. If MEMOPT_MODEL_ROOT is set, the resolved path
+    must live under that directory (symlinks resolved); otherwise any
+    resolvable regular file on disk is accepted.
+    """
+    if not raw or "\x00" in raw:
+        raise HTTPException(status_code=400, detail="Invalid model_path")
+    try:
+        resolved = Path(raw).resolve(strict=True)
+    except (FileNotFoundError, RuntimeError, OSError):
+        raise HTTPException(status_code=404, detail="Model not found")
+    if not resolved.is_file():
+        raise HTTPException(status_code=400, detail="model_path is not a regular file")
+    if _MODEL_ROOT is not None:
+        try:
+            resolved.relative_to(_MODEL_ROOT)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Model not found")
+    return resolved
+
 # Pillar 4 — observability
 try:
     from memopt.observability import MetricsCollector, OptimizationLedger
@@ -446,7 +486,8 @@ def run_optimization(job_id: str) -> None:
     All exceptions are caught so the server never crashes.
     """
     import torch
-    from memopt.phase3 import select_optimizations, apply_universal_plan
+    select_optimizations = _phase3_select
+    apply_universal_plan = _phase3_apply
     from memopt.profiler.power_sampler import PowerSampler
 
     job = job_store[job_id]
@@ -720,6 +761,18 @@ if _ALLOW_UNSAFE_LOAD:
         "MEMOPT_ALLOW_UNSAFE_LOAD=1 is set — torch.load will deserialize arbitrary "
         "pickle payloads.  Only load model files you trust."
     )
+if _MODEL_ROOT is None:
+    log.warning(
+        "MEMOPT_MODEL_ROOT is not set — any resolvable file on disk may be loaded via "
+        "POST /optimize. Set MEMOPT_MODEL_ROOT=/path/to/models to restrict."
+    )
+else:
+    log.info("MEMOPT_MODEL_ROOT=%s (model_path must resolve under this root)", _MODEL_ROOT)
+if not _PHASE3_AVAILABLE:
+    log.warning(
+        "memopt.phase3 unavailable (%s) — POST /optimize will return 501.",
+        _PHASE3_IMPORT_ERROR,
+    )
 
 
 def verify_api_key(key: str = Security(_api_key_header)) -> str:
@@ -761,14 +814,18 @@ async def optimize(request: OptimizeRequest, _: str = Security(verify_api_key)):
     - At most 2 jobs run concurrently; additional submissions queue behind them.
     - Only target=inference is supported.
     """
-    if not Path(request.model_path).exists():
-        raise HTTPException(404, f"Model not found: {request.model_path}")
+    if not _PHASE3_AVAILABLE:
+        raise HTTPException(
+            status_code=501,
+            detail="Optimization pipeline unavailable: memopt.phase3 is not installed on this server.",
+        )
+    safe_path = _validate_model_path(request.model_path)
 
     job_id = str(uuid.uuid4())
     job = OptimizationJob(
         job_id      = job_id,
         status      = JobStatus.QUEUED,
-        model_path  = request.model_path,
+        model_path  = str(safe_path),
         input_shape = request.input_shape,
         created_at  = time.time(),
     )
@@ -777,7 +834,7 @@ async def optimize(request: OptimizeRequest, _: str = Security(verify_api_key)):
 
     log.info(
         "Job %s QUEUED — model=%s shape=%s",
-        job_id, request.model_path, request.input_shape,
+        job_id, safe_path, request.input_shape,
     )
     return {"job_id": job_id, "status": "queued", "estimated_minutes": 5}
 

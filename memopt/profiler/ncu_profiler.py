@@ -228,7 +228,7 @@ class NCUProfiler:
                 )
                 if result.returncode == 0:
                     logger.info(f"NCU version: {result.stdout.strip()}")
-            except:
+            except (OSError, subprocess.SubprocessError):
                 pass
         else:
             logger.warning("Nsight Compute (ncu) not found - cannot collect real hardware counters")
@@ -350,11 +350,11 @@ class NCUProfiler:
             # Cleanup
             try:
                 os.unlink(script_path)
-            except:
+            except OSError:
                 pass
             try:
                 os.unlink(output_path)
-            except:
+            except OSError:
                 pass
 
     def _parse_ncu_csv(self, csv_path: str, region_name: str) -> List[NCUCounters]:
