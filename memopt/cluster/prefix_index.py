@@ -92,6 +92,7 @@ def lookup_longest_prefix(
     token_ids: List[int],
     seq_len:   int,
     backend,
+    tenant_id: str = "",
 ) -> Optional[Tuple[str, str, int]]:
     """
     Find the longest cached prefix of token_ids.
@@ -109,7 +110,7 @@ def lookup_longest_prefix(
         return None
 
     for length in range(max_prefix, BLOCK_SIZE - 1, -BLOCK_SIZE):
-        key = prefix_key(token_ids, length)
+        key = prefix_key(token_ids, length, tenant_id)
         try:
             raw = backend.get(key)
             if raw is None:

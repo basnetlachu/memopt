@@ -62,37 +62,8 @@ static DaemonConfig parse_args(int argc, char* argv[]) {
     return cfg;
 }
 
-// Declared in daemon.h — also called directly from tests
-void apply_env_overrides(DaemonConfig& cfg) noexcept {
-    if (const char* env = std::getenv("MEMOPT_NODE_ID")) {
-        if (cfg.node_id.empty()) cfg.node_id = env;
-    }
-    if (const char* env = std::getenv("MEMOPT_RBP_PORT")) {
-        cfg.tcp_port = static_cast<uint16_t>(std::atoi(env));
-    }
-    if (const char* env = std::getenv("MEMOPT_TRANSPORT")) {
-        if (std::strcmp(env, "tcp") == 0) cfg.prefer_rdma = false;
-    }
-    if (const char* env = std::getenv("MEMOPT_QP_TIMEOUT_S")) {
-        cfg.qp_exchange_timeout_s = std::atoi(env);
-    }
-    if (const char* env = std::getenv("MEMOPT_QP_RETRIES")) {
-        cfg.qp_exchange_retries = std::atoi(env);
-    }
-    if (const char* env = std::getenv("MEMOPT_QP_DEBUG")) {
-        cfg.log_qp_transitions = (std::atoi(env) != 0);
-    }
-
-    // Default node_id to hostname
-    if (cfg.node_id.empty()) {
-        char hostname[256];
-        if (::gethostname(hostname, sizeof(hostname)) == 0) {
-            cfg.node_id = hostname;
-        } else {
-            cfg.node_id = "unknown";
-        }
-    }
-}
+// apply_env_overrides() is defined in transport/env_overrides.cpp so that
+// both the sidecar daemon and the test binary can link to a single definition.
 
 int main(int argc, char* argv[]) {
     DaemonConfig cfg = parse_args(argc, argv);

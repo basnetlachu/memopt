@@ -107,6 +107,13 @@ class HAL:
     def gpus(self) -> List[GPUInfo]:
         return list(self._gpus)
 
+    @property
+    def tier_names(self) -> List[str]:
+        """Memory tier names for the active backend.
+        Mirrors the module-level `tier_names` so callers can read it
+        through any HAL instance without importing the module symbol."""
+        return list(tier_names)
+
     def is_gpu_available(self) -> bool:
         return self._backend in (
             HardwareBackend.NVIDIA_CUDA,
@@ -363,14 +370,30 @@ def _detect_backend():
         import torch
         if torch.cuda.is_available():
             if getattr(torch.version, "hip", None) is not None:
-                from .backends.rocm_backend import ROCmBackend
-                b = ROCmBackend()
-                logger.info("VMM HAL: ROCm backend (AMD GPU detected)")
+                # AMD ROCm hardware detected. The user-facing ROCmBackend
+                # at backends/rocm_backend.py is currently a stub that
+                # raises NotImplementedError on construction. Don't let
+                # that crash module import — log a warning and fall back
+                # to the unified (CPU-capable) backend so the rest of the
+                # system stays usable.
+                try:
+                    from .backends.rocm_backend import ROCmBackend
+                    b = ROCmBackend()
+                    logger.info("VMM HAL: ROCm backend (AMD GPU detected)")
+                    return b
+                except NotImplementedError:
+                    logger.warning(
+                        "VMM HAL: AMD ROCm hardware detected but the "
+                        "ROCm backend is a stub. Falling back to "
+                        "unified/CPU mode. See "
+                        "memopt/vmm/backends/rocm_backend.py for "
+                        "contribution instructions."
+                    )
+            else:
+                from .backends.cuda_backend import CUDABackend
+                b = CUDABackend()
+                logger.info("VMM HAL: CUDA backend (NVIDIA GPU detected)")
                 return b
-            from .backends.cuda_backend import CUDABackend
-            b = CUDABackend()
-            logger.info("VMM HAL: CUDA backend (NVIDIA GPU detected)")
-            return b
     except ImportError:
         pass
 

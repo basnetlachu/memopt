@@ -13,9 +13,11 @@ The distinction is always shown. Never claims measured when estimated.
 """
 import csv
 import io
+import json
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -313,3 +315,170 @@ def generate_report(
         return SavingsReport(
             tenant_id=tenant_id, period_label="unknown",
             totals={}, source_breakdown={}, config={})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ComplianceReport — EU AI Act Article 13/17 conformity documentation
+# ═══════════════════════════════════════════════════════════════════
+# Distinct from SavingsReport: this packages a hardware certificate
+# alongside the energy ledger summary in a form a compliance auditor
+# can ingest (HTML / CSV / JSON), with explicit measurement-source
+# legend so estimated values are never claimed as measured.
+class ComplianceReport:
+    """
+    Generates compliance reports from ledger data and silicon
+    certificates. Suitable for EU AI Act article 13/17 documentation.
+    """
+
+    def __init__(
+        self,
+        tenant_id: str,
+        ledger=None,
+        certificate: Optional[dict] = None,
+    ):
+        self.tenant_id    = tenant_id
+        self.ledger       = ledger
+        self.certificate  = certificate
+        self.generated_at = datetime.utcnow().isoformat() + "Z"
+
+    def _get_ledger_summary(self) -> dict:
+        if not self.ledger:
+            return {}
+        try:
+            return self.ledger.totals(tenant_id=self.tenant_id)
+        except Exception:
+            return {}
+
+    def to_dict(self) -> dict:
+        summary = self._get_ledger_summary()
+        return {
+            "report_type":          "AI_Compliance_Report",
+            "version":              "1.0",
+            "generated_at":         self.generated_at,
+            "tenant_id":            self.tenant_id,
+            "energy_summary":       summary,
+            "hardware_certificate": self.certificate or {},
+            "compliance_notes": {
+                "eu_ai_act": (
+                    "Energy measurements use NVML where available. "
+                    "Carbon estimates based on IEA 2024 grid intensity data."
+                ),
+                "energy_source_legend": {
+                    "nvml_measured": "Direct GPU power sensor",
+                    "estimated":     "Model-based estimate",
+                    "unmeasured":    "No measurement available",
+                },
+            },
+        }
+
+    def to_html(self) -> str:
+        data    = self.to_dict()
+        summary = data.get("energy_summary", {}) or {}
+        cert    = data.get("hardware_certificate", {}) or {}
+
+        cert_status = cert.get(
+            "certificate_status", cert.get("status", "NOT AVAILABLE"))
+        raw_hash = cert.get(
+            "certificate_hash", cert.get("cert_hash", "")) or ""
+        cert_hash = (raw_hash[:16] + "...") if raw_hash else "N/A"
+        signature = cert.get(
+            "signature_status", cert.get("signature", "unsigned"))
+
+        tokens     = summary.get("tokens_total") or summary.get("total_tokens") or "N/A"
+        energy_kwh = summary.get("energy_saved_kwh", "N/A")
+        co2_kg     = summary.get("co2_saved_kg", "N/A")
+        cost_usd   = summary.get("cost_saved_usd", "N/A")
+        es_break   = summary.get("energy_source_breakdown", "N/A")
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>memopt Compliance Report</title>
+<style>
+  body {{ font-family: Arial, sans-serif; max-width: 900px;
+         margin: 40px auto; color: #333; }}
+  h1 {{ color: #1a1a2e; }}
+  h2 {{ color: #16213e; border-bottom: 2px solid #e94560; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+  th, td {{ padding: 10px; text-align: left; border: 1px solid #ddd; }}
+  th {{ background: #f4f4f4; }}
+  .status-ok {{ color: green; font-weight: bold; }}
+  .hash {{ font-family: monospace; font-size: 12px; color: #666; }}
+  .footer {{ color: #999; font-size: 11px; margin-top: 40px; }}
+</style>
+</head>
+<body>
+<h1>memopt AI Compliance Report</h1>
+<p>Generated: {data['generated_at']}</p>
+<p>Tenant: <strong>{data['tenant_id']}</strong></p>
+
+<h2>Hardware Certification</h2>
+<table>
+  <tr><th>Status</th><td class="status-ok">{cert_status}</td></tr>
+  <tr><th>Certificate Hash</th><td class="hash">{cert_hash}</td></tr>
+  <tr><th>Signature</th><td>{signature}</td></tr>
+</table>
+
+<h2>Energy Summary</h2>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Total Tokens</td><td>{tokens}</td></tr>
+  <tr><td>Energy Saved (kWh)</td><td>{energy_kwh}</td></tr>
+  <tr><td>CO2 Saved (kg)</td><td>{co2_kg}</td></tr>
+  <tr><td>Cost Saved (USD)</td><td>{cost_usd}</td></tr>
+  <tr><td>Energy Source</td><td>{es_break}</td></tr>
+</table>
+
+<h2>Compliance Notes</h2>
+<p>{data['compliance_notes']['eu_ai_act']}</p>
+
+<div class="footer">
+<p>This report was generated by memopt — GPU Memory Intelligence
+   Layer by Sophisticates.</p>
+<p>Built for EU AI Act Article 13/17 conformity documentation.</p>
+</div>
+</body>
+</html>"""
+        return html
+
+    def to_csv(self) -> str:
+        data    = self.to_dict()
+        summary = data.get("energy_summary", {}) or {}
+        cert    = data.get("hardware_certificate", {}) or {}
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow(["Field", "Value", "Unit", "Source"])
+        writer.writerow(
+            ["generated_at", data["generated_at"], "", "system"])
+        writer.writerow(
+            ["tenant_id", data["tenant_id"], "", "system"])
+        for k, v in summary.items():
+            writer.writerow([k, v, "", "ledger"])
+        for k, v in cert.items():
+            if k == "ops_detail":
+                continue
+            writer.writerow([f"cert_{k}", v, "", "silicon_cert"])
+        return output.getvalue()
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+
+def generate_compliance_report(
+    tenant_id: str,
+    ledger=None,
+    certificate: Optional[dict] = None,
+    output_format: str = "html",
+) -> str:
+    """One-call compliance report generator. Returns string in
+    the requested format (html / csv / json)."""
+    report = ComplianceReport(
+        tenant_id=tenant_id, ledger=ledger, certificate=certificate)
+    if output_format == "html":
+        return report.to_html()
+    if output_format == "csv":
+        return report.to_csv()
+    return report.to_json()

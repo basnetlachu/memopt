@@ -57,6 +57,8 @@ if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(MEMOPT_HAS_CUDA TRUE)
+    find_package(CUDAToolkit REQUIRED)
+    include_directories(${CUDAToolkit_INCLUDE_DIRS})
     message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER_VERSION}")
 
     # Detect SM targets from environment or auto-detect
@@ -143,11 +145,15 @@ endif()
 target_include_directories(_memopt_paged PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/paged
 )
+if(MEMOPT_HAS_CUDA)
+    target_include_directories(_memopt_paged PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
 target_compile_features(_memopt_paged PRIVATE cxx_std_17)
 
 # Enable 16-byte CAS (cmpxchg16b) for lock-free block pool on x86-64
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(_memopt_paged PRIVATE -mcx16)
+    target_link_libraries(_memopt_paged PRIVATE atomic)
 endif()
 
 install(TARGETS _memopt_paged
@@ -179,6 +185,9 @@ pybind11_add_module(_memopt_cuda
 target_include_directories(_memopt_cuda PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/cuda_backend
 )
+if(MEMOPT_HAS_CUDA)
+    target_include_directories(_memopt_cuda PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
 target_compile_features(_memopt_cuda PRIVATE cxx_std_17)
 
 if(MEMOPT_HAS_CUDA)
@@ -269,6 +278,7 @@ target_include_directories(memopt-transport PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/transport
 )
 target_compile_features(memopt-transport PRIVATE cxx_std_17)
+target_sources(memopt-transport PRIVATE transport/env_overrides.cpp)
 target_link_libraries(memopt-transport PRIVATE pthread)
 
 if(MEMOPT_RDMA_AVAILABLE)
@@ -376,6 +386,7 @@ if(MEMOPT_ENABLE_TESTS)
     target_compile_features(test_block_pool PRIVATE cxx_std_17)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_compile_options(test_block_pool PRIVATE -mcx16)
+        target_link_libraries(test_block_pool PRIVATE atomic)
     endif()
     add_test(NAME test_block_pool COMMAND test_block_pool)
 
@@ -396,6 +407,7 @@ if(MEMOPT_ENABLE_TESTS)
     target_compile_features(test_cuda_backend PRIVATE cxx_std_17)
     if(MEMOPT_HAS_CUDA)
         target_compile_definitions(test_cuda_backend PRIVATE MEMOPT_CUDA_AVAILABLE)
+        target_link_libraries(test_cuda_backend PRIVATE CUDA::cudart)
     endif()
     if(MEMOPT_GDS_AVAILABLE)
         target_compile_definitions(test_cuda_backend PRIVATE MEMOPT_GDS_AVAILABLE)
@@ -410,6 +422,7 @@ if(MEMOPT_ENABLE_TESTS)
         transport/rdma_engine.cpp
         transport/tcp_fallback.cpp
         transport/daemon.cpp
+        transport/env_overrides.cpp
     )
     target_include_directories(test_transport PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/transport

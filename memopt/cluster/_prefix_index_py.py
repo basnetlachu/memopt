@@ -27,9 +27,15 @@ logger = logging.getLogger(__name__)
 BLOCK_SIZE = 128   # tokens — matches VMM block size
 
 
-def prefix_key(token_ids: List[int], length: int) -> str:
-    """Backend key for a prefix of `length` tokens."""
+def prefix_key(token_ids: List[int], length: int,
+               tenant_id: str = "") -> str:
+    """Backend key for a prefix of `length` tokens.
+    tenant_id namespaces the key to prevent cross-tenant LCP leakage
+    when the GKDStore has isolation enabled. Default "" preserves the
+    legacy global-prefix behavior used by chatbot dedup."""
     h = compute_hash(token_ids[:length], length)
+    if tenant_id:
+        return f"pfx:{tenant_id}:{h}:{length}"
     return f"pfx:{h}:{length}"
 
 
@@ -39,6 +45,7 @@ def register_prefixes(
     block_ref: str,
     node_id:   str,
     backend,
+    tenant_id: str = "",
 ) -> int:
     """
     Register block-aligned prefix entries in the backend.
@@ -50,7 +57,7 @@ def register_prefixes(
     """
     registered = 0
     for length in range(BLOCK_SIZE, seq_len, BLOCK_SIZE):
-        key = prefix_key(token_ids, length)
+        key = prefix_key(token_ids, length, tenant_id)
         entry = json.dumps({
             "block_ref":   block_ref,
             "node_id":     node_id,
@@ -71,6 +78,7 @@ def lookup_longest_prefix(
     token_ids: List[int],
     seq_len:   int,
     backend,
+    tenant_id: str = "",
 ) -> Optional[Tuple[str, str, int]]:
     """
     Find the longest cached prefix of token_ids.
@@ -90,7 +98,7 @@ def lookup_longest_prefix(
         return None
 
     for length in range(max_prefix, BLOCK_SIZE - 1, -BLOCK_SIZE):
-        key = prefix_key(token_ids, length)
+        key = prefix_key(token_ids, length, tenant_id)
         try:
             raw = backend.get(key)
             if raw is None:

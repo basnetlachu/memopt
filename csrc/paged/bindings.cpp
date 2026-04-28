@@ -282,10 +282,10 @@ public:
             int32_t tokens = std::min(block_size_, remaining);
             py::object k_slice = k_blocks_.attr("__getitem__")(
                 py::make_tuple(block_id,
-                               py::slice(py::none(), tokens, py::none())));
+                               py::slice(py::none(), py::int_(tokens), py::none())));
             py::object v_slice = v_blocks_.attr("__getitem__")(
                 py::make_tuple(block_id,
-                               py::slice(py::none(), tokens, py::none())));
+                               py::slice(py::none(), py::int_(tokens), py::none())));
             k_parts.append(k_slice);
             v_parts.append(v_slice);
             remaining -= tokens;

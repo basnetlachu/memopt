@@ -517,6 +517,38 @@ def run_certification(node_id: str = "") -> SiliconCertificate:
     return cert
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Class-style facade over run_certification()
+# ─────────────────────────────────────────────────────────────────────
+# The original API was a module-level run_certification() returning a
+# SiliconCertificate dataclass. The CLI and pluggable test paths want a
+# configurable object surface, so this thin wrapper exposes:
+#   CertificationConfig — knobs (warmup, iterations, dtypes)
+#   SiliconCertification(config).run() -> dict
+# Knobs are accepted but currently informational — run_certification()
+# already self-tunes. They exist so callers can plumb config without
+# coupling to internals.
+
+@dataclass
+class CertificationConfig:
+    warmup_iterations: int = 3
+    timed_iterations:  int = 10
+    dtypes:            List[str] = field(default_factory=lambda: ["fp16", "fp32"])
+    node_id:           str = ""
+
+
+class SiliconCertification:
+    def __init__(self, config: Optional[CertificationConfig] = None,
+                 node_id: str = ""):
+        self.config = config or CertificationConfig()
+        self.node_id = node_id or self.config.node_id
+
+    def run(self) -> dict:
+        """Run certification and return the cert as a dict."""
+        cert = run_certification(node_id=self.node_id)
+        return asdict(cert)
+
+
 def _save_certificate(cert: SiliconCertificate, out_dir: str = _OUT_DIR) -> str:
     """
     Persist a SiliconCertificate to <out_dir>/<hash[:16]>.json.
@@ -698,12 +730,42 @@ class SLACertificate:
 
 def verify_certificate(cert_dict: dict, signing_key: str) -> bool:
     """
-    Verify the HMAC-SHA256 signature on a SiliconCertificate dict.
+    Verify the HMAC-SHA256 signature on a certificate dict.
 
-    Returns True if the signature is valid.
-    Returns False if unsigned, missing, or tampered.
+    Supports two formats:
+      - SiliconCertificate: cert_dict["signature"] over a structured
+        payload (version, issued_at, node_id, hw fields, all_passed,
+        correctness_tests, throughput_tests).
+      - SLACertificate:     cert_dict["signature_status"] = "hmac-sha256:{hex}"
+        over sha256(canonical_json(cert_minus_post_sig_fields)).
+
+    Returns True on exact match, False if unsigned, missing, or tampered.
     """
-    if cert_dict.get("signature_status") == "unsigned":
+    sig_status = cert_dict.get("signature_status", "")
+
+    # ── SLACertificate format ───────────────────────────────────────
+    # Detect by "hmac-sha256:" prefix on signature_status. SLACertificate
+    # signs the hex sha256 *string* of the canonical-JSON-minus-exclusions,
+    # not the JSON bytes themselves — must mirror SLACertificate._sign.
+    if isinstance(sig_status, str) and sig_status.startswith("hmac-sha256:"):
+        stored_sig = sig_status[len("hmac-sha256:"):]
+        if not stored_sig:
+            return False
+        content = json.dumps(
+            {k: v for k, v in cert_dict.items()
+             if k not in ("certificate_hash", "signature_status")},
+            sort_keys=True, separators=(",", ":"),
+        )
+        cert_hash = hashlib.sha256(content.encode()).hexdigest()
+        expected = hmac.new(
+            signing_key.encode("utf-8"),
+            cert_hash.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(stored_sig, expected)
+
+    # ── SiliconCertificate format ──────────────────────────────────
+    if sig_status == "unsigned":
         return False
     stored = cert_dict.get("signature")
     if not stored:

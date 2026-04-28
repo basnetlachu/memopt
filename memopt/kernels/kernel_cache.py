@@ -66,41 +66,117 @@ class KernelCache:
         os.makedirs(self._dir, exist_ok=True)
         self._load_from_disk()
 
+    @staticmethod
+    def _meta_key(op_name: str, input_shapes, dtype: str, hardware: str) -> str:
+        """Deterministic SHA-256 from op + shape + dtype + hardware."""
+        payload = json.dumps(
+            {
+                "op":     op_name or "",
+                "shapes": [list(s) for s in (input_shapes or [])],
+                "dtype":  dtype or "",
+                "hw":     hardware or "",
+            },
+            sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
     def put(self, key: str = None, module=None, event=None, *,
             cache_key: str = None, kernel_obj=None,
-            metadata: Optional[dict] = None) -> None:
+            metadata: Optional[dict] = None,
+            op_name: Optional[str] = None,
+            input_shapes=None,
+            dtype: Optional[str] = None,
+            source: Optional[str] = None,
+            hardware: Optional[str] = None) -> None:
         """Store a compiled kernel module and its source.
 
-        Supports two calling conventions:
-          put(key, module, event)           — original (from _synthesise)
-          put(cache_key=..., kernel_obj=..., metadata=...)  — new (feedback loop)
+        Supports three calling conventions:
+          put(key, module, event)
+          put(cache_key=..., kernel_obj=..., metadata=...)
+          put(op_name=..., input_shapes=..., dtype=..., source=...,
+              hardware=...)   — source-only (no compiled module)
         """
+        # ── Source-only / metadata-keyed path (no compiled module yet) ──
+        if op_name is not None and source is not None:
+            key = self._meta_key(op_name, input_shapes, dtype, hardware)
+            entry = CacheEntry(
+                key=key,
+                op_name=op_name,
+                hardware=hardware or "",
+                source=source,
+            )
+            with self._lock:
+                self._memory[key] = (None, entry)
+            self._write_to_disk(
+                entry,
+                metadata={
+                    "op_name":      op_name,
+                    "input_shapes": [list(s) for s in (input_shapes or [])],
+                    "dtype":        dtype,
+                    "hardware":     hardware,
+                    "timestamp":    time.time(),
+                },
+            )
+            return
+
         key    = key or cache_key
         module = module or kernel_obj
 
         if event is not None:
-            source = getattr(module, "__source__", "")
+            source_str = getattr(module, "__source__", "")
             entry  = CacheEntry(
                 key=key,
                 op_name=event.op_name,
                 hardware=event.hardware,
-                source=source,
+                source=source_str,
             )
         else:
-            source = getattr(module, "__source__", "") if module else ""
+            source_str = getattr(module, "__source__", "") if module else ""
             entry  = CacheEntry(
                 key=key,
                 op_name=metadata.get("op_name", "") if metadata else "",
                 hardware=metadata.get("hardware", "") if metadata else "",
-                source=source,
+                source=source_str,
             )
 
         with self._lock:
             self._memory[key] = (module, entry)
         self._write_to_disk(entry, metadata=metadata)
 
-    def get(self, key: str) -> Optional[types.ModuleType]:
-        """Return compiled module, or None if not cached."""
+    def catalog(self) -> list:
+        """Return one descriptor per stored kernel (in-memory entries)."""
+        with self._lock:
+            return [
+                {
+                    "key":         entry.key,
+                    "op_name":     entry.op_name,
+                    "hardware":    entry.hardware,
+                    "source_size": len(entry.source or ""),
+                    "hit_count":   getattr(entry, "hit_count", 0),
+                }
+                for (_, entry) in self._memory.values()
+            ]
+
+    def get(self, key: str = None, *, op_name: Optional[str] = None,
+            input_shapes=None, dtype: Optional[str] = None,
+            hardware: Optional[str] = None):
+        """Return compiled module (key-based) or stored entry dict
+        (metadata-based). None if not cached."""
+        if key is None and op_name is not None:
+            meta_key = self._meta_key(op_name, input_shapes, dtype, hardware)
+            with self._lock:
+                if meta_key in self._memory:
+                    module, entry = self._memory[meta_key]
+                    entry.hit_count += 1
+                    self._hits += 1
+                    return module if module is not None else {
+                        "source":   entry.source,
+                        "op_name":  entry.op_name,
+                        "hardware": entry.hardware,
+                        "key":      entry.key,
+                    }
+                self._misses += 1
+            return None
         with self._lock:
             if key in self._memory:
                 module, entry = self._memory[key]

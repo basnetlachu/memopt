@@ -84,8 +84,9 @@ public:
     /// Whether this instance is valid (mmap succeeded).
     bool is_valid() const noexcept { return shm_ptr_ != nullptr; }
 
-private:
     RingBuffer() = default;
+
+private:
 
     void* shm_ptr_    = nullptr;
     size_t shm_size_  = 0;

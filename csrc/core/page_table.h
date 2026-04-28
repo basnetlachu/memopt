@@ -27,6 +27,10 @@
 #include <unordered_map>
 #include <vector>
 
+// Forward-declared in the global namespace so PageTable can grant friendship
+// to the pybind11 wrapper defined in core/bindings.cpp.
+class PyPageTable;
+
 namespace memopt {
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -202,7 +206,7 @@ public:
 
     // Allow bindings.cpp access to shards_ for handle side-table updates.
     // This is the only consumer — the shard internals are not otherwise public.
-    friend class PyPageTable;
+    friend class ::PyPageTable;
 
 private:
     std::array<Shard, NUM_SHARDS> shards_;

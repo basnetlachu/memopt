@@ -788,9 +788,17 @@ class GKDStore:
         if max_prefix < BLOCK_SIZE:
             return None
 
-        # Build all prefix keys (longest first)
+        # Build all prefix keys (longest first). When tenant isolation is
+        # enabled, namespace prefix keys by tenant — without this, an LCP
+        # hit can match another tenant's registered prefix.
+        lookup_tid = self._current_lookup_tenant
+        prefix_tid = (lookup_tid
+                      if (self._tenant_isolation
+                          and lookup_tid
+                          and lookup_tid != "_default")
+                      else "")
         lengths = list(range(max_prefix, BLOCK_SIZE - 1, -BLOCK_SIZE))
-        keys = [prefix_key(token_ids, l) for l in lengths]
+        keys = [prefix_key(token_ids, l, prefix_tid) for l in lengths]
 
         # Pipelined fetch — one round-trip for all keys
         results = self._backend.pipeline_get(keys)
@@ -868,9 +876,14 @@ class GKDStore:
 
         try:
             from memopt.cluster.prefix_index import register_prefixes
+            prefix_tid = (tenant_id
+                          if (self._tenant_isolation
+                              and tenant_id
+                              and tenant_id != "_default")
+                          else "")
             register_prefixes(
                 token_ids, sequence_length, block_ref, node_id,
-                self._backend)
+                self._backend, tenant_id=prefix_tid)
         except Exception as exc:
             logger.debug("GKD prefix registration failed: %s", exc)
 
@@ -878,6 +891,142 @@ class GKDStore:
         self._pod_register(
             content_hash, sequence_length,
             block_ref, node_id)
+
+    # ── Agentic / workflow-scoped API ────────────────────────────────
+    # The token-based lookup/register above is sized for chatbot traffic
+    # (short TTL, no session). Long-running agents need:
+    #   - keying by an opaque content_hash (caller already has bytes)
+    #   - per-entry TTL (hours/days, not the global default)
+    #   - workflow_id scoping so step 17 of an agent rehydrates step 1's KV
+    # These methods write directly to the backend under a tenant-namespaced
+    # key, bypassing prefix-index/LCP (an agent run wants exact match, not
+    # partial prefix). Same backend, separate keyspace from register().
+
+    def _namespace_hash(self, content_hash: str, tenant_id: str) -> str:
+        """Mix tenant_id into the key so cross-tenant lookups miss."""
+        if not tenant_id:
+            return f"wf:v1:{content_hash}"
+        import hashlib
+        return "wf:v1:" + hashlib.sha256(
+            f"{tenant_id}::{content_hash}".encode()).hexdigest()
+
+    def register_workflow_block(
+        self,
+        content_hash: str,
+        block_ref: str,
+        node_id: str,
+        size_bytes: int,
+        tenant_id: str,
+        workflow_id: str,
+        ttl_seconds: int = 3600,
+    ) -> bool:
+        """
+        Register a KV block scoped to a workflow.
+        TTL defaults to 1 hour. Use 86400 for day-long agents.
+        """
+        now = time.time()
+        key = self._namespace_hash(content_hash, tenant_id)
+        entry = {
+            "content_hash":  content_hash,
+            "block_ref":     block_ref,
+            "node_id":       node_id,
+            "size_bytes":    size_bytes,
+            "tenant_id":     tenant_id,
+            "workflow_id":   workflow_id,
+            "ttl_seconds":   ttl_seconds,
+            "registered_at": now,
+            "expires_at":    now + ttl_seconds if ttl_seconds > 0 else 0.0,
+            "hit_count":     0,
+        }
+        self._backend.set(key, entry, ttl_seconds=ttl_seconds)
+        return True
+
+    def lookup_workflow(
+        self,
+        content_hash: str,
+        tenant_id: str,
+        workflow_id: str,
+    ) -> Optional[GKDHit]:
+        """
+        Workflow-scoped lookup. Returns GKDHit on hit, None on miss.
+        Miss conditions: not found, expired, wrong tenant, wrong workflow.
+        Empty workflow_id on the entry means "shared across workflows".
+        """
+        key = self._namespace_hash(content_hash, tenant_id)
+        raw = self._backend.get(key)
+        if raw is None or not isinstance(raw, dict):
+            return None
+
+        # TTL check — evict on read to keep the local backend bounded
+        # without waiting for the 5-minute sweep.
+        expires_at = raw.get("expires_at", 0.0)
+        if expires_at and time.time() > expires_at:
+            self._backend.delete(key)
+            return None
+
+        stored_wf = raw.get("workflow_id", "")
+        if stored_wf and workflow_id and stored_wf != workflow_id:
+            return None
+
+        self._backend.increment_hit(key)
+        return GKDHit(
+            block_ref  = raw["block_ref"],
+            node_id    = raw["node_id"],
+            size_bytes = raw.get("size_bytes", self._block_size_bytes),
+            hit_count  = raw.get("hit_count", 0) + 1,
+        )
+
+    def evict_expired(self) -> int:
+        """
+        Sweep entries past expires_at. Returns count evicted.
+        No-op for Redis (handled by setex). LocalGKDBackend only.
+        """
+        if not hasattr(self._backend, "_store"):
+            return 0
+        now = time.time()
+        evicted = 0
+        with self._backend._lock:
+            for k in list(self._backend._store.keys()):
+                v = self._backend._store.get(k)
+                if not isinstance(v, dict):
+                    continue
+                exp = v.get("expires_at", 0.0)
+                if exp and now > exp:
+                    del self._backend._store[k]
+                    evicted += 1
+        return evicted
+
+    def workflow_stats(self, workflow_id: str) -> dict:
+        """Stats for blocks tagged with a given workflow_id."""
+        if not hasattr(self._backend, "_store"):
+            return {
+                "workflow_id":     workflow_id,
+                "total_blocks":    0,
+                "active_blocks":   0,
+                "bytes_cached_mb": 0.0,
+                "expired_blocks":  0,
+                "note": "workflow_stats requires LocalGKDBackend",
+            }
+        now = time.time()
+        total = active = bytes_cached = 0
+        with self._backend._lock:
+            for v in self._backend._store.values():
+                if not isinstance(v, dict):
+                    continue
+                if v.get("workflow_id", "") != workflow_id:
+                    continue
+                total += 1
+                bytes_cached += v.get("size_bytes", 0)
+                exp = v.get("expires_at", 0.0)
+                if not exp or now < exp:
+                    active += 1
+        return {
+            "workflow_id":     workflow_id,
+            "total_blocks":    total,
+            "active_blocks":   active,
+            "bytes_cached_mb": round(bytes_cached / 1e6, 2),
+            "expired_blocks":  total - active,
+        }
 
     # ── Pod two-tier lookup ───────────────────────────────────────────
 

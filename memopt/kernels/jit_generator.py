@@ -25,7 +25,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL   = os.environ.get("MEMOPT_LLM_MODEL", "claude-sonnet-4-20250514")
-MAX_TOKENS        = 2048
+MAX_TOKENS        = 6000
 SYNTHESIS_TIMEOUT = 30.0   # seconds — abandon synthesis if API takes longer
 
 # Retry / circuit breaker constants
@@ -370,6 +370,29 @@ class JITGenerator:
                 f"JIT: kernel registered — {event.op_name} "
                 f"hw={event.hardware}"
             )
+
+        # ── Step 7: Save to cross-deployment KernelLibrary ───────────
+        # The library is the network-effect surface: every validated
+        # kernel becomes available to the next deployment with matching
+        # op + hardware. Save AFTER correctness + benchmark gates passed.
+        # Library failure must never break inference — swallow + log.
+        try:
+            from memopt.kernels.kernel_cache import get_kernel_library
+            library = get_kernel_library()
+            library.save(
+                op_name=event.op_name,
+                hardware_hash=event.hardware,
+                source=kernel_source,
+                metadata={
+                    "op_name":      event.op_name,
+                    "input_shapes": str(event.input_shapes),
+                    "hardware":     event.hardware,
+                    "validated":    True,
+                },
+            )
+        except Exception as exc:
+            logger.debug(f"JIT: KernelLibrary.save failed: {exc}")
+
         with self._lock:
             self._total_succeeded += 1
 
@@ -507,21 +530,12 @@ class JITGenerator:
                 )
                 source = response.content[0].text.strip()
 
-                # Strip markdown fences (exact match only)
-                _FENCE_OPENINGS = {"```", "```python", "```triton", "```cuda"}
-                _FENCE_CLOSINGS = {"```"}
-                lines = source.splitlines()
-                if lines and lines[0].strip() in _FENCE_OPENINGS:
-                    lines = lines[1:]
-                    if lines and lines[-1].strip() in _FENCE_CLOSINGS:
-                        lines = lines[:-1]
-                    source = "\n".join(lines).strip()
-
-                if not source.startswith(("import triton", "import torch")):
+                valid, cleaned = self._validate_kernel_source(source)
+                if not valid:
                     logger.warning(
-                        "JIT: API response did not start with import — discarding"
+                        "JIT: API response failed validation (%s) — discarding",
+                        cleaned,
                     )
-                    # Not a retryable error — the model returned something weird
                     with _circuit_lock:
                         _circuit_failures = 0
                     return None
@@ -529,7 +543,7 @@ class JITGenerator:
                 # Success — reset circuit breaker
                 with _circuit_lock:
                     _circuit_failures = 0
-                return source
+                return cleaned
 
             except Exception as e:
                 last_error = e
@@ -564,6 +578,44 @@ class JITGenerator:
                     f"Inference continues on unfused path."
                 )
         return None
+
+    def _validate_kernel_source(self, source: str) -> tuple:
+        """
+        Static validation of a synthesized kernel source string.
+
+        Returns (is_valid, cleaned_source_or_reason).
+          - On success: (True, cleaned_source)
+          - On failure: (False, reason_string)
+
+        Strips markdown fences, verifies the source starts with a triton
+        or torch import, contains @triton.jit, and is parseable Python.
+        Pure string + AST checks — no instance state required, so it can
+        be unit-tested without going through __init__.
+        """
+        import ast
+
+        for fence in ("```python", "```triton", "```cuda", "```"):
+            if source.strip().startswith(fence):
+                source = source.strip()[len(fence):]
+                break
+        for fence in ("```python", "```triton", "```cuda", "```"):
+            if source.rstrip().endswith(fence):
+                source = source.rstrip()[: -len(fence)]
+                break
+        source = source.strip()
+
+        if not source.startswith(("import triton", "import torch")):
+            return False, "missing import"
+
+        if "@triton.jit" not in source:
+            return False, "missing @triton.jit"
+
+        try:
+            ast.parse(source)
+        except SyntaxError as e:
+            return False, f"SyntaxError: {e}"
+
+        return True, source
 
     def _validate(self, compiled, event) -> bool:
         """
