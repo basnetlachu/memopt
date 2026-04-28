@@ -892,15 +892,21 @@ void memopt_torch_free(void* ptr, size_t size, int device,
     }
 
     // Stream-ordering: torch is asking us to free memory that was last
-    // used on `stream`. If we cuMemUnmap immediately, any kernel still
-    // queued on that stream that references this VA will fault. Torch's
-    // native allocator handles this via per-stream events + lazy free.
+    // used on `stream`. If we cuMemUnmap immediately, OR if we recycle
+    // the VA via the freelist, any kernel still queued that references
+    // this VA will fault. Torch's native allocator handles this via
+    // per-stream events + lazy free.
     // Conservative fix (M2.2): synchronize the stream before tearing
-    // down. Slower than event-tracked lazy free, but correct.
+    // down or caching. Slower than event-tracked lazy free, but correct.
+    // Note: stream==NULL means the legacy/default stream — must still
+    // synchronize. cudaStreamSynchronize(0) syncs the default stream,
+    // which is what we want. The earlier `if (stream)` guard was
+    // unsound — it skipped the sync on default-stream frees and let
+    // a recycled VA get handed to a new alloc while a kernel on the
+    // default stream was still using the old contents → CUDA "illegal
+    // memory access" in the next kernel.
     // TODO(M3): replace with event-record + deferred release list.
-    if (stream) {
-        cudaStreamSynchronize(stream);
-    }
+    cudaStreamSynchronize(stream);
 
     if (!g_torch_allocator) {
         cudaFree(ptr);

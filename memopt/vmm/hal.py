@@ -112,7 +112,8 @@ class HAL:
         """Memory tier names for the active backend.
         Mirrors the module-level `tier_names` so callers can read it
         through any HAL instance without importing the module symbol."""
-        return list(tier_names)
+        _resolve_backend()
+        return list(_tier_names) if _tier_names else []
 
     def is_gpu_available(self) -> bool:
         return self._backend in (
@@ -403,15 +404,40 @@ def _detect_backend():
     return b
 
 
-# Module-level singleton — instantiated once at first import
-backend = _detect_backend()
-tiers = backend.detect_tiers()
-tier_names: List[str] = [t.name for t in tiers]
+# Module-level singletons — LAZY. Eagerly running _detect_backend()
+# at import calls torch.cuda.is_available() which initializes PyTorch's
+# CUDA primary context, after which torch.cuda.memory.change_current_allocator
+# fails with "Can't swap an already initialized allocator". Resolving these
+# names via PEP 562 __getattr__ defers the CUDA touch to the first reader.
+_backend = None
+_tiers = None
+_tier_names = None
+
+
+def _resolve_backend():
+    global _backend, _tiers, _tier_names
+    if _backend is None:
+        _backend = _detect_backend()
+        _tiers = _backend.detect_tiers()
+        _tier_names = [t.name for t in _tiers]
+    return _backend
+
+
+def __getattr__(name):
+    if name == "backend":
+        return _resolve_backend()
+    if name == "tiers":
+        _resolve_backend()
+        return _tiers
+    if name == "tier_names":
+        _resolve_backend()
+        return _tier_names
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_backend():
     """Return the active legacy backend. Prefer `backend` directly."""
-    return backend
+    return _resolve_backend()
 
 
 __all__ = [

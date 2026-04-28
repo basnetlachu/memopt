@@ -26,26 +26,41 @@ from typing import Optional
 
 import torch
 
-# Import the low-level VMM bindings (same .so, different symbols)
+# Import the low-level VMM bindings — but only the lazy loader and
+# path resolver. Importing _lib eagerly would dlopen libmemopt_vmm.so
+# (which transitively loads libcudart and initializes the CUDA primary
+# context) BEFORE PyTorch's change_current_allocator gets a chance to
+# swap, and the swap would fail with "Can't swap an already initialized
+# allocator".
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from memopt.vmm.cuda_vmm import CUDAVMMAllocator, _find_library, _lib
+from memopt.vmm.cuda_vmm import CUDAVMMAllocator, _find_library, _get_lib
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Bind the torch-specific stats probe we added to libmemopt_vmm.so
-# ─────────────────────────────────────────────────────────────────────────
-_lib.memopt_torch_get_stats.argtypes = [
-    ctypes.POINTER(ctypes.c_int),
-    ctypes.POINTER(ctypes.c_int),
-    ctypes.POINTER(ctypes.c_float),
-]
-_lib.memopt_torch_get_stats.restype = None
+def _bind_torch_symbols(lib):
+    """Bind the torch-side ctypes signatures on the lazy-loaded lib.
+    Idempotent — safe to call multiple times."""
+    if getattr(lib, "_memopt_torch_bound", False):
+        return lib
+    lib.memopt_torch_get_stats.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.memopt_torch_get_stats.restype = None
+    lib.memopt_torch_step_boundary.argtypes = [ctypes.c_float]
+    lib.memopt_torch_step_boundary.restype  = None
+    lib.memopt_torch_get_allocator.argtypes = []
+    lib.memopt_torch_get_allocator.restype  = ctypes.c_void_p
+    lib._memopt_torch_bound = True
+    return lib
 
-_lib.memopt_torch_step_boundary.argtypes = [ctypes.c_float]
-_lib.memopt_torch_step_boundary.restype  = None
 
-_lib.memopt_torch_get_allocator.argtypes = []
-_lib.memopt_torch_get_allocator.restype  = ctypes.c_void_p
+def _torch_lib():
+    """Lazy accessor — load libmemopt_vmm.so + bind torch ctypes signatures
+    on first use. Callers AFTER install() succeeds; PyTorch's pluggable
+    allocator has already dlopen'd the same path and swapped, so loading
+    here is a cached no-op for libcudart's initializer."""
+    return _bind_torch_symbols(_get_lib())
 
 
 class MemoptTorchAllocator:
@@ -140,25 +155,26 @@ class MemoptTorchAllocator:
 
         Returns the stats dict AFTER the boundary sweep.
         """
-        _lib.memopt_torch_step_boundary(ctypes.c_float(self.evict_threshold))
+        _torch_lib().memopt_torch_step_boundary(ctypes.c_float(self.evict_threshold))
         return self.stats()
 
     def stats(self) -> dict:
         pages_hbm   = ctypes.c_int(0)
         pages_dram  = ctypes.c_int(0)
         hbm_press   = ctypes.c_float(0.0)
-        _lib.memopt_torch_get_stats(
+        _lib_local = _torch_lib()
+        _lib_local.memopt_torch_get_stats(
             ctypes.byref(pages_hbm),
             ctypes.byref(pages_dram),
             ctypes.byref(hbm_press),
         )
         # For deeper stats (eviction_count, bytes_evicted_total, etc.) we
         # can reuse the generic memopt_stats call on the global allocator.
-        g_handle = _lib.memopt_torch_get_allocator()
+        g_handle = _lib_local.memopt_torch_get_allocator()
         if g_handle:
             from memopt.vmm.cuda_vmm import _MemoptStats  # local import
-            _lib.memopt_stats.restype = _MemoptStats
-            s = _lib.memopt_stats(g_handle)
+            _lib_local.memopt_stats.restype = _MemoptStats
+            s = _lib_local.memopt_stats(g_handle)
             return {
                 "pages_total":         int(s.pages_total),
                 "pages_hbm":           int(s.pages_hbm),

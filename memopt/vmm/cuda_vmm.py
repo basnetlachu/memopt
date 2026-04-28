@@ -55,34 +55,53 @@ def _find_library() -> str:
     )
 
 
-_lib = ctypes.CDLL(_find_library())
+# NOTE: do NOT call ctypes.CDLL at module import. libmemopt_vmm.so
+# transitively depends on libcudart, whose loader-time constructor
+# initializes the CUDA primary context. PyTorch then sees its CUDA
+# allocator as "initialized" and refuses change_current_allocator
+# with "Can't swap an already initialized allocator". Lazy-load via
+# _get_lib() so the dlopen happens only when the Python-side stats
+# / allocator API is actually called — by which time install() has
+# already swapped PyTorch's allocator (PyTorch's own dlopen during
+# change_current_allocator runs after its !initialized() pre-check).
+_lib = None
 
-_lib.memopt_allocator_create.argtypes  = [ctypes.c_int, ctypes.c_size_t]
-_lib.memopt_allocator_create.restype   = ctypes.c_void_p
 
-_lib.memopt_allocator_destroy.argtypes = [ctypes.c_void_p]
-_lib.memopt_allocator_destroy.restype  = None
+def _get_lib():
+    global _lib
+    if _lib is not None:
+        return _lib
+    lib = ctypes.CDLL(_find_library())
 
-_lib.memopt_malloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
-_lib.memopt_malloc.restype  = ctypes.c_ulonglong
+    lib.memopt_allocator_create.argtypes  = [ctypes.c_int, ctypes.c_size_t]
+    lib.memopt_allocator_create.restype   = ctypes.c_void_p
 
-_lib.memopt_free.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong]
-_lib.memopt_free.restype  = None
+    lib.memopt_allocator_destroy.argtypes = [ctypes.c_void_p]
+    lib.memopt_allocator_destroy.restype  = None
 
-_lib.memopt_quiesce.argtypes = [ctypes.c_void_p]
-_lib.memopt_quiesce.restype  = None
+    lib.memopt_malloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    lib.memopt_malloc.restype  = ctypes.c_ulonglong
 
-_lib.memopt_evict_n_pages.argtypes = [ctypes.c_void_p, ctypes.c_int]
-_lib.memopt_evict_n_pages.restype  = ctypes.c_int
+    lib.memopt_free.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong]
+    lib.memopt_free.restype  = None
 
-_lib.memopt_evict_to_target.argtypes = [ctypes.c_void_p, ctypes.c_float]
-_lib.memopt_evict_to_target.restype  = ctypes.c_size_t
+    lib.memopt_quiesce.argtypes = [ctypes.c_void_p]
+    lib.memopt_quiesce.restype  = None
 
-_lib.memopt_promote.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong]
-_lib.memopt_promote.restype  = ctypes.c_int
+    lib.memopt_evict_n_pages.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.memopt_evict_n_pages.restype  = ctypes.c_int
 
-_lib.memopt_stats.argtypes = [ctypes.c_void_p]
-_lib.memopt_stats.restype  = _MemoptStats
+    lib.memopt_evict_to_target.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    lib.memopt_evict_to_target.restype  = ctypes.c_size_t
+
+    lib.memopt_promote.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong]
+    lib.memopt_promote.restype  = ctypes.c_int
+
+    lib.memopt_stats.argtypes = [ctypes.c_void_p]
+    lib.memopt_stats.restype  = _MemoptStats
+
+    _lib = lib
+    return _lib
 
 
 class CUDAVMMAllocator:
@@ -95,7 +114,7 @@ class CUDAVMMAllocator:
         evict_threshold: float = 0.80,
     ):
         pool_bytes = int(pool_gb * (1024 ** 3))
-        handle = _lib.memopt_allocator_create(device, pool_bytes)
+        handle = _get_lib().memopt_allocator_create(device, pool_bytes)
         if not handle:
             raise RuntimeError(
                 f"memopt_allocator_create(device={device}, "
@@ -108,7 +127,7 @@ class CUDAVMMAllocator:
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
-            _lib.memopt_allocator_destroy(self._handle)
+            _get_lib().memopt_allocator_destroy(self._handle)
             self._handle = None
 
     def __del__(self):
@@ -125,7 +144,7 @@ class CUDAVMMAllocator:
 
     # ── allocation ──────────────────────────────────────────────────────
     def malloc(self, size_bytes: int, tag: str = "python") -> int:
-        va = _lib.memopt_malloc(
+        va = _get_lib().memopt_malloc(
             self._handle, int(size_bytes), tag.encode("utf-8")
         )
         if va == 0:
@@ -136,14 +155,14 @@ class CUDAVMMAllocator:
         return int(va)
 
     def free(self, va: int) -> None:
-        _lib.memopt_free(self._handle, ctypes.c_ulonglong(va))
+        _get_lib().memopt_free(self._handle, ctypes.c_ulonglong(va))
 
     # ── eviction ────────────────────────────────────────────────────────
     def quiesce(self) -> None:
-        _lib.memopt_quiesce(self._handle)
+        _get_lib().memopt_quiesce(self._handle)
 
     def evict_n_pages(self, n: int) -> int:
-        return int(_lib.memopt_evict_n_pages(self._handle, int(n)))
+        return int(_get_lib().memopt_evict_n_pages(self._handle, int(n)))
 
     def evict_to_target(self, target_fraction: float) -> int:
         """Evict LRU pages until ≤ target_fraction of pool remains in HBM.
@@ -151,15 +170,15 @@ class CUDAVMMAllocator:
         Returns total bytes freed from HBM.
         """
         return int(
-            _lib.memopt_evict_to_target(self._handle, float(target_fraction))
+            _get_lib().memopt_evict_to_target(self._handle, float(target_fraction))
         )
 
     def promote(self, va: int) -> int:
-        return int(_lib.memopt_promote(self._handle, ctypes.c_ulonglong(va)))
+        return int(_get_lib().memopt_promote(self._handle, ctypes.c_ulonglong(va)))
 
     # ── stats ───────────────────────────────────────────────────────────
     def stats(self) -> dict:
-        s = _lib.memopt_stats(self._handle)
+        s = _get_lib().memopt_stats(self._handle)
         return {
             "pages_total":         int(s.pages_total),
             "pages_hbm":           int(s.pages_hbm),

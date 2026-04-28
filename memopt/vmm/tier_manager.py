@@ -21,8 +21,23 @@ import os
 import time
 from typing import Optional
 
-from .hal import backend, tiers, tier_names
+# Import hal as a module so backend/tiers/tier_names resolve lazily
+# via hal.__getattr__ on first attribute access. Doing
+# `from .hal import backend` here would call hal._detect_backend()
+# at import time, which calls torch.cuda.is_available() and
+# initializes PyTorch's CUDA primary context — breaking the
+# pluggable-allocator install path.
+from . import hal as _hal
 from .page_table import PageTable, PageTableEntry
+
+
+def __getattr__(name):
+    """Module-level lazy alias for backend/tiers/tier_names —
+    keeps existing imports `from memopt.vmm.tier_manager import backend`
+    working without forcing CUDA init at import time."""
+    if name in ("backend", "tiers", "tier_names"):
+        return getattr(_hal, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +61,7 @@ class TierManager:
         node_id: str = "",
     ) -> None:
         self.page_table = page_table
-        self._tier_capacity: dict[str, int] = {t.name: t.capacity_bytes for t in tiers}
+        self._tier_capacity: dict[str, int] = {t.name: t.capacity_bytes for t in _hal.tiers}
 
         # GUM cross-node block sharing (optional)
         self._remote_client = remote_client
@@ -85,9 +100,9 @@ class TierManager:
         Allocate a new block in the hottest available tier.
         Evicts LRU blocks first if tier is above the high watermark.
         """
-        hot = tier_names[0]
+        hot = _hal.tier_names[0]
         self._ensure_capacity(hot, size_bytes)
-        handle = backend.allocate(size_bytes, hot, tenant_id=tenant_id)
+        handle = _hal.backend.allocate(size_bytes, hot, tenant_id=tenant_id)
         return self.page_table.insert(sequence_id, block_index, hot, handle, size_bytes)
 
     def fetch(self, sequence_id: str, block_index: int) -> PageTableEntry:
@@ -103,7 +118,7 @@ class TierManager:
 
         if entry is not None:
             # Block found locally — promote to hot tier if needed
-            hot = tier_names[0]
+            hot = _hal.tier_names[0]
             if entry.tier != hot:
                 self._promote(entry, hot)
                 entry = self.page_table.lookup(sequence_id, block_index)
@@ -115,9 +130,9 @@ class TierManager:
             remote_data = self._try_gum_fetch(sequence_id, block_index)
             if remote_data is not None:
                 # Remote fetch succeeded — allocate locally and return
-                hot = tier_names[0]
+                hot = _hal.tier_names[0]
                 self._ensure_capacity(hot, len(remote_data))
-                handle = backend.allocate(len(remote_data), hot)
+                handle = _hal.backend.allocate(len(remote_data), hot)
                 # Copy remote data into local allocation
                 try:
                     import torch
@@ -145,15 +160,15 @@ class TierManager:
         """Free all blocks for a completed sequence."""
         entries = self.page_table.remove_sequence(sequence_id)
         for e in entries:
-            backend.free(e.handle, e.tier)
+            _hal.backend.free(e.handle, e.tier)
         if entries:
             logger.debug("Evicted %d blocks for sequence %r", len(entries), sequence_id)
 
     def stats(self) -> dict:
         """Return page table stats augmented with backend and tier info."""
         s = self.page_table.stats()
-        s["backend"] = type(backend).__name__
-        s["tiers_available"] = tier_names
+        s["backend"] = type(_hal.backend).__name__
+        s["tiers_available"] = _hal.tier_names
         s["gum_enabled"] = (self._remote_client is not None
                             and self._block_directory is not None)
         try:
@@ -167,33 +182,33 @@ class TierManager:
 
     def _promote(self, entry: PageTableEntry, target_tier: str) -> None:
         self._ensure_capacity(target_tier, entry.size_bytes)
-        new_handle = backend.allocate(entry.size_bytes, target_tier)
+        new_handle = _hal.backend.allocate(entry.size_bytes, target_tier)
         self._sync_copy(entry.handle, new_handle)
         old_tier, old_handle = entry.tier, entry.handle
         self.page_table.update_tier(entry.sequence_id, entry.block_index, target_tier, new_handle)
-        backend.free(old_handle, old_tier)
+        _hal.backend.free(old_handle, old_tier)
         logger.debug(
             "Promoted (%r, %d): %s → %s",
             entry.sequence_id, entry.block_index, old_tier, target_tier,
         )
 
     def _evict_one(self, from_tier: str) -> bool:
-        idx = tier_names.index(from_tier)
-        if idx + 1 >= len(tier_names):
+        idx = _hal.tier_names.index(from_tier)
+        if idx + 1 >= len(_hal.tier_names):
             logger.warning("Cannot evict from %r: no colder tier available", from_tier)
             return False
 
-        cold_tier = tier_names[idx + 1]
+        cold_tier = _hal.tier_names[idx + 1]
         candidates = self.page_table.lru_candidates(from_tier, count=1)
         if not candidates:
             return False
 
         entry = candidates[0]
-        new_handle = backend.allocate(entry.size_bytes, cold_tier)
+        new_handle = _hal.backend.allocate(entry.size_bytes, cold_tier)
         self._sync_copy(entry.handle, new_handle)
         old_handle = entry.handle
         self.page_table.update_tier(entry.sequence_id, entry.block_index, cold_tier, new_handle)
-        backend.free(old_handle, from_tier)
+        _hal.backend.free(old_handle, from_tier)
         logger.debug(
             "Evicted (%r, %d): %s → %s",
             entry.sequence_id, entry.block_index, from_tier, cold_tier,
@@ -401,7 +416,7 @@ class TierManager:
         return None
 
     def _hot_tier(self) -> str:
-        return tier_names[0]
+        return _hal.tier_names[0]
 
     @staticmethod
     def _sync_copy(src, dst) -> None:
@@ -433,8 +448,8 @@ class TierManager:
             except Exception:
                 pass  # fall through to original path
 
-        result = backend.async_copy(src, dst)
-        if hasattr(backend, "record_event"):
-            backend.record_event(result).synchronize()
+        result = _hal.backend.async_copy(src, dst)
+        if hasattr(_hal.backend, "record_event"):
+            _hal.backend.record_event(result).synchronize()
         elif hasattr(result, "wait"):         # threading.Event (unified)
             result.wait()

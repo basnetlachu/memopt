@@ -19,12 +19,23 @@ import os
 import socket
 import threading
 from typing import TYPE_CHECKING, Optional
-from .hal import backend, tiers, tier_names
+# NOTE: backend / tiers / tier_names are lazy. Importing them eagerly
+# triggers torch.cuda.is_available() inside hal._detect_backend(), which
+# initializes PyTorch's CUDA primary context and breaks
+# torch.cuda.memory.change_current_allocator() in the pluggable allocator
+# install path. Resolved on first read via PEP 562 __getattr__ below.
 from .page_table import PageTable, PageTableEntry
 from .tier_manager import TierManager
 from .prefetch_engine import PrefetchEngine
 from .weight_manager import WeightManager
 from .oracle import MemoryOracle
+
+
+def __getattr__(name):
+    if name in ("backend", "tiers", "tier_names"):
+        from . import hal
+        return getattr(hal, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 if TYPE_CHECKING:
     from memopt.cluster import GKDStore

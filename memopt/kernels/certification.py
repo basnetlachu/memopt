@@ -85,6 +85,10 @@ class SiliconCertificate:
     signature:          Optional[str]
     signature_status:   str
     signing_algorithm:  str
+    # Memory-bandwidth roll-up surfaced as a flat field for CLI display
+    # AND included in the signed payload so tampering is detectable.
+    # Default None for back-compat with externally-constructed certs.
+    bandwidth_pct_of_peak: Optional[float] = None
     # Set after construction
     certificate_hash:   str = field(default="")
 
@@ -475,38 +479,50 @@ def run_certification(node_id: str = "") -> SiliconCertificate:
     all_passed = all(t.passed for t in correctness)
     issued_at  = time.time()
 
+    # Memory-bandwidth roll-up — a flat field consumers display; signing
+    # it here means a man-in-the-middle can't rewrite the displayed
+    # number without invalidating the signature. Round at sign time so
+    # the verify-side reconstruction matches byte-for-byte.
+    bw_pct = None
+    for t in throughput:
+        if t.name == "memory_bandwidth":
+            bw_pct = round(float(t.pct_of_peak), 2)
+            break
+
     # Build payload for signing
     payload = {
-        "version":           _CERT_VERSION,
-        "issued_at":         issued_at,
-        "node_id":           node_id,
-        "device_name":       hw["device_name"],
-        "compute_cap":       hw["compute_cap"],
-        "driver_version":    hw["driver_version"],
-        "cuda_version":      hw["cuda_version"],
-        "all_passed":        all_passed,
-        "correctness_tests": [asdict(t) for t in correctness],
-        "throughput_tests":  [asdict(t) for t in throughput],
+        "version":               _CERT_VERSION,
+        "issued_at":             issued_at,
+        "node_id":               node_id,
+        "device_name":           hw["device_name"],
+        "compute_cap":           hw["compute_cap"],
+        "driver_version":        hw["driver_version"],
+        "cuda_version":          hw["cuda_version"],
+        "all_passed":            all_passed,
+        "correctness_tests":     [asdict(t) for t in correctness],
+        "throughput_tests":      [asdict(t) for t in throughput],
+        "bandwidth_pct_of_peak": bw_pct,
     }
     signature, sig_status, sig_algo = _sign(payload)
 
     cert_hash = hashlib.sha256(_canonical_json(payload)).hexdigest()
 
     cert = SiliconCertificate(
-        version           = _CERT_VERSION,
-        issued_at         = issued_at,
-        node_id           = node_id,
-        device_name       = hw["device_name"],
-        compute_cap       = hw["compute_cap"],
-        driver_version    = hw["driver_version"],
-        cuda_version      = hw["cuda_version"],
-        correctness_tests = correctness,
-        throughput_tests  = throughput,
-        all_passed        = all_passed,
-        signature         = signature,
-        signature_status  = sig_status,
-        signing_algorithm = sig_algo,
-        certificate_hash  = cert_hash,
+        version               = _CERT_VERSION,
+        issued_at             = issued_at,
+        node_id               = node_id,
+        device_name           = hw["device_name"],
+        compute_cap           = hw["compute_cap"],
+        driver_version        = hw["driver_version"],
+        cuda_version          = hw["cuda_version"],
+        correctness_tests     = correctness,
+        throughput_tests      = throughput,
+        all_passed            = all_passed,
+        signature             = signature,
+        signature_status      = sig_status,
+        signing_algorithm     = sig_algo,
+        bandwidth_pct_of_peak = bw_pct,
+        certificate_hash      = cert_hash,
     )
 
     status_str = "PASS" if all_passed else "FAIL"
@@ -772,16 +788,17 @@ def verify_certificate(cert_dict: dict, signing_key: str) -> bool:
         return False
 
     payload = {
-        "version":           cert_dict.get("version"),
-        "issued_at":         cert_dict.get("issued_at"),
-        "node_id":           cert_dict.get("node_id", ""),
-        "device_name":       cert_dict.get("device_name", ""),
-        "compute_cap":       cert_dict.get("compute_cap", ""),
-        "driver_version":    cert_dict.get("driver_version", ""),
-        "cuda_version":      cert_dict.get("cuda_version", ""),
-        "all_passed":        cert_dict.get("all_passed", False),
-        "correctness_tests": cert_dict.get("correctness_tests", []),
-        "throughput_tests":  cert_dict.get("throughput_tests", []),
+        "version":               cert_dict.get("version"),
+        "issued_at":             cert_dict.get("issued_at"),
+        "node_id":               cert_dict.get("node_id", ""),
+        "device_name":           cert_dict.get("device_name", ""),
+        "compute_cap":           cert_dict.get("compute_cap", ""),
+        "driver_version":        cert_dict.get("driver_version", ""),
+        "cuda_version":          cert_dict.get("cuda_version", ""),
+        "all_passed":            cert_dict.get("all_passed", False),
+        "correctness_tests":     cert_dict.get("correctness_tests", []),
+        "throughput_tests":      cert_dict.get("throughput_tests", []),
+        "bandwidth_pct_of_peak": cert_dict.get("bandwidth_pct_of_peak"),
     }
     key_bytes = signing_key.encode("utf-8")
     expected  = hmac.new(key_bytes, _canonical_json(payload), hashlib.sha256).hexdigest()

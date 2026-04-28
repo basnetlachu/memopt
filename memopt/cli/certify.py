@@ -60,6 +60,34 @@ def run_certification(gpu_idx: int = 0) -> dict:
     except Exception:
         result["power_watts_nvml"] = None
 
+    # ── Derive display-friendly fields from the real cert schema ────
+    # SiliconCertificate persists correctness_tests[] + throughput_tests[]
+    # + all_passed + issued_at. The CLI text formatter / exit-code logic
+    # want flat keys, so synthesize them here. These are display-only —
+    # they are NOT part of the signed payload, so adding them does not
+    # invalidate the existing signature.
+    correctness = result.get("correctness_tests", []) or []
+    result["ops_total"]  = len(correctness)
+    result["ops_passed"] = sum(1 for t in correctness if t.get("passed"))
+
+    bw_pct = None
+    for t in result.get("throughput_tests", []) or []:
+        if t.get("name") == "memory_bandwidth":
+            bw_pct = t.get("pct_of_peak")
+            break
+    if bw_pct is not None:
+        result["bandwidth_pct_of_peak"] = round(float(bw_pct), 2)
+
+    issued = result.get("issued_at")
+    if issued is not None:
+        from datetime import datetime, timezone
+        result["timestamp"] = datetime.fromtimestamp(
+            float(issued), tz=timezone.utc).isoformat()
+
+    result["certificate_status"] = (
+        "CERTIFIED" if result.get("all_passed") else "DEGRADED"
+    )
+
     return result
 
 
