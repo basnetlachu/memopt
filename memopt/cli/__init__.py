@@ -324,43 +324,6 @@ def cmd_apply(args):
     sys.exit(_apply(args))
 
 
-def cmd_certify(args):
-    """Run silicon certification suite and print results."""
-    from memopt.kernels.certification import run_certification, _save_certificate
-    import json
-
-    node_id  = getattr(args, "node_id", "") or ""
-    out_dir  = getattr(args, "output_dir", None) or "/tmp/memopt_certs"
-    no_save  = getattr(args, "no_save", False)
-
-    print(f"Running Silicon Certification Suite (node={node_id or '(local)'}) ...")
-    cert = run_certification(node_id=node_id)
-
-    status = "PASS" if cert.all_passed else "FAIL"
-    print(f"\nResult: {status}")
-    print(f"Device: {cert.device_name}  CC={cert.compute_cap or 'N/A'}")
-    print(f"Cert hash: {cert.certificate_hash[:32]}...")
-
-    print("\nCorrectness tests:")
-    for t in cert.correctness_tests:
-        icon = "✓" if t.passed else "✗"
-        print(f"  {icon} {t.name:30s} dtype={t.dtype:10s} max_err={t.max_err:.2e}"
-              + (f"  [{t.note}]" if t.note else ""))
-
-    print("\nThroughput tests:")
-    for t in cert.throughput_tests:
-        print(f"  {t.name:30s} {t.achieved_gb_s:8.1f} GB/s  "
-              f"({t.pct_of_peak:.1f}% of {t.theoretical_gb_s:.0f} GB/s peak)"
-              + (f"  [{t.note}]" if t.note else ""))
-
-    print(f"\nSignature: {cert.signature_status}")
-
-    if not no_save:
-        path = _save_certificate(cert, out_dir=out_dir)
-        if path:
-            print(f"Certificate saved: {path}")
-
-
 def cmd_daemon(args):
     """Daemon management commands."""
     from memopt.daemon import MemoptDaemon, DaemonConfig
@@ -738,24 +701,6 @@ def main():
     scan_parser.add_argument("--sample-seconds", type=int, default=5, dest="sample_seconds",
                              help="Seconds to sample GPU utilization per process (default: 5)")
     scan_parser.set_defaults(func=cmd_scan)
-
-    # certify command
-    certify_parser = subparsers.add_parser(
-        "certify", help="Run silicon certification suite and produce a signed certificate"
-    )
-    certify_parser.add_argument(
-        "--node-id", dest="node_id", default="",
-        help="Node identifier to embed in the certificate (default: empty)"
-    )
-    certify_parser.add_argument(
-        "--output-dir", dest="output_dir", default="/tmp/memopt_certs",
-        help="Directory to save the certificate JSON (default: /tmp/memopt_certs)"
-    )
-    certify_parser.add_argument(
-        "--no-save", dest="no_save", action="store_true",
-        help="Print results but do not save the certificate to disk"
-    )
-    certify_parser.set_defaults(func=cmd_certify)
 
     # apply command
     apply_parser = subparsers.add_parser("apply", help="Apply optimizations to a running GPU process")

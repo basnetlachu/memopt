@@ -4,50 +4,8 @@ Integration gap closure tests.
 Verifies that all 10 cross-pillar wiring gaps have been closed.
 Each test targets one specific gap.
 """
-import json
 import os
-import tempfile
-import threading
-from unittest.mock import MagicMock, patch
-
-import pytest
-
-
-# ── Gap 5: SLA history auto-populated ───────────────────────────────
-
-
-def test_sla_history_auto_populated():
-    """CertifyDaemon._run_once() writes to SLA history."""
-    from memopt.kernels.certify_daemon import CertifyDaemon
-
-    with tempfile.TemporaryDirectory() as d:
-        hist_path = os.path.join(d, "cert_history.json")
-        old_hist = os.environ.get("MEMOPT_CERT_HISTORY_PATH")
-        old_node = os.environ.get("MEMOPT_NODE_ID")
-        os.environ["MEMOPT_CERT_HISTORY_PATH"] = hist_path
-        os.environ["MEMOPT_NODE_ID"] = "test_gap5"
-        try:
-            daemon = CertifyDaemon(
-                node_id="test_gap5",
-                interval_hours=999)
-            daemon._run_once()
-
-            assert os.path.exists(hist_path), \
-                "SLA history file not created by _run_once()"
-            with open(hist_path) as f:
-                history = json.load(f)
-            assert len(history) >= 1
-            assert history[0]["node_id"] == "test_gap5"
-            assert "all_passed" in history[0]
-        finally:
-            if old_hist is not None:
-                os.environ["MEMOPT_CERT_HISTORY_PATH"] = old_hist
-            else:
-                os.environ.pop("MEMOPT_CERT_HISTORY_PATH", None)
-            if old_node is not None:
-                os.environ["MEMOPT_NODE_ID"] = old_node
-            else:
-                os.environ.pop("MEMOPT_NODE_ID", None)
+from unittest.mock import MagicMock
 
 
 # ── Gap 6: KernelLibrary fallback ───────────────────────────────────
@@ -61,29 +19,6 @@ def test_kernel_library_fallback_no_crash():
     # Request a key that doesn't exist — should check library and return None
     result = cache.get("nonexistent_key_abc123")
     assert result is None  # Not found, but did not crash
-
-
-# ── Gap 9: Prometheus metrics ───────────────────────────────────────
-
-
-def test_prometheus_metrics_no_crash():
-    """_emit_prometheus_metrics() exists and never raises."""
-    from memopt.kernels.certify_daemon import CertifyDaemon
-    from memopt.kernels.certification import run_certification
-
-    daemon = CertifyDaemon(
-        node_id="test_prom",
-        interval_hours=999)
-
-    cert = run_certification("test_prom")
-
-    # Must not raise regardless of prometheus_client availability
-    daemon._emit_prometheus_metrics(cert=cert, drift_pct=0.0)
-
-
-def test_prometheus_method_exists():
-    from memopt.kernels.certify_daemon import CertifyDaemon
-    assert hasattr(CertifyDaemon, "_emit_prometheus_metrics")
 
 
 # ── Gap 10: tier_at_access passed ───────────────────────────────────

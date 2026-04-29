@@ -543,24 +543,13 @@ if _HAS_FASTAPI:
     @app.get("/report/found-capacity")
     def found_capacity_report():
         """
-        Report GKD deduplication stats and ledger totals.
-        Energy savings are real measurements when PowerSampler is active,
-        estimated from GKD hit rate when PowerSampler is unavailable.
+        Report GKD deduplication stats.
+        Energy savings reflect PowerSampler readings when active.
         """
         gkd_stats = _gkd_store.stats() if _gkd_store is not None else {}
-        ledger_totals = {}
-        try:
-            from memopt.api.server import _p4_ledger
-            if _p4_ledger is not None:
-                ledger_totals = _p4_ledger.totals()
-        except Exception:
-            pass
 
-        # Distinguish measured vs estimated savings
         has_power = (_power_sampler is not None
                      and getattr(_power_sampler, 'available', False))
-        energy_kwh = ledger_totals.get("energy_saved_kwh")
-        has_real_energy = (energy_kwh is not None and has_power)
 
         return {
             "gkd": {
@@ -573,14 +562,12 @@ if _HAS_FASTAPI:
                 "entries_in_store":         gkd_stats.get("entries_in_store", 0),
                 "backend_degraded":         gkd_stats.get("backend_degraded", False),
             },
-            "ledger": ledger_totals,
             "energy_savings": {
-                "measured": has_real_energy,
+                "measured": False,
                 "power_sampler_active": has_power,
-                "note": ("real NVML power measurements"
-                         if has_real_energy
-                         else "estimated from GKD hit rate — "
-                              "install pynvml for real measurements"),
+                "note": ("PowerSampler active — live NVML readings"
+                         if has_power
+                         else "PowerSampler unavailable — install pynvml"),
             },
             "node_id": _node_id,
             "generated_at": time.time(),
@@ -591,72 +578,17 @@ if _HAS_FASTAPI:
         period_hours: int = 24,
         tenant: str = "",
     ):
-        """
-        Per-tenant GKD cost savings report.
-
-        Cost assumptions (all configurable via env vars):
-          MEMOPT_COST_PER_1K_TOKENS: what you charge per 1K tokens (default: 0 = no dollar amounts)
-          MEMOPT_COMPUTE_COST_RATIO: fraction of token cost that is compute (default: 0.7)
-
-        Dollar amounts only appear when the operator configures real pricing.
-        """
-        if _gkd_store is None:
-            return {
-                "error": "GKD store not active",
-                "gkd_enabled": False,
-            }
-
-        # Get stats — tenant-scoped or all
-        if tenant:
-            tenant_data = {tenant: _gkd_store.tenant_stats(tenant)}
-        else:
-            tenant_data = _gkd_store.tenant_stats()
-
-        # Cost configuration
-        cost_per_1k = float(os.getenv("MEMOPT_COST_PER_1K_TOKENS", "0"))
-        compute_ratio = float(os.getenv("MEMOPT_COMPUTE_COST_RATIO", "0.7"))
-        has_pricing = cost_per_1k > 0
-
-        tenant_reports = {}
-        for tid, stats in tenant_data.items():
-            tokens_saved = (
-                stats.get("exact_tokens_saved", 0)
-                + stats.get("partial_tokens_saved", 0))
-
-            report = {
-                "exact_hits":           stats.get("exact_hits", 0),
-                "partial_hits":         stats.get("partial_hits", 0),
-                "misses":               stats.get("misses", 0),
-                "hit_rate_pct":         stats.get("hit_rate_pct", 0.0),
-                "exact_tokens_saved":   stats.get("exact_tokens_saved", 0),
-                "partial_tokens_saved": stats.get("partial_tokens_saved", 0),
-                "total_tokens_saved":   tokens_saved,
-            }
-
-            if has_pricing:
-                compute_cost_saved = (
-                    tokens_saved / 1000 * cost_per_1k * compute_ratio)
-                report["compute_cost_saved_usd"] = round(
-                    compute_cost_saved, 6)
-                report["pricing_note"] = (
-                    f"Based on ${cost_per_1k}/1K tokens, "
-                    f"{compute_ratio * 100:.0f}% compute ratio")
-            else:
-                report["compute_cost_saved_usd"] = None
-                report["pricing_note"] = (
-                    "Set MEMOPT_COST_PER_1K_TOKENS to see dollar savings")
-
-            tenant_reports[tid] = report
-
-        return {
-            "period_hours":     period_hours,
-            "generated_at":     time.time(),
-            "tenant_isolation": getattr(
-                _gkd_store, "_tenant_isolation", False),
-            "tenants":          tenant_reports,
-            "total_tenants":    len(tenant_reports),
-            "global_gkd_stats": _gkd_store.stats(),
-        }
+        # MOVED: Cost-savings reporting depends on the compliance ledger
+        # (Pillar 4) which now lives in memopt-trust. Returns 501 here.
+        # TODO: Re-enable when memopt-trust integrates back.
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Endpoint moved to memopt-trust. "
+                "Not available in memopt-engine."
+            ),
+        )
 
     @app.get("/metrics")
     def metrics():
@@ -782,21 +714,13 @@ if _HAS_FASTAPI:
                         "GKD exact hit: skipping inference "
                         "for %d tokens (block_ref=%s)",
                         seq_len, gkd_hit.block_ref)
-                    # Record hit in Pillar 4 metrics
+                    # Record hit in telemetry collector
                     try:
-                        from memopt.api.server import (
-                            _p4_collector, _p4_ledger)
+                        from memopt.api.server import _p4_collector
                         if _p4_collector is not None:
                             _p4_collector.record_request(
                                 cached_output.get(
                                     "completion_tokens", 0))
-                        if _p4_ledger is not None:
-                            _p4_ledger.record(
-                                tokens=cached_output.get(
-                                    "completion_tokens", 0),
-                                tenant_id="_default",
-                                gkd_hit_rate_pct=100.0,
-                            )
                     except Exception:
                         pass
                     return CompletionResponse(
@@ -894,24 +818,11 @@ if _HAS_FASTAPI:
             except Exception:
                 pass  # registration failure must never block response
 
-        # Pillar 4 — record metrics with real energy measurement
+        # Telemetry — record request count
         try:
-            from memopt.api.server import _p4_collector, _p4_ledger
+            from memopt.api.server import _p4_collector
             if _p4_collector is not None:
                 _p4_collector.record_request(result.tokens_generated)
-            if _p4_ledger is not None:
-                gkd_stats = _gkd_store.stats() if _gkd_store else {}
-                _energy_source = (
-                    "nvml_measured" if actual_j_per_token is not None
-                    else "estimated" if gkd_stats.get("hit_rate_pct")
-                    else "unmeasured")
-                _p4_ledger.record(
-                    tokens=result.tokens_generated,
-                    tenant_id="_default",
-                    actual_j_per_token=actual_j_per_token,
-                    gkd_hit_rate_pct=gkd_stats.get("hit_rate_pct"),
-                    energy_source=_energy_source,
-                )
         except Exception:
             pass
 
@@ -1138,9 +1049,9 @@ def _build_engine(
         _power_sampler = None
         log.warning("PowerSampler unavailable: %s", e)
 
-    # Pillar 4 — wire MetricsCollector to data sources
+    # Wire MetricsCollector (telemetry) to data sources
     try:
-        from memopt.api.server import _p4_collector, _p4_ledger
+        from memopt.api.server import _p4_collector
         if _p4_collector is not None:
             if _p3_kv_cache is not None:
                 from memopt.serving import kernel_hooks as _kh
@@ -1151,29 +1062,8 @@ def _build_engine(
     except Exception as e:
         log.debug("MetricsCollector wiring skipped: %s", e)
 
-    # Pillar 6 — CertifyDaemon: drift detection + kernel re-synthesis
-    try:
-        from memopt.kernels.certify_daemon import (
-            CertifyDaemon,
-            make_control_plane_callback,
-        )
-
-        global _certify_daemon
-        _certify_daemon = CertifyDaemon(
-            node_id=_node_id,
-            alert_callback=make_control_plane_callback(
-                jit_generator=_p3_generator,
-                kernel_cache=_p3_kv_cache,
-            ),
-        )
-        _certify_daemon.start()
-        log.info(
-            "CertifyDaemon started (node=%s, interval=%sh)",
-            _node_id,
-            os.getenv("MEMOPT_CERTIFY_INTERVAL_H", "24"),
-        )
-    except Exception as e:
-        log.warning("CertifyDaemon startup failed: %s — serving without drift detection", e)
+    # Pillar 6 (CertifyDaemon) moved to memopt-trust.
+    # Re-add when integrating with memopt-trust.
 
     # Self-register with control plane if configured
     cp = os.getenv("MEMOPT_CONTROL_PLANE", "")
