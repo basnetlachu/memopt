@@ -332,26 +332,41 @@ def test_hit_rate_window_empty():
 # ── Cost savings endpoint ───────────────────────────────────────────
 
 
-def test_savings_endpoint():
+def test_savings_endpoint_returns_501_after_trust_extraction():
+    """
+    After memopt-trust extraction, /report/savings
+    returns 501 because Pillar 4 (compliance ledger)
+    moved to the memopt-trust archive.
+
+    This test enforces that contract: the endpoint
+    must signal 'moved' rather than silently fail.
+    Re-enable as 200 only when memopt-trust is
+    re-integrated.
+    """
     from fastapi.testclient import TestClient
     import memopt.serving.server as srv
     from memopt.cluster.gkd_store import GKDStore
 
-    # Initialize GKD store for the test
     old_store = srv._gkd_store
     try:
         srv._gkd_store = GKDStore()
         client = TestClient(srv.app)
 
         response = client.get("/report/savings")
-        assert response.status_code == 200
-        data = response.json()
 
-        required = ["period_hours", "generated_at",
-                    "tenant_isolation", "tenants",
-                    "total_tenants"]
-        for key in required:
-            assert key in data, f"Missing key: {key}"
+        # 501 = Not Implemented = correctly stubbed
+        # Anything else (200, 500, 404) = regression
+        assert response.status_code == 501, (
+            f"Expected 501 (stubbed), got "
+            f"{response.status_code}: {response.text}"
+        )
+
+        body = response.json()
+        assert "memopt-trust" in body.get("detail", "").lower(), (
+            "501 response must reference memopt-trust "
+            "in the detail field so callers know where "
+            "the feature went"
+        )
     finally:
         srv._gkd_store = old_store
 
