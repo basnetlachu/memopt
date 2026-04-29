@@ -371,8 +371,17 @@ def test_savings_endpoint_returns_501_after_trust_extraction():
         srv._gkd_store = old_store
 
 
-def test_savings_no_dollar_without_config():
-    """Without pricing config, no dollar amounts appear."""
+def test_savings_no_dollar_without_config_returns_501():
+    """
+    After memopt-trust extraction, /report/savings
+    returns 501 regardless of MEMOPT_COST_PER_1K_TOKENS
+    config. Originally tested that dollar amounts were
+    omitted when config was unset; the endpoint no longer
+    reaches that code path.
+
+    Re-enable original behavior when memopt-trust is
+    re-integrated.
+    """
     from fastapi.testclient import TestClient
     import memopt.serving.server as srv
     from memopt.cluster.gkd_store import GKDStore
@@ -380,20 +389,17 @@ def test_savings_no_dollar_without_config():
     old_store = srv._gkd_store
     old_cost = os.environ.pop("MEMOPT_COST_PER_1K_TOKENS", None)
     try:
-        # Set up a GKD store with a recorded hit so tenants dict is non-empty
-        store = GKDStore()
-        store.register(list(range(10)), 10, "ref1", "node1",
-                       tenant_id="test_tenant")
-        store.lookup(list(range(10)), 10, tenant_id="test_tenant")
-        srv._gkd_store = store
-
+        srv._gkd_store = GKDStore()
         client = TestClient(srv.app)
-        response = client.get("/report/savings")
-        data = response.json()
 
-        for tid, report in data.get("tenants", {}).items():
-            assert report["compute_cost_saved_usd"] is None, (
-                "Dollar amounts must be None without pricing config")
+        response = client.get("/report/savings")
+
+        assert response.status_code == 501, (
+            f"Expected 501 (stubbed), got "
+            f"{response.status_code}: {response.text}"
+        )
+        assert "memopt-trust" in response.json().get(
+            "detail", "").lower()
     finally:
         srv._gkd_store = old_store
         if old_cost is not None:
