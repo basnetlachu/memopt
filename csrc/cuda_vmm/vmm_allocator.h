@@ -23,7 +23,9 @@ extern "C" {
 #endif
 
 #define MEMOPT_PAGE_SIZE_BYTES (2 * 1024 * 1024ULL)  // 2 MiB
-#define MEMOPT_MAX_PAGES       (8192)  // 8192 × 2MiB = 16 GiB max
+// Capacity is now dynamic, sized at allocator_create from
+// pool_size_bytes / MEMOPT_PAGE_SIZE_BYTES, plus 25%
+// headroom for sub-2-MiB sub-allocation churn.
 
 // Tier definitions
 #define TIER_HBM  0

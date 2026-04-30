@@ -30,6 +30,68 @@ static double now_us() {
     return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
 }
 
+// G12 fix verification: legacy cap was 8192 pages (16 GiB).
+// On a >= 80 GiB rig we can allocate more than that. This test
+// allocates 16385 × 2 MiB pages (one beyond the legacy cap) and
+// confirms the allocator no longer rejects them.
+static int test_dynamic_capacity_above_legacy_cap() {
+    printf("\n=== Test: dynamic_capacity_above_legacy_cap ===\n");
+
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    const size_t required_free = 34ULL * 1024 * 1024 * 1024;  // 34 GiB
+    if (free_bytes < required_free) {
+        printf("  [SKIP] requires 32 GiB free HBM "
+               "(have %.1f GiB free)\n",
+               free_bytes / (1024.0*1024.0*1024.0));
+        return 0;
+    }
+
+    // 33 GiB pool — above the legacy 16 GiB cap. (Design §2.12 says 32 GiB,
+    // but 16385 × 2 MiB = 32.002 GiB exceeds a 32 GiB VA pool by 2 MiB; we
+    // bump to 33 GiB to honour the page-count spec.)
+    const size_t pool_size = 33ULL * 1024 * 1024 * 1024;
+    printf("  Creating allocator with %.1f GiB pool...\n",
+           pool_size / (1024.0*1024.0*1024.0));
+
+    MemoptAllocator* alloc = memopt_allocator_create(0, pool_size);
+    assert(alloc != NULL);
+
+    const int target_pages = 16385;  // one above legacy MEMOPT_MAX_PAGES
+    CUdeviceptr* vas = (CUdeviceptr*)calloc(target_pages,
+                                            sizeof(CUdeviceptr));
+    assert(vas != NULL);
+
+    int allocated = 0;
+    for (int i = 0; i < target_pages; i++) {
+        vas[i] = memopt_malloc(alloc, MEMOPT_PAGE_SIZE_BYTES, "g12_test");
+        if (vas[i] == 0) {
+            printf("  [FAIL] alloc rejected at page %d "
+                   "(legacy cap was 8192)\n", i);
+            break;
+        }
+        allocated++;
+    }
+
+    MemoptStats s = memopt_stats(alloc);
+    printf("  Allocated: %d / %d pages\n", allocated, target_pages);
+    printf("  pages_total = %d\n", s.pages_total);
+    assert(allocated == target_pages);
+    assert(s.pages_total == target_pages);
+
+    for (int i = 0; i < allocated; i++) {
+        if (vas[i]) memopt_free(alloc, vas[i]);
+    }
+    s = memopt_stats(alloc);
+    printf("  After free: pages_total = %d\n", s.pages_total);
+    assert(s.pages_total == 0);
+
+    free(vas);
+    memopt_allocator_destroy(alloc);
+    printf("  [OK] dynamic capacity above legacy cap works\n");
+    return 0;
+}
+
 int main() {
     printf("=== memopt VMM Allocator Test ===\n\n");
 
@@ -214,6 +276,9 @@ int main() {
     free(host_buf);
     free(verify_buf);
     memopt_allocator_destroy(alloc);
+
+    // ---- Test 6: G12 dynamic capacity (skipped if HBM < 34 GiB free) ----
+    test_dynamic_capacity_above_legacy_cap();
 
     printf("\n[ALL TESTS PASSED]\n");
     printf("memopt VMM Allocator Milestone 1: COMPLETE\n");

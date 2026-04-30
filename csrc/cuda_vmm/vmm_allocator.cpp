@@ -20,6 +20,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <assert.h>
+#include <limits.h>
 
 // ============================================================
 // Internal structures
@@ -52,7 +53,8 @@ struct MemoptAllocator {
     size_t       va_pool_used;   // Next allocation offset
 
     // Page table
-    MemoptPage   pages[MEMOPT_MAX_PAGES];
+    MemoptPage*  pages;          // heap-allocated
+    int          n_pages_cap;    // capacity, set in create
     int          n_pages;
     pthread_mutex_t lock;
 
@@ -240,9 +242,27 @@ MemoptAllocator* memopt_allocator_create(
     a->va_pool_used = 0;
     a->n_pages = 0;
 
+    // Dynamic capacity: pool / page + 25% sub-alloc headroom.
+    // Even if the pool is 2 MiB, we always allow at least 8
+    // pages for sub-allocation churn.
+    size_t pages_target = pool_size_bytes / MEMOPT_PAGE_SIZE_BYTES;
+    pages_target = pages_target + (pages_target / 4);
+    if (pages_target < 8) pages_target = 8;
+    if (pages_target > INT_MAX) pages_target = INT_MAX;
+    a->n_pages_cap = (int)pages_target;
+    a->pages = (MemoptPage*)calloc(a->n_pages_cap, sizeof(MemoptPage));
+    if (!a->pages) {
+        fprintf(stderr,
+            "[memopt] page table alloc failed (%d pages, %zu bytes)\n",
+            a->n_pages_cap,
+            (size_t)a->n_pages_cap * sizeof(MemoptPage));
+        cuMemAddressFree(a->va_pool_base, a->va_pool_size);
+        free(a); return NULL;
+    }
+
     // M2.1: VA freelist. Cap at 8× max pages — torch churns far more
     // alloc/free cycles than live pages (bnb staging, scratch workspaces).
-    a->va_free_cap = MEMOPT_MAX_PAGES * 8;
+    a->va_free_cap = a->n_pages_cap * 8;
     a->va_free = (VaFree*)calloc(a->va_free_cap, sizeof(VaFree));
     a->n_va_free = 0;
     if (!a->va_free) {
@@ -317,7 +337,7 @@ CUdeviceptr memopt_malloc(MemoptAllocator* a,
 
     pthread_mutex_lock(&a->lock);
 
-    if (a->n_pages >= MEMOPT_MAX_PAGES) {
+    if (a->n_pages >= a->n_pages_cap) {
         fprintf(stderr, "[memopt] page table full\n");
         pthread_mutex_unlock(&a->lock);
         return 0;
@@ -581,7 +601,7 @@ size_t memopt_evict_to_target(MemoptAllocator* a,
     if (!a) return 0;
 
     size_t total_freed = 0;
-    int safety = MEMOPT_MAX_PAGES + 1;  // bound — one page per iter at most
+    int safety = a->n_pages_cap + 1;  // bound — one page per iter at most
 
     // M2 FIX 2: pressure is measured against OUR VA pool, not the whole GPU.
     // "target 0.30" means "keep at most 30 % of the pool in HBM".
@@ -788,6 +808,11 @@ void memopt_allocator_destroy(MemoptAllocator* a) {
     if (a->va_free) {
         free(a->va_free);
         a->va_free = NULL;
+    }
+
+    if (a->pages) {
+        free(a->pages);
+        a->pages = NULL;
     }
 
     pthread_mutex_destroy(&a->lock);
