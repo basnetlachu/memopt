@@ -22,3 +22,7 @@ def cuda_device(cuda_available):
     if not cuda_available:
         pytest.skip("CUDA not available")
     return "cuda"
+
+
+# Rig-specific skips
+from tests.conftest_rig_skips import pytest_collection_modifyitems  # noqa: E402,F401
