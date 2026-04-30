@@ -165,6 +165,16 @@ python scripts/audit_wiring.py
 - [Architecture Reference](docs/architecture.md) — complete technical specification
 - [RDMA Deployment Guide](docs/rdma_deployment.md) — InfiniBand setup and troubleshooting
 
+## Memory substrate
+
+memopt v1 ships Layer 1 of the memory substrate: a tenant-isolated,
+stream-aware allocator with pluggable backends (CUDA VMM, ROCm/HIP
+stub, Level Zero stub, CXL/NUMA, CPU). The public API is `memopt.alloc /
+free / context / stats / observe` plus `MemoryHandle`. See
+[docs/substrate_v1_user_guide.md](docs/substrate_v1_user_guide.md) for
+usage and [docs/substrate_v1_design.md](docs/substrate_v1_design.md)
+for the spec.
+
 ## License
 
 Proprietary — contact for licensing.
