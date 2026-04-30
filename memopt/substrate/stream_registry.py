@@ -73,8 +73,15 @@ class StreamRegistry:
                 return_to_arena_cb(handle_record)
                 return False
             for s in streams:
-                event = self.event_pool.popleft() if self.event_pool else self._make_event()
-                self._event_record(event, s)
+                if self.event_pool:
+                    event = self.event_pool.popleft()
+                    self._event_record(event, s)
+                elif hasattr(s, "record_event"):
+                    # Mock or specialised stream supplies its own event.
+                    event = s.record_event()
+                else:
+                    event = self._make_event()
+                    self._event_record(event, s)
                 self.pending.setdefault(s, deque()).append((event, handle_record))
             return True
 

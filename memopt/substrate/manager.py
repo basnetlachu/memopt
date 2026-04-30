@@ -354,6 +354,12 @@ class AllocationManager:
     ) -> SubscriptionHandle:
         return self._dispatcher.subscribe(kind, callback)
 
+    def drain_pending(self) -> int:
+        """Force a stream-pending drain (normally only triggered by alloc).
+        Useful for tests that free a batch and need to observe arena
+        bytes return to zero before the next alloc fires."""
+        return self._streams.drain_pending(self._return_block_to_arena_cb)
+
     @staticmethod
     def _make_event_factory() -> Callable[[], Any]:
         try:
