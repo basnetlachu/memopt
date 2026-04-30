@@ -61,8 +61,8 @@ class CUDABackend(BackendStrategy):
         if self._allocator is None:
             from memopt.vmm.cuda_vmm import CUDAVMMAllocator
             self._allocator = CUDAVMMAllocator(
-                device_idx=self.device_idx,
-                pool_size_bytes=self.pool_size_bytes,
+                device=self.device_idx,
+                pool_gb=self.pool_size_bytes / (1024 ** 3),
             )
         return self._allocator
 

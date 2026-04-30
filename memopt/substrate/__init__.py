@@ -1,20 +1,17 @@
 """memopt substrate package — Layer 1 memory management.
 
 Public API surface per docs/substrate_v1_design.md §2.1. The substrate
-is assembled in Commit 12 (AllocationManager). In Commit 2 the public
-functions validate their inputs and then raise NotImplementedError.
+is assembled in Commit 12 (AllocationManager).
 
-Direct construction of MemoryHandle is supported (used by tests with
-mock backends).
+Entry points:
+  alloc, free, context, stats, observe, MemoryHandle
 """
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from .events import Event, SubscriptionHandle
 from .handle import MemoryHandle, _validate_alloc_args
-
-
-_NOT_ASSEMBLED = "substrate not assembled until Commit 12"
 
 
 def alloc(
@@ -27,12 +24,21 @@ def alloc(
     ttl_seconds: Optional[float] = None,
     hint: Optional[dict] = None,
 ) -> MemoryHandle:
-    _validate_alloc_args(size_bytes, tenant, tag, placement, ttl_seconds)
-    raise NotImplementedError(_NOT_ASSEMBLED)
+    from .manager import AllocationManager
+    return AllocationManager.get().alloc(
+        size_bytes,
+        tenant=tenant,
+        tag=tag,
+        placement=placement,
+        stream=stream,
+        ttl_seconds=ttl_seconds,
+        hint=hint,
+    )
 
 
 def free(handle: MemoryHandle) -> None:
-    raise NotImplementedError(_NOT_ASSEMBLED)
+    from .manager import AllocationManager
+    AllocationManager.get().free(handle)
 
 
 def context(
@@ -41,15 +47,23 @@ def context(
     tag: Optional[str] = None,
     placement: Optional[str] = None,
 ):
-    raise NotImplementedError(_NOT_ASSEMBLED)
+    from .manager import AllocationManager
+    return AllocationManager.get().context(
+        tenant=tenant, tag=tag, placement=placement
+    )
 
 
 def stats(tenant: Optional[str] = None) -> dict:
-    raise NotImplementedError(_NOT_ASSEMBLED)
+    from .manager import AllocationManager
+    return AllocationManager.get().stats(tenant=tenant)
 
 
-def observe(event: str, callback: Callable[[Any], None]):
-    raise NotImplementedError(_NOT_ASSEMBLED)
+def observe(
+    event: str,
+    callback: Callable[[Event], None],
+) -> SubscriptionHandle:
+    from .manager import AllocationManager
+    return AllocationManager.get().observe(event, callback)
 
 
 __all__ = [
@@ -59,4 +73,6 @@ __all__ = [
     "stats",
     "observe",
     "MemoryHandle",
+    "Event",
+    "SubscriptionHandle",
 ]
