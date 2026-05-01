@@ -175,6 +175,19 @@ free / context / stats / observe` plus `MemoryHandle`. See
 usage and [docs/substrate_v1_design.md](docs/substrate_v1_design.md)
 for the spec.
 
+## Orchestrator (Layer 2)
+
+memopt v1.2 adds Layer 2: a tenant-aware observation/decision layer
+that sits on top of the substrate. In v1.0 (Phase A) it observes the
+substrate's event stream and exposes a public Policy protocol; it does
+NOT drive eviction yet (that ships behind `MEMOPT_USE_ORCHESTRATOR=1`
+in Phase B). The public API is `memopt.orchestrator.start / stop /
+stats / register_policy` plus `memopt.peek_handle`. See
+[docs/orchestrator_v1_user_guide.md](docs/orchestrator_v1_user_guide.md)
+for usage and
+[docs/orchestrator_v1_design.md](docs/orchestrator_v1_design.md) for
+the spec.
+
 ## License
 
 Proprietary — contact for licensing.
