@@ -66,12 +66,22 @@ def observe(
     return AllocationManager.get().observe(event, callback)
 
 
+def peek_handle(
+    handle_id: int,
+    *,
+    tenant: Optional[str] = None,
+) -> Optional[MemoryHandle]:
+    from .manager import AllocationManager
+    return AllocationManager.get().peek_handle(handle_id, tenant=tenant)
+
+
 __all__ = [
     "alloc",
     "free",
     "context",
     "stats",
     "observe",
+    "peek_handle",
     "MemoryHandle",
     "Event",
     "SubscriptionHandle",

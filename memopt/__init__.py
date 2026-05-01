@@ -56,7 +56,7 @@ except ImportError:
     BandwidthReport = None        # type: ignore[assignment,misc]
 
 # Substrate v1 (Layer 1 memory management) — additive re-exports.
-from .substrate import alloc, free, context, stats, observe, MemoryHandle  # noqa: E402
+from .substrate import alloc, free, context, stats, observe, peek_handle, MemoryHandle  # noqa: E402
 
 __all__ = [
     "BandwidthTracker",
@@ -67,5 +67,6 @@ __all__ = [
     "context",
     "stats",
     "observe",
+    "peek_handle",
     "MemoryHandle",
 ]

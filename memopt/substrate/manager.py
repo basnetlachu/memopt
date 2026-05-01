@@ -49,6 +49,21 @@ _PLACEMENT_TO_LOC = {
 }
 
 
+# Static placement-rank table for _emit_orchestrator_event ordering checks
+# (design §2.2.6). hbm/hot is hottest; nvme/cold/cpu coldest.
+_PLACEMENT_RANK = {
+    "hbm": 3, "hot": 3,
+    "dram": 2, "warm": 2, "cxl": 2,
+    "nvme": 1, "cold": 1, "cpu": 1,
+}
+
+
+def _placement_rank(placement: Optional[str]) -> Optional[int]:
+    if placement is None:
+        return None
+    return _PLACEMENT_RANK.get(placement)
+
+
 def _resolve_default(value, ctx_value, fallback):
     if value is not None:
         return value
@@ -353,6 +368,71 @@ class AllocationManager:
         callback: Callable[[Event], None],
     ) -> SubscriptionHandle:
         return self._dispatcher.subscribe(kind, callback)
+
+    def peek_handle(
+        self,
+        handle_id: int,
+        *,
+        tenant: Optional[str] = None,
+    ) -> Optional[MemoryHandle]:
+        """Look up a live handle by id without mutating state (design §2.2.5).
+
+        The returned MemoryHandle is a *reference* to the live object, not a
+        copy; callers must treat it as immutable. Returns None if no handle
+        with that id exists. Raises PermissionError under G1 if the caller's
+        effective tenant (explicit arg, else current_tenant() context) does
+        not match the handle's tenant.
+
+        CUDA-callback safe: dict lookup under self._handles_lock; no driver
+        call, no allocation.
+        """
+        with self._handles_lock:
+            record = self._handles.get(handle_id)
+        if record is None:
+            return None
+        eff_tenant = tenant if tenant is not None else current_tenant()
+        if eff_tenant is not None and record.handle.tenant != eff_tenant:
+            raise PermissionError("peek across tenants forbidden (G1)")
+        return record.handle
+
+    def _emit_orchestrator_event(self, event: Event) -> None:
+        """Layer-2 emission entrypoint (design §2.2.6).
+
+        Validates kind ∈ {evict, promote, migrate} plus the placement
+        ordering for evict / promote, then forwards to the existing
+        Dispatcher. Layer 2 is the sole caller; this keeps emission
+        centralised on the manager so the ring's overflow accounting
+        covers Layer-2 events identically to alloc / free."""
+        assert event.kind in ("evict", "promote", "migrate"), (
+            f"_emit_orchestrator_event: unsupported kind {event.kind!r}"
+        )
+        if event.kind == "evict":
+            from_rank = _placement_rank(event.from_placement)
+            to_rank = _placement_rank(event.to_placement)
+            assert from_rank is not None and to_rank is not None, (
+                f"evict requires from/to placements, got "
+                f"from={event.from_placement!r} to={event.to_placement!r}"
+            )
+            assert from_rank > to_rank, (
+                f"evict must move hotter→colder, got "
+                f"from={event.from_placement!r} to={event.to_placement!r}"
+            )
+        elif event.kind == "promote":
+            from_rank = _placement_rank(event.from_placement)
+            to_rank = _placement_rank(event.to_placement)
+            assert from_rank is not None and to_rank is not None, (
+                f"promote requires from/to placements, got "
+                f"from={event.from_placement!r} to={event.to_placement!r}"
+            )
+            assert from_rank < to_rank, (
+                f"promote must move colder→hotter, got "
+                f"from={event.from_placement!r} to={event.to_placement!r}"
+            )
+        else:  # migrate
+            assert event.to_placement is not None, (
+                "migrate requires to_placement to be set"
+            )
+        self._dispatcher.emit(event)
 
     def drain_pending(self) -> int:
         """Force a stream-pending drain (normally only triggered by alloc).
