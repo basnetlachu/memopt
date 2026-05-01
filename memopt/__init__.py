@@ -44,7 +44,7 @@ Training Optimization:
         trainer.train()
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 # Core API — guarded so the package can be imported without torch installed
 # (e.g. during testing of torch-free submodules like vmm)

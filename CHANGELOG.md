@@ -1,5 +1,73 @@
 # Changelog
 
+## 1.2.0 — Orchestrator v1 (Phase A)
+
+Orchestrator v1 release — Phase A complete (per `docs/orchestrator_v1_design.md`).
+
+  - **AccessTracker** (`memopt.orchestrator.access`) — tenant-aware
+    LRU tracker driven by substrate event records. Per-tenant
+    intrusive doubly-linked LRU per `(tenant, placement)` so candidate
+    walks are O(count) not O(total).
+  - **Predictor** (`memopt.orchestrator.predict`) — greenfield
+    tenant-keyed first-order Markov chain with sequential / recency /
+    fallback sources. Per DECISION 6, every key tuple is `(tenant, tag)`.
+  - **PolicyEngine + LRUWatermarkPolicy** (`memopt.orchestrator.policy`)
+    — fan-out evaluator with priority-based conflict resolution and
+    auto-unregister of buggy policies after 3 consecutive raises.
+  - **Coordinator** (`memopt.orchestrator.coordinator`) — single
+    daemon thread `memopt-orchestrator-coordinator`; subscribes to all
+    five `Event.kind` streams; drains queue + drives policy cycle. Per
+    DECISION 7 v1.0 ships in observation-only mode (no decisions
+    applied by default).
+  - **TelemetryCollector** (`memopt.orchestrator.telemetry`) —
+    counters live in their own namespace; `decisions_per_tenant` is
+    gated by `MEMOPT_ADMIN_TOKEN` per G4.
+  - **Public API** (`memopt.orchestrator.start / stop / stats /
+    register_policy`) plus `memopt.peek_handle` re-exported from
+    `memopt.substrate.AllocationManager`.
+  - **Bridge test** (`tests/test_orchestrator_legacy_parity.py`) —
+    Phase A assertions: per-tenant byte counts and event-drop counters
+    are byte-for-byte identical between the orchestrator-stopped run
+    and the orchestrator-on-but-observation-only run; `decisions == 0`.
+  - **Threat model** (`docs/orchestrator_v1_threat_model.md`) and
+    **user guide** (`docs/orchestrator_v1_user_guide.md`) shipped per
+    §2.5 / §2.2.
+  - Mac baseline: 752 → 876 PASSED (124 new orchestrator REQUIRED-CI
+    tests); 22 → 34 SKIPPED (10 new @perf microbenches + 2 @gpu
+    tests); 15 DESELECTED unchanged; 0 FAILED.
+  - Substrate change scope (Commit 1 only): `peek_handle` and
+    `_emit_orchestrator_event` added to `AllocationManager`. No
+    existing substrate method body changed.
+
+### What Phase A does NOT deliver
+
+Verbatim from `docs/orchestrator_v1_design.md` §3.7:
+
+  - **Phase B** (`MEMOPT_USE_ORCHESTRATOR=1` flag flip): advisory
+    `placement="auto"` resolution + C++ step_boundary deferral.
+    Separate engagement; gating in §2.7 Phase B.
+  - **Phase C** (default-ON): three months of Phase B soak required.
+    Separate engagement.
+  - **Phase D** (remove legacy paths): deletes
+    `TierManager._ensure_capacity`, `ElasticAllocator`,
+    `MemoryGovernor`, the C++ direct-eviction path, and the
+    VMM-internal Markov chain in `PrefetchEngine`. Separate
+    engagement.
+  - **Layer 3** (ML-driven prefetch oracle): separate package
+    `memopt-prefetch-oracle`; v1.0 stays classical Markov.
+  - **Layer 4** (declarative policy DSL): separate package
+    `memopt-policy-dsl`; v1.0 ships only the `Policy` protocol.
+  - **Layer 5** (federated orchestration across nodes): separate
+    layer; the §2.3.2 predictor explicitly does not gossip across
+    processes (DECISION 7 trade-off).
+  - **vLLM integration.** `memopt-vllm` (separate package).
+  - **Custom CUDA kernels for the predictor.** v1.0 is pure Python
+    (DECISION 6 trade-off).
+  - **Persistence of learned patterns across restarts.** Predictor
+    starts cold every process.
+  - **Cost / FinOps integration.** Lives in `memopt-trust`.
+  - **Confidential computing / attestation.** Out of scope.
+
 ## 1.1.0 — Substrate v1 (Phase A)
 
   - Substrate v1 (Layer 1) — Memory management substrate added under
