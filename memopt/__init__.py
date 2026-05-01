@@ -58,6 +58,12 @@ except ImportError:
 # Substrate v1 (Layer 1 memory management) — additive re-exports.
 from .substrate import alloc, free, context, stats, observe, peek_handle, MemoryHandle  # noqa: E402
 
+# Orchestrator v1 (Layer 2 — observation in Phase A; opt-in eviction
+# driver in Phase B). Imported as a subpackage so callers write
+# `memopt.orchestrator.start()` rather than polluting the top-level
+# namespace.
+from . import orchestrator as orchestrator  # noqa: E402
+
 __all__ = [
     "BandwidthTracker",
     "BandwidthMeasurement",
@@ -69,4 +75,5 @@ __all__ = [
     "observe",
     "peek_handle",
     "MemoryHandle",
+    "orchestrator",
 ]
