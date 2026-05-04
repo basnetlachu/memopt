@@ -1,0 +1,61 @@
+# GitLab CI — mirrors the GitHub Actions matrix in .github/workflows/ci.yml
+# so the GitLab side stays green even when GitHub is the authoritative
+# remote. Apache-2.0; same regression command as CONTRIBUTING.md.
+
+stages:
+  - test
+  - perf
+
+variables:
+  PYTHONPATH: "."
+  MEMOPT_SIGNING_KEY: "ci-test-key"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+    - .venv
+
+.test_template: &test_template
+  stage: test
+  before_script:
+    - python3 -V
+    - python3 -m pip install --upgrade pip
+    - pip install -e ".[dev,daemon,api]"
+  script:
+    - PYTHONPATH=. python3 -m pytest tests/ memopt/ -q -p no:cacheprovider
+        -k 'not gpu and not cuda'
+        --ignore=memopt/vmm/tests/test_cuda_vmm_smoke.py
+        --ignore=memopt/vmm/tests/test_torch_allocator_sanity.py
+    - python3 -c "
+        import memopt;
+        import memopt.orchestrator;
+        import memopt.integrations;
+        memopt.orchestrator.start();
+        memopt.orchestrator.stop();
+        print(f'memopt v{memopt.__version__} imports OK')
+        "
+
+test:python3.10:
+  <<: *test_template
+  image: python:3.10-slim
+
+test:python3.11:
+  <<: *test_template
+  image: python:3.11-slim
+
+test:python3.12:
+  <<: *test_template
+  image: python:3.12-slim
+
+perf:microbench:
+  stage: perf
+  image: python:3.12-slim
+  needs:
+    - test:python3.12
+  before_script:
+    - python3 -m pip install --upgrade pip
+    - pip install -e ".[dev]"
+  script:
+    - PYTHONPATH=. python3 -m pytest -m perf
+        memopt/orchestrator/tests/test_perf_microbench.py -q
