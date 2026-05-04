@@ -7,6 +7,19 @@
 > synthesis, and OpenAI-compatible serving are *consumers* of the fabric,
 > not its identity.
 
+> **v1.3.0 architecture map (current — 2026-05-04).** memopt now
+> ships **two infrastructure layers** + **eight product pillars**.
+> The live map lives in `README.md` under "What It Does"; the design
+> contracts are in `docs/substrate_v1_design.md` (Layer 1),
+> `docs/orchestrator_v1_design.md` (Layer 2), and
+> `docs/oracle_v1_design.md` (Layer 3 discovery). Pillars 4, 6, 7
+> were revived from `memopt-trust-archive` per
+> `docs/pillar_revival_plan.md` and wired to Layers 1+2 via
+> `memopt/integrations/`. The text below this banner is the historical
+> "complete technical reference" snapshot from the pre-Layer-2 era and
+> may overstate or understate parts of the current 8-pillar stack —
+> when in doubt, prefer the design docs and README.
+
 **Language:** Python 3.10+ (control plane), C++17 (data plane), CUDA 12.4+ (GPU kernels)
 **Validated on:** NVIDIA A100-SXM4-80GB · A100 80GB PCIe · RTX 4090 · RTX PRO 6000 Blackwell (102 GB) · PyTorch 2.6.0+cu124 · torchao 0.16.0
 **Test suite:** 688 Python tests pass (21 skipped — clean skips for CockroachDB / AMD ROCm hardware paths), 7 C++ GoogleTest suites, 0 failures
