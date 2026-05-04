@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,daemon,api]"
+
+      - name: Run regression baseline
+        env:
+          MEMOPT_SIGNING_KEY: ci-test-key
+        run: |
+          PYTHONPATH=. python -m pytest tests/ memopt/ -q -p no:cacheprovider \
+            -k 'not gpu and not cuda' \
+            --ignore=memopt/vmm/tests/test_cuda_vmm_smoke.py \
+            --ignore=memopt/vmm/tests/test_torch_allocator_sanity.py
+
+      - name: Smoke test public API imports
+        env:
+          MEMOPT_SIGNING_KEY: ci-test-key
+        run: |
+          python -c "
+          import memopt
+          import memopt.orchestrator
+          import memopt.integrations
+          import memopt.observability
+          import memopt.finops.tracker
+          import memopt.trust.receipt
+          import memopt.kernels.certification
+          memopt.orchestrator.start()
+          memopt.orchestrator.stop()
+          print(f'memopt v{memopt.__version__} imports OK')
+          "
+
+  perf:
+    name: Perf microbench (smoke; ordering-only)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run @perf microbench
+        run: |
+          PYTHONPATH=. python -m pytest -m perf \
+            memopt/orchestrator/tests/test_perf_microbench.py -q
+
+  lint:
+    name: Lint (Black --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Black
+        run: pip install "black>=23.0.0"
+      - name: Black --check (substrate + orchestrator + integrations only)
+        run: |
+          black --check memopt/substrate memopt/orchestrator memopt/integrations || \
+            echo "::warning::black --check failed for shipped layers; not blocking CI yet"
+
+  license-audit:
+    name: License audit (pip-licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "."
+          pip install pip-licenses
+      - name: Audit transitive license tree
+        run: |
+          pip-licenses --format=plain --with-urls --order=license
