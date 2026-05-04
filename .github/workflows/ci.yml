@@ -28,10 +28,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
+      - name: Install CPU-only torch first (avoids CUDA wheel pull on Linux runners)
         run: |
           python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install memopt + extras
+        run: |
           pip install -e ".[dev,daemon,api]"
+          pip install psutil
 
       - name: Run regression baseline
         env:
@@ -69,9 +74,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install
+      - name: Install (CPU torch first)
         run: |
           python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[dev]"
       - name: Run @perf microbench
         run: |
