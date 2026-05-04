@@ -7,12 +7,17 @@ from .process_monitor import ProcessMonitor, GPUProcess, GPUState
 from .scheduler import SafeScheduler, OptimizationTask, OptimizationState
 from .reporter import DashboardReporter, get_reporter, init_reporter
 
-# Zero-touch scan/apply API
+# Zero-touch scan API. The apply / zero-touch / ROI helpers were
+# removed in commit c5705a3 ("optimizations deleted……") and are not
+# being revived (per docs/pillar_revival_plan.md M7). Their __all__
+# entries have been dropped accordingly.
 from .scanner import GPUScanner
 from .scanner import GPUProcess as ScannedGPUProcess
 from .process_inspector import ProcessInspector, ProcessProfile
 from .report import ScanReporter
-from .apply import ApplyEngine, ApplyResult
+
+# Control plane reporter
+from .reporter import ControlPlaneReporter
 
 __all__ = [
     "MemoptDaemon",
@@ -26,28 +31,12 @@ __all__ = [
     "DashboardReporter",
     "get_reporter",
     "init_reporter",
-    # Scan/apply
+    # Scan
     "GPUScanner",
     "ScannedGPUProcess",
     "ProcessInspector",
     "ProcessProfile",
     "ScanReporter",
-    "ApplyEngine",
-    "ApplyResult",
-    # Zero-touch daemon + ROI
-    "ZeroTouchDaemon",
-    "ZeroTouchConfig",
-    "ZeroDaemonConfig",
-    "OptimizationEvent",
-    "ClusterROICalculator",
-    "ROICalculator",
-    "ROIEstimate",
     # Control plane reporter
     "ControlPlaneReporter",
 ]
-
-# Zero-touch daemon + ROI
-
-ZeroDaemonConfig = ZeroTouchConfig  # backward-compat alias
-# Control plane reporter
-from .reporter import ControlPlaneReporter

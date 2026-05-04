@@ -72,8 +72,8 @@ Documentation = "https://docs.memopt.com"
 
 [project.scripts]
 memopt = "memopt.cli:main"
-memopt-wrap = "memopt.wrap.cli:main"
 memopt-serve = "memopt.serving.server:main"
+memopt-certify = "memopt.cli.certify:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

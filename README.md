@@ -2,7 +2,7 @@
 
 A GPU memory profiling, and serving platform that turns GPU clusters into a unified memory fabric. Python control plane, C++17 data plane, optional CUDA kernels.
 
-**339 tests pass | 7 C++ test suites | 0 failures**
+**1013 tests pass | 7 C++ test suites | 0 failures**
 
 ## What It Does
 
