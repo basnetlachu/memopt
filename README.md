@@ -46,8 +46,7 @@ before any "production-ready" claim:
      ships in observation-only mode per `docs/orchestrator_v1_design.md`
      DECISION 7. Eviction-driving Layer 2 ships in `v1.4.0`, not here.
 
-Track these in [docs/pillar_revival_plan.md](docs/pillar_revival_plan.md)
-and the v1.3.0 entry of [CHANGELOG.md](CHANGELOG.md).
+Track these in the v1.3.0 entry of [CHANGELOG.md](CHANGELOG.md).
 
 ## What It Does
 

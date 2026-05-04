@@ -9,7 +9,7 @@ README "Status — production readiness" is checked. Tag `v1.3.0a1`.
 
 
 
-Per `docs/pillar_revival_plan.md` milestones 2-7. Reunifies the
+Reunifies the
 `memopt-trust-archive` pillars (4, 6, 7) with the engine repo, ships
 the public Apache-2.0 license, and wires the revived pillars to the
 Layer 1 substrate + Layer 2 orchestrator through a thin adapter

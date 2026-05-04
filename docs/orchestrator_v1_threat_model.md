@@ -4,7 +4,6 @@
 | --- | --- |
 | Status | v1.0 (Phase A) |
 | Authoritative | `docs/orchestrator_v1_design.md` §2.5 |
-| Step Zero report | `docs/orchestrator_v1_step_zero_report.md` |
 | Builds on | `docs/substrate_v1_threat_model.md` G1–G4 (Layer 1) |
 
 This document lists what the orchestrator (Layer 2) guarantees against

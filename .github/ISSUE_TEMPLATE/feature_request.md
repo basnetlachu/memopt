@@ -25,9 +25,9 @@ Layer 1 substrate, Layer 2 orchestrator, Layer 3 oracle, or pillar?
 
 **Backward compatibility**
 
-Does this break the long-term contract pinned in
-`docs/orchestrator_v1_implementation_prompt.md` §H.4? (If yes, this
-is a major-version change and needs a redesign cycle.)
+Does this break the long-term API contract documented in
+`docs/substrate_v1_design.md` or `docs/orchestrator_v1_design.md`?
+(If yes, this is a major-version change and needs a redesign cycle.)
 
 **Test plan**
 

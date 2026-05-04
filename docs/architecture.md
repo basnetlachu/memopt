@@ -13,8 +13,7 @@
 > contracts are in `docs/substrate_v1_design.md` (Layer 1),
 > `docs/orchestrator_v1_design.md` (Layer 2), and
 > `docs/oracle_v1_design.md` (Layer 3 discovery). Pillars 4, 6, 7
-> were revived from `memopt-trust-archive` per
-> `docs/pillar_revival_plan.md` and wired to Layers 1+2 via
+> were re-integrated from a sibling archive and wired to Layers 1+2 via
 > `memopt/integrations/`. The text below this banner is the historical
 > "complete technical reference" snapshot from the pre-Layer-2 era and
 > may overstate or understate parts of the current 8-pillar stack —

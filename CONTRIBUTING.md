@@ -30,9 +30,10 @@ under the [Apache License 2.0](LICENSE).
 
 ## Architecture rules
 
-memopt is built in layers. The top layers have **20-year contracts**
-(`docs/orchestrator_v1_implementation_prompt.md` §H.4). Do not edit
-files under these paths without a full design redesign:
+memopt is built in layers. The top layers have **long-term API
+contracts** documented in `docs/substrate_v1_design.md` and
+`docs/orchestrator_v1_design.md`. Do not edit files under these paths
+without a full design redesign:
 
   - `memopt/substrate/` — Layer 1 memory substrate (v1.1)
   - `memopt/orchestrator/` — Layer 2 orchestrator (v1.2.0)

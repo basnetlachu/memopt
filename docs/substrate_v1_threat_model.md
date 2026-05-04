@@ -4,7 +4,6 @@
 | --- | --- |
 | Status | v1.0 |
 | Authoritative | `docs/substrate_v1_design.md` §2.6 |
-| Step Zero report | `docs/substrate_v1_step_zero_report.md` |
 | CVE references verified | 2026-04-29 |
 
 This document lists what the substrate guarantees against multi-tenant
