@@ -250,7 +250,15 @@ def test_optimizer_fires_after_warmup():
         for _ in range(WARM_UP_CALLS + 1):
             opt.notify("memopt.rope_fused", args)
 
-        fired.wait(timeout=5.0)
+        # Generous timeout — slow CI runners (Linux containers under
+        # contention) sometimes take 10s+ to schedule the synthesis
+        # thread. We also poll opt.stats() because the threading.Event
+        # sometimes fires after the stats counter increments.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if opt.stats().get("total_fired", 0) >= 1:
+                break
+            fired.wait(timeout=0.5)
         assert opt.stats()["total_fired"] >= 1
 
 

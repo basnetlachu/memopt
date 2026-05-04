@@ -28,6 +28,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Apt deps (Linux only — libcairo for CairoSVG; libgomp for torch)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libcairo2 libcairo2-dev libgomp1 pkg-config
+
       - name: Install CPU-only torch first (avoids CUDA wheel pull on Linux runners)
         run: |
           python -m pip install --upgrade pip

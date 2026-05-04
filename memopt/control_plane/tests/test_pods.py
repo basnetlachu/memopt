@@ -132,8 +132,12 @@ def test_pod_data_survives_restart():
 def test_cli_pod_controller_help():
     """CLI --help works without starting anything."""
     import subprocess
+    import sys
+    # Use sys.executable (the running interpreter) instead of a
+    # hardcoded `.venv/bin/python` path that doesn't exist on CI
+    # runners (GitHub Actions installs Python via setup-python, no venv).
     result = subprocess.run(
-        [".venv/bin/python", "-c",
+        [sys.executable, "-c",
          "import sys; sys.argv=['memopt','pod-controller','--help']; "
          "from memopt.cli import main; main()"],
         capture_output=True, text=True,

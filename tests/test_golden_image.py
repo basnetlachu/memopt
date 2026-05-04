@@ -228,9 +228,17 @@ def test_first_boot_script_syntax():
 
 def test_golden_image_workflow_valid_yaml():
     import yaml
-    path = os.path.join(
-        _REPO_ROOT,
-        ".github/workflows/build_golden_image.yml")
+    import pytest
+    # The build_golden_image workflow was disabled in the v1.3.0 OSS
+    # release prep (renamed to .disabled). When/if it's re-enabled,
+    # this test re-asserts that the YAML still parses. Skip cleanly
+    # while it's disabled.
+    base = os.path.join(_REPO_ROOT, ".github/workflows")
+    candidates = ["build_golden_image.yml", "build_golden_image.yml.disabled"]
+    path = next((os.path.join(base, c) for c in candidates
+                 if os.path.exists(os.path.join(base, c))), None)
+    if path is None:
+        pytest.skip("build_golden_image workflow not present (deferred)")
     with open(path) as f:
         doc = yaml.safe_load(f)
     # YAML parses "on:" as key True when on is unquoted — accept either
