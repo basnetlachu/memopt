@@ -115,10 +115,13 @@ Layer 3 is the ML-driven prefetch oracle (see
 ## Security
 
 If you find a security vulnerability, **do not** open a public issue.
-Email `security@memopt.com` instead. We will respond within 5 business
-days.
+Email `basnetlawservices@gmail.com` with subject line
+`memopt-security: <one-line summary>`. We will acknowledge within 5
+business days. (For first-OSS-release we use a personal email; this
+will move to `security@<future-domain>` when the project gains a
+dedicated org.)
 
 ## Questions
 
-Open a discussion at https://github.com/memopt-team/memopt/discussions
-(repo URL is a placeholder until the public release).
+Open a discussion at https://github.com/basnetlachu/memopt/discussions
+or file an issue at https://github.com/basnetlachu/memopt/issues.

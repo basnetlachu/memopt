@@ -34,8 +34,8 @@ Project maintainers are responsible for clarifying and enforcing the standards
 above and will take appropriate corrective action.
 
 Report instances of abusive, harassing, or otherwise unacceptable behavior to
-`conduct@memopt.com`. All reports will be reviewed promptly and treated as
-confidential.
+`basnetlawservices@gmail.com` with subject line `memopt-conduct: <summary>`.
+All reports will be reviewed promptly and treated as confidential.
 
 ## Attribution
 

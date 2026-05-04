@@ -9,7 +9,7 @@ description = "GPU Memory Bandwidth Profiling & Optimization Platform"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "MemOpt Team", email = "hello@memopt.com"}
+    {name = "Lachu Man Basnet", email = "basnetlawservices@gmail.com"}
 ]
 requires-python = ">=3.8"
 classifiers = [
@@ -67,8 +67,11 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://memopt.com"
-Documentation = "https://docs.memopt.com"
+Homepage      = "https://github.com/basnetlachu/memopt"
+Documentation = "https://github.com/basnetlachu/memopt/tree/main/docs"
+Source        = "https://github.com/basnetlachu/memopt"
+Issues        = "https://github.com/basnetlachu/memopt/issues"
+Changelog     = "https://github.com/basnetlachu/memopt/blob/main/CHANGELOG.md"
 
 [project.scripts]
 memopt = "memopt.cli:main"
