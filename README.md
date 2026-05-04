@@ -1,8 +1,34 @@
 # memopt — GPU Memory Fabric for AI Infrastructure
 
+[![status](https://img.shields.io/badge/status-alpha-orange.svg)](#status--production-readiness)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![tests](https://img.shields.io/badge/tests-1016%20passing-brightgreen.svg)](#)
+[![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](#)
+
 A GPU memory profiling, and serving platform that turns GPU clusters into a unified memory fabric. Python control plane, C++17 data plane, optional CUDA kernels.
 
-**1013 tests pass | 7 C++ test suites | 0 failures**
+**1016 tests pass | 7 C++ test suites | 0 failures** (Mac / no CUDA)
+
+## Status — production readiness
+
+**This is an alpha release (`v1.3.0a1`).** The library is OSS-licensed
+and the test baseline is green on Mac, but the following must complete
+before any "production-ready" claim:
+
+  1. **GPU rig validation** — the 2 `@gpu` tests and 18 cuda-named
+     tests are SKIPPED / DESELECTED on Mac. They must run green on an
+     A100 / H100 host before tagging a non-alpha release.
+  2. **CI must pass on its first push** — `.github/workflows/ci.yml`
+     defines a Linux + Mac × Python 3.10/3.11/3.12 matrix; nothing has
+     run there yet.
+  3. **Live-workload soak** — recommend ≥ 24h soak under representative
+     traffic before declaring "production-ready."
+  4. **Phase B `MEMOPT_USE_ORCHESTRATOR=1`** — Layer 2 (orchestrator)
+     ships in observation-only mode per `docs/orchestrator_v1_design.md`
+     DECISION 7. Eviction-driving Layer 2 ships in `v1.4.0`, not here.
+
+Track these in [docs/pillar_revival_plan.md](docs/pillar_revival_plan.md)
+and the v1.3.0 entry of [CHANGELOG.md](CHANGELOG.md).
 
 ## What It Does
 

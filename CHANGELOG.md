@@ -1,6 +1,13 @@
 # Changelog
 
-## 1.3.0 — Pillar revival + Apache-2.0 release prep
+## 1.3.0a1 — Pillar revival + Apache-2.0 release prep (ALPHA)
+
+**Alpha release.** Library is OSS-licensed and Mac baseline is green
+(1016 PASSED, 0 FAILED), but GPU rig validation has not yet been
+performed for this release. Do NOT run in production until item 1 in
+README "Status — production readiness" is checked. Tag `v1.3.0a1`.
+
+
 
 Per `docs/pillar_revival_plan.md` milestones 2-7. Reunifies the
 `memopt-trust-archive` pillars (4, 6, 7) with the engine repo, ships
