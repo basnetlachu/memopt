@@ -1,8 +1,8 @@
 # memopt — GPU Memory Fabric for AI Infrastructure
 
+[![CI](https://github.com/basnetlachu/memopt/actions/workflows/ci.yml/badge.svg)](https://github.com/basnetlachu/memopt/actions/workflows/ci.yml)
 [![status](https://img.shields.io/badge/status-alpha-orange.svg)](#status--production-readiness)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-1016%20passing-brightgreen.svg)](#)
 [![GPU validated](https://img.shields.io/badge/GPU%20validated-NO-red.svg)](PRODUCTION_READINESS.md)
 [![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](#)
 
@@ -249,7 +249,25 @@ for usage and
 [docs/orchestrator_v1_design.md](docs/orchestrator_v1_design.md) for
 the spec.
 
+## About
+
+memopt is open-sourced by [**Sophisticates**](https://github.com/basnetlachu),
+the company behind the project. The codebase is contributed to the
+public domain under Apache-2.0 so the broader AI-infrastructure
+community can build on it, audit it, and extend it. We use memopt
+internally for our own GPU-memory optimization work and ship every
+improvement back to this public repository.
+
+  - **Maintainer:** Lachu Man Basnet (`basnetlawservices@gmail.com`)
+  - **Issues / discussions:** https://github.com/basnetlachu/memopt/issues
+  - **Security disclosures:** see [CONTRIBUTING.md § Security](CONTRIBUTING.md#security)
+
+If your team uses memopt in production we'd love to hear about it —
+open a discussion on GitHub.
+
 ## License
 
-Proprietary — contact for licensing.
+Apache License 2.0. See [LICENSE](LICENSE) for the full text and
+[NOTICE](NOTICE) for third-party attributions. A pinned dependency
+license audit lives at [docs/license_audit.md](docs/license_audit.md).
 
