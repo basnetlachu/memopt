@@ -1,10 +1,21 @@
-# memopt — GPU Memory Fabric for AI Infrastructure
+# MEMOPT — Universal Memory Fabric for AI Infrastructure
+
+> **MEMOPT** is the open-source universal memory fabric for AI
+> infrastructure, built from first principles by
+> **[Sophisticates](https://sophisticatesai.com)** — a deep tech
+> venture company working across AI, Quantum Computing, Robotics, and
+> Physics. MEMOPT is Sophisticates' flagship product, open-sourced
+> under Apache-2.0 so the broader AI infrastructure community can
+> build on, audit, and extend the hardest part of GPU serving:
+> *memory*.
 
 [![CI](https://github.com/basnetlachu/memopt/actions/workflows/ci.yml/badge.svg)](https://github.com/basnetlachu/memopt/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/memopt-engine.svg)](https://pypi.org/project/memopt-engine/)
 [![status](https://img.shields.io/badge/status-alpha-orange.svg)](#status--production-readiness)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![GPU validated](https://img.shields.io/badge/GPU%20validated-NO-red.svg)](PRODUCTION_READINESS.md)
 [![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](#)
+[![Sophisticates](https://img.shields.io/badge/by-Sophisticates-7C3AED.svg)](https://sophisticatesai.com)
 
 > ## ⚠️  ALPHA — TEST ON YOUR OWN GPU BEFORE PRODUCTION
 >
@@ -78,24 +89,22 @@ Pillars 4, 6, 7 wire to Layer 1/2 through `memopt/integrations/`
 
 ## Quick Start
 
-> **Note:** `pip install memopt` from PyPI is **not yet wired** for the
-> v1.3.0a1 alpha. Install directly from GitHub for now (PyPI publish
-> tracked for the first stable release):
+```bash
+# Install from PyPI:
+pip install memopt-engine
+
+# After installation, the Python import path is `memopt`
+# (distribution-name vs import-name — same convention as
+# `pip install scikit-learn` then `import sklearn`):
+python -c "import memopt; print(memopt.__version__)"
+```
+
+For development from source:
 
 ```bash
-# Install the latest alpha straight from the GitHub main branch
-pip install git+https://github.com/basnetlachu/memopt.git@v1.3.0a1
-
-# Or, for development:
 git clone https://github.com/basnetlachu/memopt.git
 cd memopt
 pip install -e ".[dev,daemon,api]"
-```
-
-When PyPI publishing is done, the install line will simplify to:
-
-```bash
-pip install memopt    # NOT YET AVAILABLE — see above
 ```
 
 ### Profile a Model
@@ -265,21 +274,37 @@ for usage and
 [docs/orchestrator_v1_design.md](docs/orchestrator_v1_design.md) for
 the spec.
 
-## About
+## About MEMOPT
 
-memopt is open-sourced by [**Sophisticates**](https://github.com/basnetlachu),
-the company behind the project. The codebase is contributed to the
-public domain under Apache-2.0 so the broader AI-infrastructure
-community can build on it, audit it, and extend it. We use memopt
-internally for our own GPU-memory optimization work and ship every
-improvement back to this public repository.
+MEMOPT (pronounced *memm-opt*) is a universal memory fabric for AI
+infrastructure. It solves one of the hardest problems in modern GPU
+serving: **memory** — KV-cache OOM under long contexts, redundant KV
+recomputation across requests, HBM stalls from un-fused kernels,
+multi-tier paging across HBM/DRAM/NVMe, cross-node block sharing, and
+auditable energy/cost accountability. memopt unifies all of these
+behind one API, with two pinned infrastructure layers (substrate +
+orchestrator) and eight product pillars layered on top.
 
+It's released under Apache-2.0 so any AI infrastructure team can read
+the source, audit the security guarantees, fork it, contribute back,
+or run it in production without licensing friction.
+
+## About Sophisticates
+
+memopt is built and open-sourced by **[Sophisticates](https://sophisticatesai.com)**
+(pronounced *so-phis-ti-cates*), a deep tech venture company founded
+by **Lachu Man Basnet**. Sophisticates builds companies from first
+principles across **AI, Quantum Computing, Robotics, and Physics**.
+MEMOPT is Sophisticates' flagship product in the AI infrastructure
+vertical.
+
+  - **Website:** [sophisticatesai.com](https://sophisticatesai.com)
   - **Maintainer:** Lachu Man Basnet (`basnetlawservices@gmail.com`)
   - **Issues / discussions:** https://github.com/basnetlachu/memopt/issues
   - **Security disclosures:** see [CONTRIBUTING.md § Security](CONTRIBUTING.md#security)
 
-If your team uses memopt in production we'd love to hear about it —
-open a discussion on GitHub.
+If your team uses memopt in production, we'd love to hear about it —
+open a discussion on GitHub or reach out via sophisticatesai.com.
 
 ## License
 

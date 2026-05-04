@@ -1,10 +1,14 @@
-memopt
+MEMOPT — Universal Memory Fabric for AI Infrastructure
 Copyright 2026 Sophisticates and the memopt Authors
 
-This product includes software developed by Sophisticates
-(https://github.com/basnetlachu) and contributed to the open-source
-community under the Apache-2.0 license at
+This product includes software developed by Sophisticates, a deep
+tech venture company (https://sophisticatesai.com), and contributed
+to the open-source community under the Apache-2.0 license at
 https://github.com/basnetlachu/memopt.
+
+MEMOPT is Sophisticates' flagship AI-infrastructure product. The
+distribution name on PyPI is `memopt-engine` (the import name remains
+`memopt`).
 
 Licensed under the Apache License, Version 2.0 (the "License").
 See the LICENSE file in the project root for the full license text.

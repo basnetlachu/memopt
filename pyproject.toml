@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel", "cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "memopt"
+name = "memopt-engine"
 version = "1.3.0a1"
-description = "GPU Memory Fabric for AI Infrastructure — open-sourced by Sophisticates"
+description = "MEMOPT — Universal Memory Fabric for AI Infrastructure. Open-sourced by Sophisticates (https://sophisticatesai.com)."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
@@ -28,8 +28,9 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 keywords = [
-    "gpu", "memory", "bandwidth", "profiling",
-    "optimization", "llm", "inference", "hbm"
+    "gpu", "memory", "bandwidth", "profiling", "optimization",
+    "llm", "inference", "hbm", "vmm", "kv-cache", "ai-infrastructure",
+    "memory-fabric", "memopt", "sophisticates",
 ]
 dependencies = [
     "torch>=2.0.0",

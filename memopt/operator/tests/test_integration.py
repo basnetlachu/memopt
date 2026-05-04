@@ -175,8 +175,13 @@ def test_example_apiversion_matches_crd():
 
 def test_validate_crds_script():
     """CRD validation script passes."""
+    import sys
+    # Use sys.executable so the subprocess inherits the same Python
+    # environment as the test runner (which has the test deps such as
+    # `yaml` installed). A bare `python3` would resolve via PATH and
+    # may pick a different interpreter without the test deps.
     result = subprocess.run(
-        ["python3", "scripts/validate_crds.py"],
+        [sys.executable, "scripts/validate_crds.py"],
         capture_output=True, text=True,
         cwd=_REPO_ROOT)
     assert result.returncode == 0, \
