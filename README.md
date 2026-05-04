@@ -3,7 +3,26 @@
 [![status](https://img.shields.io/badge/status-alpha-orange.svg)](#status--production-readiness)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![tests](https://img.shields.io/badge/tests-1016%20passing-brightgreen.svg)](#)
+[![GPU validated](https://img.shields.io/badge/GPU%20validated-NO-red.svg)](PRODUCTION_READINESS.md)
 [![python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](#)
+
+> ## ⚠️  ALPHA — TEST ON YOUR OWN GPU BEFORE PRODUCTION
+>
+> **GPU validation has NOT been performed on this release.** The
+> 1016-passing test baseline is Mac / no-CUDA only. The 2 `@gpu` tests
+> + 18 cuda-named tests are SKIPPED / DESELECTED on the release host.
+>
+> **If you are deploying to real GPUs you MUST:**
+>
+>  1. Run the full regression on your target GPU (A100 / H100 / L40S /
+>     ROCm) with the steps in [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md).
+>  2. Soak-test under representative traffic for ≥ 24 hours before
+>     declaring the deployment "production-ready."
+>  3. Set `MEMOPT_SIGNING_KEY` to a high-entropy secret (NOT the default).
+>
+> Do **not** assume "tests pass" means "works on my hardware." See
+> the four blockers in [Status — production readiness](#status--production-readiness)
+> below.
 
 A GPU memory profiling, and serving platform that turns GPU clusters into a unified memory fabric. Python control plane, C++17 data plane, optional CUDA kernels.
 
