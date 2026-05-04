@@ -42,6 +42,15 @@ Development dependencies:
   Cython                        (Apache-2.0)          https://cython.org/
   Black                         (MIT)                 https://black.readthedocs.io/
 
+Transitive (LGPL flag):
+
+  CairoSVG                      (LGPL-3.0-or-later)   https://cairosvg.org/
+                                Pulled in by the PDF / SVG export chain.
+                                LGPL is compatible with Apache-2.0
+                                distribution when dynamically linked
+                                (memopt does not bundle CairoSVG sources).
+                                See docs/license_audit.md for the full audit.
+
 ================================================================================
 ATTRIBUTION
 ================================================================================
