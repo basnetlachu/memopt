@@ -900,20 +900,29 @@ async def agent_optimize(request: AgentRequest, _: str = Security(verify_api_key
 # Scrape with: curl http://localhost:8080/metrics
 
 
-# ── Compliance ledger endpoints — moved to memopt-trust ─────────────────────
-# Pillar 4 (compliance ledger) lives in the memopt-trust archive.
-# These endpoints return 501 in memopt-engine.
-# TODO: Re-enable when memopt-trust integrates back.
+# ── Compliance ledger endpoints — pillar 4 ─────────────────────────────────
+# Pillar 4 (compliance ledger) is wired through memopt.observability.
 
-_LEDGER_MOVED_DETAIL = (
-    "Endpoint moved to memopt-trust. "
-    "Not available in memopt-engine."
-)
+def _get_ledger():
+    """Return a process-singleton OptimizationLedger for the API server."""
+    from memopt.observability.ledger import OptimizationLedger
+    global _LEDGER_SINGLETON
+    try:
+        return _LEDGER_SINGLETON
+    except NameError:
+        pass
+    _LEDGER_SINGLETON = OptimizationLedger()
+    return _LEDGER_SINGLETON
 
 
 @app.get("/ledger")
 async def ledger_entries(n: int = 100, tenant_id: str = Depends(get_tenant)):
-    raise HTTPException(status_code=501, detail=_LEDGER_MOVED_DETAIL)
+    ledger = _get_ledger()
+    entries = ledger.entries(
+        tenant_id=tenant_id if tenant_id != "_default" else None,
+        limit=max(1, min(int(n), 1000)),
+    )
+    return {"tenant_id": tenant_id, "entries": entries}
 
 
 @app.get("/ledger/verify")
@@ -921,7 +930,10 @@ async def ledger_verify(
     tenant_id: Optional[str] = None,
     tenant: str = Depends(get_tenant),
 ):
-    raise HTTPException(status_code=501, detail=_LEDGER_MOVED_DETAIL)
+    ledger = _get_ledger()
+    return ledger.verify(
+        tenant_id=tenant_id if tenant_id else (tenant if tenant != "_default" else None)
+    )
 
 
 @app.get("/ledger/export/csv")
@@ -929,7 +941,11 @@ async def export_ledger_csv(
     period_hours: int = 24,
     tenant_id: str = Depends(get_tenant),
 ):
-    raise HTTPException(status_code=501, detail=_LEDGER_MOVED_DETAIL)
+    from fastapi.responses import PlainTextResponse
+    from memopt.observability.report_exporter import generate_report
+    ledger = _get_ledger()
+    report = generate_report(ledger, tenant_id=tenant_id, period_hours=period_hours)
+    return PlainTextResponse(content=report.to_csv_summary(), media_type="text/csv")
 
 
 @app.get("/ledger/export/report.html")
@@ -937,7 +953,11 @@ async def export_report_html(
     period_hours: int = 24,
     tenant_id: str = Depends(get_tenant),
 ):
-    raise HTTPException(status_code=501, detail=_LEDGER_MOVED_DETAIL)
+    from fastapi.responses import HTMLResponse
+    from memopt.observability.report_exporter import generate_report
+    ledger = _get_ledger()
+    report = generate_report(ledger, tenant_id=tenant_id, period_hours=period_hours)
+    return HTMLResponse(content=report.to_html(), status_code=200)
 
 
 @app.get("/ledger/export/report.pdf")
@@ -945,7 +965,17 @@ async def export_report_pdf(
     period_hours: int = 24,
     tenant_id: str = Depends(get_tenant),
 ):
-    raise HTTPException(status_code=501, detail=_LEDGER_MOVED_DETAIL)
+    from fastapi.responses import Response
+    from memopt.observability.report_exporter import generate_report
+    ledger = _get_ledger()
+    report = generate_report(ledger, tenant_id=tenant_id, period_hours=period_hours)
+    pdf_bytes = report.to_pdf()
+    if pdf_bytes is None:
+        raise HTTPException(
+            status_code=501,
+            detail="PDF export requires reportlab; install via `pip install reportlab`.",
+        )
+    return Response(content=pdf_bytes, media_type="application/pdf")
 
 
 @app.get("/ledger/export/carbon")
@@ -953,7 +983,25 @@ async def export_carbon(
     period_hours: int = 24 * 30,
     tenant_id: str = Depends(get_tenant),
 ):
-    raise HTTPException(status_code=501, detail=_LEDGER_MOVED_DETAIL)
+    from memopt.observability.ledger import CarbonCalculator
+    ledger = _get_ledger()
+    totals = ledger.totals(tenant_id=tenant_id if tenant_id != "_default" else None)
+    energy_kwh_saved = float(totals.get("energy_kwh_saved", 0.0))
+    days = max(1.0, period_hours / 24.0)
+    daily_kwh = energy_kwh_saved / days
+
+    calc = CarbonCalculator()
+    annual = calc.annual_projection(daily_kwh_saved=daily_kwh)
+    return {
+        "tenant_id": tenant_id,
+        "period_hours": period_hours,
+        "totals": totals,
+        "annual_projection": annual,
+        "disclaimer": annual.get(
+            "disclaimer",
+            "Estimate only — not a certified carbon accounting figure.",
+        ),
+    }
 
 
 # ── Tenant management (admin only) ───────────────────────────────────────────
