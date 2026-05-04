@@ -6,14 +6,31 @@ A GPU memory profiling, and serving platform that turns GPU clusters into a unif
 
 ## What It Does
 
-| Pillar | What It Solves | How |
-|--------|---------------|-----|
-| **Infinite Context VMM** | KV cache OOM for long contexts | Multi-tier paging (HBM → DRAM → NVMe) with predictive prefetch |
-| **Global KV Deduplication** | Redundant KV recomputation | Content-addressed cache skips inference on exact prompt hit |
-| **Self-Synthesizing Kernels** | HBM memory stalls | Detects stalls, calls Claude API, synthesizes fused Triton kernels |
-| **Proof of Efficiency** | Energy/cost accountability | Per-batch energy measurement via NVML, SQLite ledger, HMAC-signed certificates |
-| **Global Unified Memory** | Wasted NVMe across nodes | Cross-node block sharing over TCP with lease protocol |
-| **Silicon Certification** | Hardware drift | Correctness + throughput battery, automatic re-synthesis on drift |
+memopt v1.3.0 ships **two infrastructure layers** plus **eight product pillars**.
+
+### Infrastructure layers
+
+| Layer | Purpose | Reference |
+|-------|---------|-----------|
+| **Layer 1 — Substrate** | Tenant-isolated, stream-aware allocator with pluggable backends (CUDA VMM, ROCm/HIP, CXL/NUMA, CPU). Public API: `memopt.alloc / free / context / stats / observe / peek_handle / MemoryHandle`. | [docs/substrate_v1_design.md](docs/substrate_v1_design.md) |
+| **Layer 2 — Orchestrator** | Tenant-aware decision pump on top of the substrate. Public API: `memopt.orchestrator.start / stop / stats / register_policy`. v1.0 ships in observation-only mode (DECISION 7). | [docs/orchestrator_v1_design.md](docs/orchestrator_v1_design.md) |
+
+### Pillars
+
+| # | Pillar | What It Solves | How |
+|---|--------|---------------|-----|
+| 1 | **Infinite Context VMM** | KV cache OOM for long contexts | Multi-tier paging (HBM → DRAM → NVMe) with predictive prefetch |
+| 2 | **Agentic KV Memory** | Redundant KV recomputation across requests | Content-addressed cache skips inference on exact prompt hit |
+| 3 | **Self-Synthesizing Kernels** | HBM memory stalls | Detects stalls, calls Claude API, synthesizes fused Triton kernels |
+| 4 | **AI Compliance Ledger** | Energy / cost accountability + EU AI Act conformity | Per-batch energy measurement, SQLite ledger, HMAC-signed entries, carbon calculator, savings/compliance reports |
+| 5 | **Global Unified Memory** | Wasted NVMe across nodes | Cross-node block sharing over TCP/RDMA with lease protocol |
+| 6 | **Silicon Certification** | Hardware drift | Correctness + throughput battery, drift detector, auto re-cert daemon |
+| 7 | **GPU FinOps Intelligence** | $/hour waste invisibility | Per-tenant utilization → dollar tracking with auditable signed reports |
+| 8 | **Hardware Abstraction** | Multi-backend portability | Unified HAL over CUDA / ROCm / Gaudi / TPU / CPU stubs |
+
+Pillars 4, 6, 7 wire to Layer 1/2 through `memopt/integrations/`
+(`attach_ledger_to_substrate`, `FinOpsPoller`,
+`assemble_production_receipt`).
 
 ## Quick Start
 

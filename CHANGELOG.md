@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.3.0 — Pillar revival + Apache-2.0 release prep
+
+Per `docs/pillar_revival_plan.md` milestones 2-7. Reunifies the
+`memopt-trust-archive` pillars (4, 6, 7) with the engine repo, ships
+the public Apache-2.0 license, and wires the revived pillars to the
+Layer 1 substrate + Layer 2 orchestrator through a thin adapter
+package. Layer 1 substrate and Layer 2 orchestrator source unchanged.
+
+  - **Pillar 4 — AI Compliance ledger** (`memopt/observability/`):
+    `OptimizationLedger` + HMAC-signed entries + `CarbonCalculator`,
+    plus `SavingsReport` / `ComplianceReport` exports
+    (HTML/CSV/JSON/PDF). 4 REST endpoints in
+    `memopt/api/server.py` rewired (no longer 501 stubs).
+  - **Pillar 6 — Silicon certification**
+    (`memopt/kernels/{certification,certify_daemon,drift_detector}.py`):
+    correctness + throughput battery + drift detector + standalone
+    `memopt certify` CLI subcommand + `memopt-certify` script entry
+    point.
+  - **Pillar 7 — GPU FinOps**
+    (`memopt/finops/tracker.py`, `memopt/trust/receipt.py`):
+    per-tenant utilization → dollar tracker + production trust
+    receipt builder.
+  - **Layer 1/2 wiring** (`memopt/integrations/`):
+    `attach_ledger_to_substrate` (substrate events → ledger),
+    `FinOpsPoller` (substrate stats → finops on a daemon thread),
+    `assemble_production_receipt` (`ReceiptBuilder.build_for_request`
+    wrapped to accept any subset of pillars). Pure consumers of the
+    public Layer 1/2 API.
+  - **Open-source readiness**: Apache-2.0 license + LICENSE +
+    NOTICE + CONTRIBUTING.md + CODE_OF_CONDUCT.md (Contributor
+    Covenant 2.1). `pyproject.toml` license field flipped from
+    `"Proprietary"` → `"Apache-2.0"`; classifier added.
+  - **Drift cleanup**: fixed `memopt/daemon/__init__.py` (was
+    raising `ModuleNotFoundError` on import — unreached by tests
+    but broken nonetheless), removed `memopt-wrap` ghost script
+    entry from `pyproject.toml`, refreshed README test count.
+
+Mac baseline: 876 → **1013 PASSED** (+137), 34 SKIPPED, 18 DESELECTED
+(+3 cuda-named cert tests filtered by `-k 'not cuda'`), 0 FAILED.
+
+### What v1.3.0 does NOT deliver
+
+  - Phase B `MEMOPT_USE_ORCHESTRATOR=1` flag (Layer 2 stays
+    observation-only per `docs/orchestrator_v1_design.md` DECISION 7).
+  - GPU rig re-validation — Mac baseline only; the 2 `@gpu` tests
+    skipped on Mac and the 18 cuda-named tests deselected on Mac
+    must be re-run on a CUDA host before any release tag is pushed.
+  - Layer 3 (Prefetch Oracle) — discovery doc only
+    (`docs/oracle_v1_design.md` Phase 1).
+  - Removal of dead `cmd_certificates` / `cmd_migrate` / phase3
+    deferred-import surfaces. They sit inside try/except ImportError
+    blocks and print "feature not available."
+  - Cleanup of the `memopt-trust-archive` sibling repo. v1.3.0
+    supersedes it; the archive should be marked read-only once the
+    1.3.0 tag is pushed.
+
 ## 1.2.0 — Orchestrator v1 (Phase A)
 
 Orchestrator v1 release — Phase A complete (per `docs/orchestrator_v1_design.md`).
