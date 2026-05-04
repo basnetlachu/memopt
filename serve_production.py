@@ -3,12 +3,22 @@ memopt production serving test.
 Deploys a model with all pillars active.
 Fires 100 concurrent requests.
 Reports per-pillar metrics.
+
+Security: this script REQUIRES MEMOPT_SIGNING_KEY to be set in the
+caller's environment. We deliberately do NOT supply a default key —
+shipping a placeholder key in a file labeled 'production' would let a
+caller produce HMAC-signed certificates trivially.
 """
 import sys, os, time, json, threading
 import concurrent.futures
 sys.path.insert(0, '/opt/memopt')
 
-os.environ.setdefault('MEMOPT_SIGNING_KEY', 'production-test-key')
+if not os.environ.get('MEMOPT_SIGNING_KEY'):
+    sys.stderr.write(
+        "ERROR: MEMOPT_SIGNING_KEY is required for production runs. "
+        "Set it to a high-entropy secret before invoking this script.\n"
+    )
+    sys.exit(2)
 os.environ.setdefault('MEMOPT_GKD_TENANT_ISOLATION', 'true')
 
 print('=' * 60)
