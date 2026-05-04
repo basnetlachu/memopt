@@ -78,8 +78,24 @@ Pillars 4, 6, 7 wire to Layer 1/2 through `memopt/integrations/`
 
 ## Quick Start
 
+> **Note:** `pip install memopt` from PyPI is **not yet wired** for the
+> v1.3.0a1 alpha. Install directly from GitHub for now (PyPI publish
+> tracked for the first stable release):
+
 ```bash
-pip install memopt
+# Install the latest alpha straight from the GitHub main branch
+pip install git+https://github.com/basnetlachu/memopt.git@v1.3.0a1
+
+# Or, for development:
+git clone https://github.com/basnetlachu/memopt.git
+cd memopt
+pip install -e ".[dev,daemon,api]"
+```
+
+When PyPI publishing is done, the install line will simplify to:
+
+```bash
+pip install memopt    # NOT YET AVAILABLE — see above
 ```
 
 ### Profile a Model
