@@ -1,0 +1,59 @@
+memopt
+Copyright 2026 The memopt Authors
+
+This product includes software developed at the memopt project
+(https://memopt.com).
+
+Licensed under the Apache License, Version 2.0 (the "License").
+See the LICENSE file in the project root for the full license text.
+
+================================================================================
+THIRD-PARTY SOFTWARE
+================================================================================
+
+This product depends on and may include code from the following
+third-party packages. Each is distributed under its own license. A
+runtime license audit can be produced with:
+
+    pip install pip-licenses
+    pip-licenses --format=plain
+
+Core runtime dependencies:
+
+  PyTorch                       (BSD-3-Clause)        https://pytorch.org/
+  NumPy                         (BSD-3-Clause)        https://numpy.org/
+
+Optional runtime dependencies (per `pyproject.toml [project.optional-dependencies]`):
+
+  pybind11                      (BSD-3-Clause)        https://github.com/pybind/pybind11
+  scikit-build-core             (Apache-2.0)          https://scikit-build-core.readthedocs.io/
+  CMake                         (BSD-3-Clause)
+  Ninja                         (Apache-2.0)
+  pynvml                        (BSD-3-Clause)        https://pypi.org/project/pynvml/
+  PyYAML                        (MIT)                 https://pyyaml.org/
+  httpx                         (BSD-3-Clause)        https://www.python-httpx.org/
+  FastAPI                       (MIT)                 https://fastapi.tiangolo.com/
+  Uvicorn                       (BSD-3-Clause)        https://www.uvicorn.org/
+  prometheus-client             (Apache-2.0)          https://github.com/prometheus/client_python
+
+Development dependencies:
+
+  pytest                        (MIT)                 https://docs.pytest.org/
+  Cython                        (Apache-2.0)          https://cython.org/
+  Black                         (MIT)                 https://black.readthedocs.io/
+
+================================================================================
+ATTRIBUTION
+================================================================================
+
+The substrate event-ring (`memopt/substrate/events.py`) and CCA stream
+semantics (`memopt/substrate/stream_registry.py`) are influenced by
+the design of PyTorch's caching CUDA allocator (BSD-3-Clause). See the
+file headers for specific design references.
+
+The classical Markov-chain predictor in `memopt/orchestrator/predict.py`
+is a greenfield implementation; the algorithmic shape (transition /
+sequential / recency / fallback) mirrors the legacy
+`memopt/vmm/_oracle_py.py` for parity with the legacy VMM, but does
+not import from it (verified by static AST scan in
+`memopt/orchestrator/tests/test_decision_d1_greenfield.py`).
