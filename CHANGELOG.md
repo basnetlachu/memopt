@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0a2 — Metadata + doc cleanup (ALPHA)
+
+Patch on top of 1.3.0a1. No code change.
+
+  - Maintainer email corrected to `lachu.basnet@sophisticatesai.com`
+    (the 1.3.0a1 wheel carried the wrong email; PyPI does not allow
+    re-uploading the same version, so this 1.3.0a2 republish carries
+    the corrected metadata).
+  - Removed `docs/oracle_v1_design.md` (Layer 3 Phase 1 internal
+    discovery doc; Layer 3 itself is not in this release).
+  - Softened the security/conduct boilerplate language.
+
+Mac baseline unchanged: 1016 PASSED, 34 SKIPPED, 18 DESELECTED, 0 FAILED.
+
 ## 1.3.0a1 — Pillar revival + Apache-2.0 release prep (ALPHA)
 
 **Alpha release.** Library is OSS-licensed and Mac baseline is green

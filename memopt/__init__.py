@@ -44,7 +44,7 @@ Training Optimization:
         trainer.train()
 """
 
-__version__ = "1.3.0a1"
+__version__ = "1.3.0a2"
 
 
 def _emit_alpha_gpu_warning() -> None:
