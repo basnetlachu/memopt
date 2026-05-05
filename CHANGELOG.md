@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0a3 — Republish (PyPI 400 on a2) (ALPHA)
+
+The 1.3.0a2 publish hit a PyPI 400 in the upload step (queued workflow
+ran after a tag move; clean republish under a fresh version sidesteps
+all queue / SHA staleness). No code change vs 1.3.0a2.
+
 ## 1.3.0a2 — Metadata + doc cleanup (ALPHA)
 
 Patch on top of 1.3.0a1. No code change.
