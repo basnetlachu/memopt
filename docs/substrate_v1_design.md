@@ -3261,9 +3261,9 @@ The bridge test does NOT assert:
 
 ### 3.5 Implementation commit plan (ADDITION 4)
 
-Phase A is delivered as 16 commits. Each commit is one Claude
-Code invocation, reviewed by the user before the next is
-launched. No bulk commits; each is independently revertible.
+Phase A is delivered as 16 commits. Each commit is reviewed by the
+maintainer before the next is launched. No bulk commits; each is
+independently revertible.
 
 | #   | Commit                                                  | Touches                                                       | New tests                                                                    | Regression run |
 | --- | ------------------------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------- | -------------- |

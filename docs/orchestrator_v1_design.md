@@ -2919,10 +2919,9 @@ memopt/orchestrator/tests/test_perf_microbench.py
 
 ### 3.5 Implementation commit plan
 
-Phase A is delivered as **14 commits** in **5 milestones**.
-Each commit is one Claude Code invocation, reviewed by the user
-before the next is launched. No bulk commits; each is
-independently revertible.
+Phase A is delivered as **14 commits** in **5 milestones**. Each
+commit is reviewed by the maintainer before the next is launched.
+No bulk commits; each is independently revertible.
 
 #### Milestones
 
