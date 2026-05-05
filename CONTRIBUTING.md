@@ -93,15 +93,13 @@ When proposing a feature, describe:
 
 ## Layer 3 (Prefetch Oracle) contributions
 
-Layer 3 is the ML-driven prefetch oracle (see
-`docs/oracle_v1_design.md` Phase 1). It plugs into Layer 2's
-`Predictor` protocol. To contribute a new predictor:
+Layer 3 is a planned ML-driven prefetch oracle that plugs into Layer
+2's `Predictor` protocol. To contribute a new predictor implementation:
 
-1. Read `docs/oracle_v1_design.md` end-to-end.
-2. Implement the four-method protocol (`observe`, `predict`,
-   `forget_tenant`, `stats`).
-3. Honor the `(tenant, tag)` key invariant.
-4. Add a fallback to the classical Layer-2 predictor when confidence
+1. Implement the four-method protocol on Layer 2's `Predictor`
+   interface (`observe`, `predict`, `forget_tenant`, `stats`).
+2. Honor the `(tenant, tag)` key invariant.
+3. Add a fallback to the classical Layer-2 predictor when confidence
    is low — the classical predictor at `memopt/orchestrator/predict.py`
    is the long-term safety net and must never be deleted.
 
@@ -115,12 +113,9 @@ Layer 3 is the ML-driven prefetch oracle (see
 
 ## Security
 
-If you find a security vulnerability, **do not** open a public issue.
-Email `basnetlawservices@gmail.com` with subject line
-`memopt-security: <one-line summary>`. We will acknowledge within 5
-business days. (For first-OSS-release we use a personal email; this
-will move to `security@<future-domain>` when the project gains a
-dedicated org.)
+If you find a security vulnerability, please do not open a public
+issue. Email `lachu.basnet@sophisticatesai.com` with the subject
+`memopt-security`. We aim to respond within 5 business days.
 
 ## Questions
 

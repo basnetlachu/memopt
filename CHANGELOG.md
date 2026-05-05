@@ -55,7 +55,7 @@ Mac baseline: 876 → **1013 PASSED** (+137), 34 SKIPPED, 18 DESELECTED
     skipped on Mac and the 18 cuda-named tests deselected on Mac
     must be re-run on a CUDA host before any release tag is pushed.
   - Layer 3 (Prefetch Oracle) — discovery doc only
-    (`docs/oracle_v1_design.md` Phase 1).
+    (planned future work).
   - Removal of dead `cmd_certificates` / `cmd_migrate` / phase3
     deferred-import surfaces. They sit inside try/except ImportError
     blocks and print "feature not available."

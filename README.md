@@ -299,7 +299,7 @@ MEMOPT is Sophisticates' flagship product in the AI infrastructure
 vertical.
 
   - **Website:** [sophisticatesai.com](https://sophisticatesai.com)
-  - **Maintainer:** Lachu Man Basnet (`basnetlawservices@gmail.com`)
+  - **Maintainer:** Lachu Man Basnet (`lachu.basnet@sophisticatesai.com`)
   - **Issues / discussions:** https://github.com/basnetlachu/memopt/issues
   - **Security disclosures:** see [CONTRIBUTING.md § Security](CONTRIBUTING.md#security)
 

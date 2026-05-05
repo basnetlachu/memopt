@@ -9,7 +9,7 @@ description = "MEMOPT — Universal Memory Fabric for AI Infrastructure. Open-so
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "Lachu Man Basnet", email = "basnetlawservices@gmail.com"},
+    {name = "Lachu Man Basnet", email = "lachu.basnet@sophisticatesai.com"},
     {name = "Sophisticates"},
 ]
 requires-python = ">=3.8"

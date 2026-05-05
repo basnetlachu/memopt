@@ -33,9 +33,9 @@ Unacceptable behavior includes:
 Project maintainers are responsible for clarifying and enforcing the standards
 above and will take appropriate corrective action.
 
-Report instances of abusive, harassing, or otherwise unacceptable behavior to
-`basnetlawservices@gmail.com` with subject line `memopt-conduct: <summary>`.
-All reports will be reviewed promptly and treated as confidential.
+Report instances of abusive, harassing, or otherwise unacceptable behavior
+to `lachu.basnet@sophisticatesai.com` with the subject `memopt-conduct`.
+Reports are reviewed promptly and treated as confidential.
 
 ## Attribution
 

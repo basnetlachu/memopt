@@ -12,7 +12,8 @@
 > The live map lives in `README.md` under "What It Does"; the design
 > contracts are in `docs/substrate_v1_design.md` (Layer 1),
 > `docs/orchestrator_v1_design.md` (Layer 2), and
-> `docs/oracle_v1_design.md` (Layer 3 discovery). Pillars 4, 6, 7
+> Layer 3 (a future ML-driven prefetch oracle) is planned but not in
+> this release. Pillars 4, 6, 7
 > were re-integrated from a sibling archive and wired to Layers 1+2 via
 > `memopt/integrations/`. The text below this banner is the historical
 > "complete technical reference" snapshot from the pre-Layer-2 era and
