@@ -2,7 +2,6 @@
 Tests for BloomFilter and its integration with GKDStore.
 No external dependencies. No Redis. No GPU.
 """
-import struct
 
 import pytest
 

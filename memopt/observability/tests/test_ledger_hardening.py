@@ -3,10 +3,7 @@ Ledger hardening tests — disk space, rotation, size tracking.
 """
 import os
 import tempfile
-import time
-from unittest.mock import patch, MagicMock
 
-import pytest
 
 from memopt.observability.ledger import OptimizationLedger
 

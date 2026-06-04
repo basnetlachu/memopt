@@ -19,10 +19,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 
 logger = logging.getLogger("memopt.substrate.events")

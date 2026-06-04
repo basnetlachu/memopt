@@ -12,8 +12,6 @@ import pytest
 
 import memopt
 import memopt.orchestrator as orch
-from memopt.orchestrator.config import OrchestratorConfig
-from memopt.orchestrator.policy import Decision
 from memopt.substrate.manager import AllocationManager
 
 

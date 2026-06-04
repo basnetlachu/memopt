@@ -1,7 +1,6 @@
 """Tests for BackendStrategy ABC (per design §3.1 test_backend_protocol.py)."""
 from __future__ import annotations
 
-import sys
 import typing
 from typing import ClassVar, List, Optional
 

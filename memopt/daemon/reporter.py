@@ -12,9 +12,7 @@ import os
 import socket
 import threading
 import time
-from dataclasses import asdict
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger("memopt.daemon")
 

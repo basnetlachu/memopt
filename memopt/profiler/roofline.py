@@ -12,7 +12,7 @@ Roofline model:
 import subprocess
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 logger = logging.getLogger("memopt.profiler.roofline")
 

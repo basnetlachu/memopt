@@ -130,7 +130,7 @@ def cmd_apply(args) -> int:
         print(f"\n  Success  PID {result.pid_new}  applied=[{opts}]")
         return 0
     elif result.rolled_back:
-        print(f"\n  Rolled back. Original process restarted.")
+        print("\n  Rolled back. Original process restarted.")
         return 1
     else:
         print(f"\n  Not applied: {result.error}")
@@ -184,7 +184,7 @@ def cmd_migrate(args) -> int:
     print(f"  Expected: {plan.estimated_speedup:.1f}x speedup")
 
     if plan.estimated_speedup < 1.5:
-        print(f"  No beneficial migration available.")
+        print("  No beneficial migration available.")
         return 0
 
     if dry_run:
@@ -215,14 +215,14 @@ def cmd_preflight(args) -> int:
     gpu_index  = getattr(args, "gpu", 0)
 
     print(f"\n  Analyzing {model_path}...")
-    print(f"  Loading model structure (no weights required)...")
+    print("  Loading model structure (no weights required)...")
 
     try:
         from transformers import AutoConfig, AutoModelForCausalLM
         import torch
 
         config = AutoConfig.from_pretrained(model_path)
-        print(f"  Config loaded. Tracing graph...")
+        print("  Config loaded. Tracing graph...")
 
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(config)

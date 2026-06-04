@@ -1,7 +1,6 @@
 """End-to-end smoke tests for the assembled substrate (per design §3.1)."""
 from __future__ import annotations
 
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest

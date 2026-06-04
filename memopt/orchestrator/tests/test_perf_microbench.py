@@ -5,24 +5,19 @@ only (per §3.4.4 — absolute thresholds are noise across hardware)."""
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import platform
 import statistics
 import subprocess
-import sys
 import time
-from typing import Dict
 
 import pytest
 
 import memopt
-import memopt.orchestrator as orch
 from memopt.orchestrator.access import AccessTracker
 from memopt.orchestrator.config import OrchestratorConfig
 from memopt.orchestrator.coordinator import OrchestratorCoordinator
 from memopt.orchestrator.policy import (
-    Decision,
     LRUWatermarkPolicy,
     PolicyEngine,
     PolicySnapshot,

@@ -117,7 +117,7 @@ def test_bottleneck_detector_on_gpu():
     assert s["total_profiled"] >= 1
 
     print(f"\n  Detector profiled: {s['total_profiled']} ops")
-    print(f"  Stall rate estimated on real GPU op")
+    print("  Stall rate estimated on real GPU op")
 
 
 def test_full_synthesis_loop():
@@ -169,7 +169,7 @@ def test_full_synthesis_loop():
         print(f"\n  Firing synthesis event for {event.op_name}")
         print(f"  Shapes: {event.input_shapes}")
         print(f"  Hardware: {event.hardware}")
-        print(f"  Waiting for Claude API + Triton compilation (up to 60s)...")
+        print("  Waiting for Claude API + Triton compilation (up to 60s)...")
 
         gen.handle(event)
 
@@ -193,11 +193,11 @@ def test_full_synthesis_loop():
             key = cache_key(event.op_name, event.input_shapes, event.hardware)
             cached = cache.get(key)
             assert cached is not None, "Kernel succeeded but not found in cache"
-            print(f"  Kernel in cache: YES")
+            print("  Kernel in cache: YES")
             print(f"  Cache stats: {cache.stats()}")
         else:
-            print(f"  Kernel discarded — PyTorch baseline already optimal for this shape")
-            print(f"  This is correct behaviour — the discard-if-slower check works")
+            print("  Kernel discarded — PyTorch baseline already optimal for this shape")
+            print("  This is correct behaviour — the discard-if-slower check works")
 
 
 def test_cache_hit_after_synthesis():
@@ -245,7 +245,7 @@ def test_cache_hit_after_synthesis():
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         print(f"\n  Second handle() call: {elapsed_ms:.3f}ms")
-        print(f"  (Should be near-zero — cache hit, no API call)")
+        print("  (Should be near-zero — cache hit, no API call)")
         assert elapsed_ms < 100, \
             f"Second call took {elapsed_ms:.1f}ms — should be cache hit (<100ms)"
 
@@ -286,9 +286,9 @@ def test_baseline_vs_synthesised_benchmark():
 
         gen_stats = gen.stats()
         if gen_stats["total_succeeded"] == 0:
-            print(f"\n  Synthesis discarded — kernel not faster than baseline")
-            print(f"  PyTorch's built-in mm is already highly optimised at this size")
-            print(f"  Architecture is correct — discard-if-slower check worked")
+            print("\n  Synthesis discarded — kernel not faster than baseline")
+            print("  PyTorch's built-in mm is already highly optimised at this size")
+            print("  Architecture is correct — discard-if-slower check worked")
             return
 
         key = cache_key(event.op_name, event.input_shapes, event.hardware)
@@ -320,14 +320,14 @@ def test_baseline_vs_synthesised_benchmark():
         speedup = baseline_ms / max(kernel_ms, 1e-9)
 
         print(f"\n{'='*56}")
-        print(f"  PILLAR 3 SYNTHESIS RESULTS")
+        print("  PILLAR 3 SYNTHESIS RESULTS")
         print(f"{'='*56}")
         print(f"  GPU:              {torch.cuda.get_device_name(0)}")
-        print(f"  Op:               torch.mm [2048x4096] x [4096x2048] fp16")
+        print("  Op:               torch.mm [2048x4096] x [4096x2048] fp16")
         print(f"  Baseline (PyTorch): {baseline_ms:.3f}ms per call")
         print(f"  Synthesised kernel: {kernel_ms:.3f}ms per call")
         print(f"  Speedup:            {speedup:.2f}x")
-        print(f"  Kernel in cache:    YES")
+        print("  Kernel in cache:    YES")
         print(f"{'='*56}")
 
         assert speedup >= 1.05, \

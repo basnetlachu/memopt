@@ -22,7 +22,7 @@ import time
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Callable, Any, Deque, Tuple, Optional
+from typing import Dict, List, Callable, Any, Deque, Tuple
 from enum import Enum
 from contextlib import contextmanager
 

@@ -15,7 +15,7 @@ falls back to PyTorch silently. Inference correctness is never at risk.
 from __future__ import annotations
 import logging
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:  # never executed at runtime; satisfies Pylance for annotations
     import torch

@@ -6,12 +6,11 @@ GPU-dependent tests skip cleanly when CUDA is unavailable.
 import os
 import time
 import types
-import threading
 import tempfile
 import pytest
 
 from memopt.kernels.bottleneck_detector import (
-    BottleneckDetector, BottleneckEvent, STALL_THRESHOLD, WINDOW_OPS
+    BottleneckDetector, BottleneckEvent
 )
 from memopt.kernels.jit_generator import JITGenerator
 from memopt.kernels.portability_layer import PortabilityLayer
@@ -343,14 +342,6 @@ def test_portability_layer_returns_correct_strategy():
     # profile() returns the pre-detected HardwareProfile
     assert hw.backend == detect_hardware().backend
     assert layer.target() in ("cuda", "rocm", "cpu")
-
-
-def test_portability_bad_source_returns_none():
-    """Syntax errors in generated source must not raise — return None."""
-    layer = PortabilityLayer()
-    # Confirmed existing test still passes with new implementation
-    result = layer.compile("this is not valid python!!!", "cuda")
-    assert result is None
 
 
 def test_arch_aware_prompt_contains_block_size():

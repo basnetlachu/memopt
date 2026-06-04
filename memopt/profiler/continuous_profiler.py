@@ -17,7 +17,7 @@ import time
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Deque
+from typing import List, Callable, Deque
 from enum import Enum
 from contextlib import contextmanager
 
@@ -501,7 +501,7 @@ class ContinuousProfiler:
             ])
 
             if bottleneck.recommendations:
-                lines.append(f"   Recommendations:")
+                lines.append("   Recommendations:")
                 for rec in bottleneck.recommendations[:2]:
                     lines.append(f"     - {rec}")
 

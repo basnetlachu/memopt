@@ -10,7 +10,6 @@ import pytest
 from memopt.orchestrator.policy import (
     Decision,
     LRUWatermarkPolicy,
-    Policy,
     PolicyEngine,
     PolicySnapshot,
 )

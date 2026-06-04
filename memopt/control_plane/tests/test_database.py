@@ -4,11 +4,10 @@ No PostgreSQL required (uses SQLite :memory:).
 """
 import time
 
-import pytest
 
 from memopt.control_plane.database import (
     Database, SQLiteBackend, make_backend,
-    _pg_to_sqlite, MIGRATIONS,
+    _pg_to_sqlite,
 )
 
 
@@ -59,7 +58,6 @@ def test_make_backend_sqlite_default():
 
 def test_make_backend_postgresql_no_psycopg2():
     """PostgreSQL URL without psycopg2 → SQLite fallback."""
-    import unittest.mock as mock
     import sys
 
     # Temporarily make psycopg2 unimportable

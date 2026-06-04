@@ -72,7 +72,7 @@ assert _struct.calcsize(CONNECT_REQ_FMT) == 328
 # ReadRequest: node_id(64s) + remote_addr(Q) + rkey(I) + pad(I) +
 #              local_addr(Q) + size(I) + pad(I) + request_id(Q)
 READ_REQ_FMT = "<64sQIIQIIQ"
-assert _struct.calcsize(READ_REQ_FMT) == 112
+assert _struct.calcsize(READ_REQ_FMT) == 104
 
 # WriteRequest: same layout as ReadRequest
 WRITE_REQ_FMT = READ_REQ_FMT

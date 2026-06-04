@@ -31,8 +31,8 @@ Usage:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable
+from dataclasses import dataclass
+from typing import Dict, Optional, Any, Callable
 from contextlib import contextmanager
 
 import torch

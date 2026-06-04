@@ -2,7 +2,6 @@
 Tests for make_control_plane_callback.
 All pass without GPU, without API key, without control plane running.
 """
-import pytest
 from unittest.mock import MagicMock, patch
 
 

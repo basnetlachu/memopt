@@ -3,12 +3,9 @@ VMM hardening tests — thread survival, health checks, NVMe cap.
 """
 import os
 import tempfile
-import time
 
-import pytest
 
 from memopt.vmm import VMM
-from memopt.vmm.prefetch_engine import PrefetchEngine
 
 
 def test_is_healthy_returns_true_when_running():

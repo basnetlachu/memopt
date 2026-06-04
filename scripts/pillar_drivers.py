@@ -11,8 +11,6 @@ import os
 import sys
 import time
 import traceback
-import socket
-import threading
 from pathlib import Path
 
 sys.path.insert(0, "/root/memopt")
@@ -198,7 +196,7 @@ def p3_jit():
 # ──────────────────────────────────────────────────────────────────────
 @pillar("P4_Observability")
 def p4_obs():
-    from memopt.observability.collector import MetricsCollector, MetricRegistry
+    from memopt.observability.collector import MetricRegistry
     from memopt.observability.ledger import OptimizationLedger
     from memopt.observability.certificate import sign_entry, verify_certificate
     reg = MetricRegistry()

@@ -3,7 +3,6 @@ GKD hardening tests — Redis fallback, LCP caps, TTL enforcement.
 """
 import os
 import time
-from unittest.mock import MagicMock, patch
 
 import pytest
 

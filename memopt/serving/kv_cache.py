@@ -14,7 +14,7 @@ VMM integration (opt-in, lazy):
 import torch
 import torch.nn as nn
 import logging
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
 # VMM integration — lazy to avoid circular imports and remain opt-in

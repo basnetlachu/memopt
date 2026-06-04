@@ -16,9 +16,7 @@ from memopt.orchestrator.config import OrchestratorConfig
 from memopt.orchestrator.coordinator import OrchestratorCoordinator
 from memopt.orchestrator.policy import (
     Decision,
-    LRUWatermarkPolicy,
     PolicyEngine,
-    PolicySnapshot,
 )
 from memopt.orchestrator.predict import Predictor
 from memopt.orchestrator.telemetry import TelemetryCollector

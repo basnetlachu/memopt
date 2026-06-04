@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 from .access_log import AccessLog, BlockAccessEvent
 from .universal_profile import UniversalMemoryProfile, detect_universal_profile
@@ -292,7 +292,6 @@ class PrefetchEngine:
     def _check_nvme_cap(self) -> None:
         """Evict oldest NVMe blocks if usage exceeds 90% of MEMOPT_NVME_MAX_GB."""
         try:
-            import shutil
             nvme_dir = getattr(self, '_nvme_dir', None)
             if nvme_dir is None:
                 nvme_dir = os.environ.get('MEMOPT_NVME_DIR', '')

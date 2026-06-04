@@ -5,7 +5,6 @@ import json
 import os
 import time
 
-import pytest
 
 
 def test_global_oracle_config_from_env():

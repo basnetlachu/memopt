@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Callable, Any
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
 from .gpu_specs import GPU_L2_CACHE_MB
@@ -251,9 +251,6 @@ class CoalescingAnalyzer:
 
         if efficiency is not None:
             return efficiency
-
-        # Estimate from DRAM throughput vs theoretical peak
-        dram_throughput = ncu_metrics.get("dram__bytes.sum.per_second", 0)
 
         # If we have stall metrics, use them to estimate efficiency
         stall_long = ncu_metrics.get("smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct", 0)

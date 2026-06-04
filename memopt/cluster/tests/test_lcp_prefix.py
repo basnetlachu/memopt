@@ -5,9 +5,8 @@ All 15 existing GKD tests pass unchanged.
 """
 import json
 import pathlib
-import pytest
 from memopt.cluster.prefix_index import (
-    BLOCK_SIZE, prefix_key, register_prefixes, lookup_longest_prefix,
+    prefix_key, register_prefixes, lookup_longest_prefix,
     find_lcp, _verify_fingerprint_fast,
 )
 

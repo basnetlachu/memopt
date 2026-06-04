@@ -9,15 +9,12 @@ import socket
 import tempfile
 import threading
 import hashlib
-import pytest
 
 from memopt.cluster.block_directory import (
     LocalBlockDirectory, BlockEntry, make_directory
 )
 from memopt.cluster.remote_block import (
     RemoteBlockServer, RemoteBlockClient,
-    MSG_ADVERTISE, MSG_REQUEST, MSG_TRANSFER, MSG_ERROR,
-    _send_frame, _recv_frame,
 )
 
 

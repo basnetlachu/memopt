@@ -5,7 +5,6 @@ import os
 import time
 import tempfile
 
-import pytest
 
 
 def test_pod_controller_uses_discovery_peers():

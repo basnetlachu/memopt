@@ -4,10 +4,9 @@ Uses pynvml or nvidia-smi fallback to detect running GPU processes.
 """
 
 import subprocess
-import time
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime
 
 logger = logging.getLogger("memopt.daemon")

@@ -5,7 +5,6 @@ import tempfile
 import pytest
 
 from memopt.vmm.universal_profile import (
-    MemoryTier,
     UniversalMemoryProfile,
     detect_universal_profile,
 )

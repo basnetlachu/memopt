@@ -9,7 +9,7 @@ from __future__ import annotations
 import hmac
 import os
 import threading
-from typing import Dict, Optional
+from typing import Dict
 
 
 _EVENT_KINDS = ("alloc", "free", "evict", "promote", "migrate")

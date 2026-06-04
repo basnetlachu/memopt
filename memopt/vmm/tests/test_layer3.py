@@ -14,7 +14,7 @@ from memopt.vmm.federation import (
     _send_frame,
 )
 from memopt.vmm.elastic_allocator import (
-    AllocationDecision, AllocatorStats, ElasticAllocator, NodeMemoryState,
+    AllocatorStats, ElasticAllocator, NodeMemoryState,
 )
 from memopt.vmm.memory_governor import (
     GovernorStats, MemoryGovernor,
@@ -340,7 +340,7 @@ def test_governor_stats_fields():
 
 def test_bounded_fanout_limits_peers():
     """Gossip sends to at most FANOUT peers, not all."""
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import patch
 
     oracle = MemoryOracle()
     oracle.observe("s1", 0, step=1)

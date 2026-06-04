@@ -496,7 +496,6 @@ class _BackendAdapter:
         # CUDA / other: stage through host
         try:
             import torch
-            t = torch.empty(end - offset, dtype=torch.uint8, device="cuda")
             # Direct device pointer copy via cudaMemcpy is non-trivial here;
             # use as_tensor.cpu() round-trip.
             tensor = handle.as_tensor(torch.uint8, (handle.size_bytes,))

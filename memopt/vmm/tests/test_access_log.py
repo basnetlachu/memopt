@@ -2,12 +2,10 @@
 import dataclasses
 import json
 import os
-import queue
 import tempfile
 import threading
 import time
 
-import pytest
 
 from memopt.vmm.access_log import AccessLog, BlockAccessEvent
 

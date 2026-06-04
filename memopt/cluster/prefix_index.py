@@ -14,7 +14,7 @@ import json
 import logging
 from typing import List, Optional, Tuple
 
-from memopt.cluster.hashing import compute_hash, FINGERPRINT_TOKENS
+from memopt.cluster.hashing import FINGERPRINT_TOKENS
 
 logger = logging.getLogger(__name__)
 

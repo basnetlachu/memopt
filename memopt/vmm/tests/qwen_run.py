@@ -10,10 +10,8 @@ Must be two processes because `torch.cuda.memory.change_current_allocator`
 cannot be called after CUDA has already been used in-process.
 """
 import json
-import os
 import sys
 import time
-import gc
 from pathlib import Path
 
 if len(sys.argv) != 3 or sys.argv[1] not in ("baseline", "memopt"):

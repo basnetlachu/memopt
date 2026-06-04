@@ -1,7 +1,6 @@
 """Tests for the Layer 1/2 <-> pillar wiring."""
 from __future__ import annotations
 
-import os
 import time
 
 import pytest

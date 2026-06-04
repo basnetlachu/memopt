@@ -6,7 +6,7 @@ The benchmark tests print real numbers that can go directly into a pitch deck.
 """
 import time
 import pytest
-from memopt.cluster.gkd_store import GKDStore, LocalGKDBackend
+from memopt.cluster.gkd_store import GKDStore
 from memopt.cluster.hashing import (
     compute_hash, make_fingerprint, verify_fingerprint
 )
@@ -174,7 +174,7 @@ def test_economics_1000_users_same_pdf():
         assert hit.block_ref == "pdf_block:0"
 
     s = gkd.stats()
-    print(f"\n  === GKD Economics: 1,000 users, same PDF ===")
+    print("\n  === GKD Economics: 1,000 users, same PDF ===")
     print(f"  Total lookups:          {s['total_lookups']:,}")
     print(f"  Cache hits:             {s['cache_hits']:,}")
     print(f"  Hit rate:               {s['hit_rate_pct']}%")
@@ -301,7 +301,6 @@ def test_pipeline_get_local_backend():
 
 def test_pipelined_lcp_uses_pipeline_get():
     """GKDStore LCP lookup should call pipeline_get, not sequential gets."""
-    from unittest.mock import patch, MagicMock
     from memopt.cluster.gkd_store import GKDStore
 
     store = GKDStore()

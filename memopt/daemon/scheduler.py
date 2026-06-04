@@ -3,11 +3,10 @@ Safe optimization scheduler.
 Manages when and how to apply optimizations to GPU workloads.
 """
 
-import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Callable
+from typing import Dict, Optional
 from enum import Enum
 
 from .process_monitor import ProcessMonitor, GPUProcess, GPUState

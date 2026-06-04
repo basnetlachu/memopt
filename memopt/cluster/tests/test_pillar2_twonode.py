@@ -16,7 +16,6 @@ Run:
 import json
 import socket
 import time
-import threading
 
 import pytest
 import torch
@@ -146,7 +145,7 @@ def test_cross_node_read_latency(node_b_server, node_a_transport):
     p50 = latencies[49]
     p99 = latencies[98]
 
-    print(f"\n  Cross-node read latency (128KB block via loopback TCP)")
+    print("\n  Cross-node read latency (128KB block via loopback TCP)")
     print(f"    avg : {avg:.3f} ms")
     print(f"    p50 : {p50:.3f} ms")
     print(f"    p99 : {p99:.3f} ms")
@@ -180,7 +179,7 @@ def test_cross_node_bandwidth(node_b_server, node_a_transport):
     transferred_gb = (n_blocks * BLOCK_SIZE) / 1e9
     bandwidth_gbps = transferred_gb / elapsed
 
-    print(f"\n  Cross-node bandwidth")
+    print("\n  Cross-node bandwidth")
     print(f"    transferred : {transferred_gb:.2f} GB")
     print(f"    time        : {elapsed:.2f} s")
     print(f"    bandwidth   : {bandwidth_gbps:.2f} GB/s")
@@ -223,7 +222,7 @@ def test_gkd_cross_node_dedup():
     hbm_saved   = s["estimated_hbm_saved_gb"]
     collisions  = s["collision_detections_total"]
 
-    print(f"\n  GKD cross-node deduplication")
+    print("\n  GKD cross-node deduplication")
     print(f"    hit rate    : {hit_rate:.1f}%")
     print(f"    HBM saved   : {hbm_saved:.3f} GB")
     print(f"    collisions  : {collisions}  (must be 0)")
@@ -257,7 +256,7 @@ def test_hypervisor_borrow_routing():
         f"Same-rack latency estimate {offer.estimated_latency_us}us > 1.0us"
     )
 
-    print(f"\n  Hypervisor borrow routing")
+    print("\n  Hypervisor borrow routing")
     print(f"    donor   : {offer.node_id}")
     print(f"    latency : {offer.estimated_latency_us} us")
 
@@ -271,8 +270,8 @@ def test_cluster_vmm_dual_node():
 
     n = 100
     for i in range(n):
-        vmm_a.allocate(f"seq_a", i, BLOCK_SIZE)
-        vmm_b.allocate(f"seq_b", i, BLOCK_SIZE)
+        vmm_a.allocate("seq_a", i, BLOCK_SIZE)
+        vmm_b.allocate("seq_b", i, BLOCK_SIZE)
 
     sa = vmm_a.stats()
     sb = vmm_b.stats()
@@ -334,10 +333,10 @@ def test_revolutionary_a4000():
 
     try:
         print(f"\n{'='*60}")
-        print(f"  REVOLUTIONARY BENCHMARK — 2x RTX A4000 PCIe")
+        print("  REVOLUTIONARY BENCHMARK — 2x RTX A4000 PCIe")
         print(f"  Same server, loopback TCP (port {server_port})")
         print(f"{'='*60}")
-        print(f"\n  Registering 2,000 x 128KB blocks on Node B...")
+        print("\n  Registering 2,000 x 128KB blocks on Node B...")
 
         buffers_b = []
         regions_b = []
@@ -367,11 +366,11 @@ def test_revolutionary_a4000():
         client_transport = TCPTransport(listen_port=client_port)
         connected = client_transport.connect("node-b", "127.0.0.1", port=server_port)
         assert connected, f"Loopback TCP connection failed — port {server_port}"
-        print(f"  Node A connected via loopback TCP")
+        print("  Node A connected via loopback TCP")
 
         try:
             # ── R1: Cross-node latency ─────────────────────────────────
-            print(f"\n--- R1: Cross-node read latency ---")
+            print("\n--- R1: Cross-node read latency ---")
             dst = bytearray(_BLOCK_SIZE_loc)
             sample = RemoteRegion(
                 node_id="node-b",
@@ -404,7 +403,7 @@ def test_revolutionary_a4000():
             assert avg < 5.0, f"Latency too high: {avg:.3f}ms"
 
             # ── R2: Sustained bandwidth (30s) ──────────────────────────────
-            print(f"\n--- R2: Sustained bandwidth — 30 seconds ---")
+            print("\n--- R2: Sustained bandwidth — 30 seconds ---")
             bytes_xfer = 0
             n_reads    = 0
             read_dst   = bytearray(_BLOCK_SIZE_loc)
@@ -437,7 +436,7 @@ def test_revolutionary_a4000():
             assert bandwidth > 0.5, f"Bandwidth too low: {bandwidth:.3f} GB/s"
 
             # ── R3: GKD at scale — 2,000 requests, 90% repeat ─────────────
-            print(f"\n--- R3: GKD hit rate — 2,000 requests ---")
+            print("\n--- R3: GKD hit rate — 2,000 requests ---")
             hits = misses = 0
             for req in range(2000):
                 if req < 1800:
@@ -466,7 +465,7 @@ def test_revolutionary_a4000():
             assert s["collision_detections_total"] == 0
 
             # ── R4: Cluster VMM memory pooling ─────────────────────────────
-            print(f"\n--- R4: Cluster VMM pressure — both GPUs ---")
+            print("\n--- R4: Cluster VMM pressure — both GPUs ---")
             device_count = torch.cuda.device_count()
             print(f"  CUDA devices: {device_count}")
 
@@ -501,7 +500,7 @@ def test_revolutionary_a4000():
             assert total_virtual > 1.0
 
             # ── R5: Hypervisor — 100 borrow requests ──────────────────────
-            print(f"\n--- R5: Hypervisor routing — 100 borrows ---")
+            print("\n--- R5: Hypervisor routing — 100 borrows ---")
             h = MemoryHypervisor(node_id="rack1-gpu0", enable_network=False)
             h.register_local_node({"dram": 4 * _GB_loc})
             h.register_peer("rack1-gpu1", "127.0.0.1", {"dram": 200 * _GB_loc})
@@ -523,7 +522,7 @@ def test_revolutionary_a4000():
             assert successful == 100
 
             # ── R6: Data integrity ─────────────────────────────────────────
-            print(f"\n--- R6: Data integrity — 50 block verification ---")
+            print("\n--- R6: Data integrity — 50 block verification ---")
             ok = fail = 0
             verify_dst = bytearray(_BLOCK_SIZE_loc)
 
@@ -549,7 +548,7 @@ def test_revolutionary_a4000():
 
             # ── Final results ──────────────────────────────────────────────
             print(f"\n{'='*60}")
-            print(f"  PILLAR 2 RESULTS")
+            print("  PILLAR 2 RESULTS")
             print(f"{'='*60}")
             for k, v in results.items():
                 print(f"  {k}: {v}")

@@ -13,9 +13,9 @@ import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
-from .process_monitor import ProcessMonitor, GPUProcess, GPUState
+from .process_monitor import ProcessMonitor, GPUProcess
 
 logger = logging.getLogger("memopt.daemon")
 

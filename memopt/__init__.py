@@ -57,7 +57,6 @@ def _emit_alpha_gpu_warning() -> None:
     environment — set it ONLY after you have completed Section A
     (GPU regression sweep) of PRODUCTION_READINESS.md."""
     import os
-    import sys
     import warnings
     if os.environ.get("MEMOPT_SUPPRESS_ALPHA_WARNING"):
         return

@@ -13,7 +13,7 @@ Pre-flight flow:
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Dict, Optional, Any
 from enum import Enum
 
@@ -181,7 +181,6 @@ class StaticGraphAnalyzer:
                         batch_size: int) -> Optional[LayerAnalysis]:
         """Analyze a single layer module. Returns None for unknown types."""
         try:
-            import torch.nn as nn
 
             bytes_per_elem = 2  # float16 / bfloat16
 

@@ -8,7 +8,6 @@ DB tests use an in-memory backend for isolation.
 import os
 import subprocess
 
-import pytest
 
 
 # ══════════════════════════════════════════════════════════════════════

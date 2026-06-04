@@ -15,7 +15,6 @@ Environment variables:
 """
 from __future__ import annotations
 import os
-import time
 import logging
 
 logger = logging.getLogger(__name__)

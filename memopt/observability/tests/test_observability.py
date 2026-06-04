@@ -3,18 +3,13 @@ Pillar 4 observability tests.
 All pass with no GPU, no API keys, no network access.
 """
 import os
-import json
 import time
-import hmac
-import hashlib
 import tempfile
-import threading
 import pytest
 
 from memopt.observability.collector   import MetricsCollector, MetricRegistry
 from memopt.observability.ledger      import OptimizationLedger, _compute_savings
-from memopt.observability.certificate import sign_entry, verify_certificate
-from memopt.observability.arbitrage   import ArbitrageEngine, GPUOffer
+from memopt.observability.arbitrage   import ArbitrageEngine
 import memopt.auth.api_key as _ak_mod
 
 
@@ -374,8 +369,7 @@ def test_ledger_tenant_isolation():
 
 def test_ledger_buffer_flushes_on_batch_size():
     """Buffer must flush to SQLite when FLUSH_BATCH_SIZE entries accumulate."""
-    import os
-    from memopt.observability.ledger import OptimizationLedger, FLUSH_BATCH_SIZE
+    from memopt.observability.ledger import OptimizationLedger
 
     with tempfile.TemporaryDirectory() as d:
         ledger = OptimizationLedger(db_path=f"{d}/ledger.db")

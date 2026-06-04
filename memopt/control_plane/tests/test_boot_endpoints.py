@@ -7,7 +7,6 @@ an in-memory SQLite backend for isolation.
 """
 import os
 
-import pytest
 
 
 # ══════════════════════════════════════════════════════════════════════

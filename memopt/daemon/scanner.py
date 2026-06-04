@@ -7,7 +7,7 @@ Never crashes — returns empty list if no GPUs or pynvml fails.
 """
 import os
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Dict
 
 log = logging.getLogger(__name__)

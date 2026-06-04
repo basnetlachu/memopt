@@ -2,8 +2,6 @@
 Tests for control plane degradation tracking.
 All pass without GPU, without Redis.
 """
-import pytest
-from pathlib import Path
 
 
 def test_database_degradation_columns(tmp_path):

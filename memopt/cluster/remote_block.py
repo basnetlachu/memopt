@@ -506,10 +506,6 @@ class RemoteBlockClient:
             if metrics is not None:
                 try:
                     from memopt.cluster.gum_metrics import TransferMeasurement
-                    locality = "unknown"
-                    if geo_router:
-                        locality = geo_router.locality_label(candidate)
-
                     metrics.record_transfer(TransferMeasurement(
                         peer_node_id=node_id,
                         bytes_transferred=len(result) if result else 0,

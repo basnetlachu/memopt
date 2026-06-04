@@ -11,8 +11,8 @@ Orchestrates the full memopt analysis pipeline:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 from pathlib import Path
 
 logger = logging.getLogger("memopt.workflows")

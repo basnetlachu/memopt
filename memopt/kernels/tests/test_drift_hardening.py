@@ -1,12 +1,9 @@
 """
 Drift detector hardening tests — baseline, drift detection, certify daemon.
 """
-import os
 import tempfile
-import time
 from pathlib import Path
 
-import pytest
 
 from memopt.kernels.drift_detector import DriftDetector
 
@@ -78,7 +75,7 @@ def test_certify_daemon_instantiates():
 
 def test_certify_now_runs_immediately():
     """certify_now() should trigger _run_once() synchronously."""
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import patch
     from memopt.kernels.certify_daemon import CertifyDaemon
 
     daemon = CertifyDaemon(node_id="test-node")

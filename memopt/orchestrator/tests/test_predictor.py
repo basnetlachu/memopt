@@ -2,10 +2,9 @@
 DECISION 6). 13 tests per §3.1.2."""
 from __future__ import annotations
 
-import sys
 import threading
 
-from memopt.orchestrator.predict import Predictor, Prediction
+from memopt.orchestrator.predict import Predictor
 
 
 def test_observe_inserts_transition():

@@ -13,7 +13,6 @@ state machine itself is fully exercised by tests.
 """
 from __future__ import annotations
 
-import dataclasses
 import re
 import weakref
 from dataclasses import dataclass, field

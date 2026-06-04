@@ -4,7 +4,6 @@ package does NOT depend on the legacy VMM stack."""
 from __future__ import annotations
 
 import ast
-import os
 import pathlib
 
 import memopt.orchestrator as orch_pkg

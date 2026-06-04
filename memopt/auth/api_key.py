@@ -24,7 +24,7 @@ import stat
 import hmac
 import secrets
 import logging
-from typing import Optional, Dict, Tuple
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

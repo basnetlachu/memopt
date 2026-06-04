@@ -20,8 +20,6 @@ import threading
 import time
 import json
 import logging
-import sqlite3
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query, Security

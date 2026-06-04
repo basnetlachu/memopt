@@ -1,10 +1,7 @@
 """
 GUM hardening tests — lease expiry, fetch retry.
 """
-import time
-from unittest.mock import MagicMock, patch
 
-import pytest
 
 from memopt.cluster.block_directory import BlockEntry, LocalBlockDirectory
 
@@ -66,7 +63,7 @@ def test_can_evict_missing_returns_true():
 def test_fetch_block_retries_on_failure():
     """fetch_block should retry before returning None."""
     import os
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import patch
     from memopt.cluster.remote_block import RemoteBlockClient
 
     client = RemoteBlockClient(node_id="test-node")

@@ -127,13 +127,13 @@ class ScanReporter:
         print(f"      Model    : {prof.model_family}  [{prof.mode}]")
         print(f"      GPU util : {prof.avg_utilization_pct:.0f}%")
         print(
-            f"      Bottleneck: "
+            "      Bottleneck: "
             + _fmt(bneck_label.upper(), bneck_color, color)
             + f"  (AI={prof.arithmetic_intensity:.1f}  ridge={prof.ridge_point:.0f} FLOPS/byte)"
         )
 
         if prof.recommendations:
-            print(f"      Recommendations:")
+            print("      Recommendations:")
             for j, key in enumerate(prof.recommendations, 1):
                 label = OPT_LABELS.get(key, key)
                 marker = "  →" if j == 1 else "   "
@@ -155,7 +155,7 @@ class ScanReporter:
                 )
             )
         else:
-            print(f"      No recommendations available.")
+            print("      No recommendations available.")
 
         # Show throughput opportunities for inference-mode transformer models
         is_transformer = prof.model_family not in ("resnet", "vit", "diffusion", "clip", "unknown")

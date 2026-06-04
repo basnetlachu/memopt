@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
 from .bloom_filter import BloomFilter
-from .hashing import compute_hash, make_fingerprint, verify_fingerprint
+from .hashing import compute_hash, make_fingerprint
 from .prefix_index import _verify_fingerprint_fast
 
 logger = logging.getLogger(__name__)

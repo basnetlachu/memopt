@@ -807,7 +807,7 @@ class TrafficAttributor:
             OptimizationCandidate(
                 optimization_type=OptimizationType.TILING,
                 target=tensors[0] if tensors else "tensors",
-                description=f"Apply tiling to improve temporal locality",
+                description="Apply tiling to improve temporal locality",
                 expected_traffic_reduction_pct=reduction_pct,
                 expected_speedup=1.0 + (reduction_pct / 100) * 0.4,
                 requires_recompilation=True,
@@ -945,7 +945,7 @@ class TrafficAttributor:
             OptimizationCandidate(
                 optimization_type=OptimizationType.KERNEL_FUSION,
                 target="fuse_to_reduce_intermediate",
-                description=f"Fuse kernels to reduce intermediate materialization",
+                description="Fuse kernels to reduce intermediate materialization",
                 expected_traffic_reduction_pct=reduction_pct * 0.5,
                 expected_speedup=1.0 + (reduction_pct / 100) * 0.4,
                 requires_recompilation=True,

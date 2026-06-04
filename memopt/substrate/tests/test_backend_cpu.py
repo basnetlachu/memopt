@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import tracemalloc
 
-import pytest
 
 from memopt.substrate.backends import CPUFallbackBackend
 from memopt.substrate.backends.base import PhysLoc

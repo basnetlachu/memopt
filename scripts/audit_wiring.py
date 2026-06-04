@@ -3,7 +3,7 @@
 memopt wiring audit — verifies C++ components are actually called.
 Run: python scripts/audit_wiring.py
 """
-import sys, os, inspect, importlib, traceback, json
+import sys, os, inspect, importlib, json
 
 # Ensure memopt is importable when run from project root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

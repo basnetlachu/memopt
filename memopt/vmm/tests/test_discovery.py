@@ -3,9 +3,7 @@ Tests for node discovery — capabilities, registration, peer scan.
 All pass without Redis, without GPU.
 """
 import os
-import time
 
-import pytest
 
 from memopt.vmm.discovery import NodeCapabilities, NodeDiscovery
 

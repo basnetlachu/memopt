@@ -6,7 +6,7 @@ Called once at agent startup — result cached for the session.
 import torch
 import torch.nn as nn
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -474,5 +474,3 @@ def _detect_family(model: nn.Module, inputs: Any) -> str:
 
 # ── Unified multi-modal interface ────────────────────────────────────────────
 # Use these instead of model(**inputs) anywhere in the codebase
-from memopt.utils.multimodal import forward as universal_forward  # noqa: E402
-from memopt.utils.multimodal import detect_modality               # noqa: E402

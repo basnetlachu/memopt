@@ -3,14 +3,13 @@ Tests for ScyllaDB GKD backend.
 All tests skip cleanly if cassandra-driver not installed
 or SCYLLA_HOSTS not set.
 """
-import json
 import os
 import unittest.mock as mock
 
 import pytest
 
 from memopt.cluster.gkd_store import (
-    GKDStore, LocalGKDBackend, make_gkd_backend,
+    LocalGKDBackend, make_gkd_backend,
 )
 
 

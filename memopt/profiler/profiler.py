@@ -29,7 +29,7 @@ import time
 import logging
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Any, Iterator
+from typing import List, Optional, Any, Iterator, Tuple
 from contextlib import contextmanager
 
 import torch
@@ -39,14 +39,12 @@ from .hardware_counters import (
     HardwareCounterCollector,
     HardwareCounters,
     CounterCollectionMode,
-    get_gpu_spec,
     GPUSpec,
 )
 from .classifier import (
     BottleneckClassifier,
     BottleneckClassification,
     BottleneckType,
-    Severity,
     PriorityScore,
 )
 
@@ -179,7 +177,7 @@ class LiveDashboard:
             "│  GPU UTILIZATION ANALYSIS - Live Monitoring" + " " * 22 + "│",
             "├" + "─" * 68 + "┤",
             "│" + " " * 68 + "│",
-            f"│  Overall Statistics:" + " " * 47 + "│",
+            "│  Overall Statistics:" + " " * 47 + "│",
             f"│  ├─ Compute Utilization: {report.avg_compute_utilization:5.1f}% MFU" + " " * 31 + "│",
             f"│  ├─ Memory Bandwidth: {report.total_dram_traffic_gb * 1000 / max(report.total_gpu_time_ms, 0.001):6.0f} GB/s" + " " * 28 + "│",
             f"│  └─ Memory Stalls: {report.avg_memory_stall_pct:5.1f}% (recoverable: ~{report.total_recoverable_gpu_time_pct:.0f}%)" + " " * 15 + "│",

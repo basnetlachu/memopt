@@ -6,7 +6,6 @@ Runs on CPU (CI / local dev) and on GPU (A100 / H100).
 import json
 import os
 import tempfile
-import time
 import pytest
 
 from memopt.kernels.certification import (
@@ -15,13 +14,9 @@ from memopt.kernels.certification import (
     ThroughputResult,
     _get_hardware_info,
     _theoretical_peak_gb_s,
-    _run_correctness_tests,
-    _run_throughput_tests,
     run_certification,
     _save_certificate,
     verify_certificate,
-    _canonical_json,
-    _sign,
     _TOLERANCES,
 )
 

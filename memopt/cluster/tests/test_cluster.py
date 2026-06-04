@@ -3,7 +3,6 @@ Cluster layer tests — hypervisor routing, transport, and borrow protocol.
 All tests use TCPTransport and LocalGKDBackend. No hardware required.
 """
 import time
-import threading
 import pytest
 import inspect
 from memopt.cluster.transport import TCPTransport, RemoteRegion, make_transport, AbstractTransport
@@ -218,7 +217,6 @@ def test_ucx_transport_skips_cleanly_without_ucxpy():
     UCXTransport raises ImportError when ucx-py is not installed.
     make_transport() must catch this and return TCPTransport.
     """
-    from memopt.cluster.transport import UCXTransport
     try:
         import ucp
         pytest.skip("ucx-py is installed — UCX path tested separately")

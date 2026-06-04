@@ -14,11 +14,9 @@ For each model we:
 from __future__ import annotations
 import gc
 import json
-import os
 import sys
 import time
 import traceback
-from dataclasses import dataclass
 from typing import Optional
 
 sys.path.insert(0, "/root/memopt")
@@ -28,7 +26,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from memopt.vmm import VMM
 from memopt.cluster.gkd_store import GKDStore
-from memopt.observability.collector import MetricRegistry
 from memopt.observability.ledger import OptimizationLedger
 
 try:

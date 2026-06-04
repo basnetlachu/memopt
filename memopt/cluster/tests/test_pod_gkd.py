@@ -1,7 +1,6 @@
 """
 Tests for pod-level GKD cache and two-tier lookup.
 """
-import os
 import threading
 import time
 

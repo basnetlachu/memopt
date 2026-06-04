@@ -7,7 +7,6 @@ import os
 import tempfile
 import time
 
-import pytest
 
 from memopt.vmm.oracle import BlockPrediction, MemoryOracle, OracleStats
 from memopt.vmm.oracle_data_cleaner import CleaningStats, OracleDataCleaner

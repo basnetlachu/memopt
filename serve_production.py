@@ -358,7 +358,7 @@ print(f'  Total tokens:       {total_tokens}')
 print('\n[P2] GKD DEDUPLICATION')
 print(f'  Cache hits:         {gkd_hits}/{n_done}')
 print(f'  Hit rate:           {gkd_hit_rate:.1f}%')
-print(f'  Shared requests:    ~70%')
+print('  Shared requests:    ~70%')
 
 print('\n[P4] COMPLIANCE LEDGER')
 for k, v in ledger_totals.items():

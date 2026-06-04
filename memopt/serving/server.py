@@ -387,7 +387,6 @@ if _HAS_FASTAPI:
 
             # Check background threads
             try:
-                from memopt.vmm import VMM
                 vmm_instance = getattr(_engine, '_vmm', None)
                 if vmm_instance and hasattr(vmm_instance, 'prefetch'):
                     if not vmm_instance.prefetch.is_healthy():

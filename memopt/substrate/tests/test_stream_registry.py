@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from collections import deque
 
-import pytest
 
 from memopt.substrate.stream_registry import StreamRegistry
 

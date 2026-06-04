@@ -86,7 +86,7 @@ def cmd_optimize(args):
     print("\nOptimizing...")
     model, session = api.optimize(model, sample, verbose=True)
 
-    print(f"\nResults saved to: ~/.memopt/sessions/")
+    print("\nResults saved to: ~/.memopt/sessions/")
 
 
 def cmd_profile(args):
@@ -327,7 +327,6 @@ def cmd_apply(args):
 def cmd_certify(args):
     """Run silicon certification suite and print results."""
     from memopt.kernels.certification import run_certification, _save_certificate
-    import json
 
     node_id  = getattr(args, "node_id", "") or ""
     out_dir  = getattr(args, "output_dir", None) or "/tmp/memopt_certs"

@@ -33,7 +33,7 @@ import torch
 # swap, and the swap would fail with "Can't swap an already initialized
 # allocator".
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from memopt.vmm.cuda_vmm import CUDAVMMAllocator, _find_library, _get_lib
+from memopt.vmm.cuda_vmm import _find_library, _get_lib
 
 
 def _bind_torch_symbols(lib):

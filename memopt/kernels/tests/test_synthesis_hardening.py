@@ -1,12 +1,8 @@
 """
 Kernel synthesis hardening tests — strict mode, circuit breaker, audit log.
 """
-import json
-import os
 import tempfile
-import time
 
-import pytest
 
 
 def test_synthesis_audit_log_never_raises():

@@ -17,9 +17,8 @@ import time
 import threading
 import socket
 import struct
-import json
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 

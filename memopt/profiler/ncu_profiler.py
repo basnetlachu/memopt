@@ -19,20 +19,17 @@ Usage:
 from __future__ import annotations
 
 import os
-import re
 import csv
 import time
 import tempfile
 import subprocess
 import logging
 from io import StringIO
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
 from contextlib import contextmanager
 
 import torch
-import torch.nn as nn
 
 logger = logging.getLogger("memopt.ncu")
 
@@ -325,7 +322,7 @@ class NCUProfiler:
                 "python3", script_path
             ]
 
-            logger.info(f"Running ncu profiling...")
+            logger.info("Running ncu profiling...")
             logger.debug(f"Command: {' '.join(cmd)}")
 
             # Run ncu
@@ -495,8 +492,8 @@ class NCUProfiler:
         self._counters.append(counters)
 
         logger.warning(
-            f"Context manager profiling only captures timing. "
-            f"Use profile_script() for full CUPTI metrics."
+            "Context manager profiling only captures timing. "
+            "Use profile_script() for full CUPTI metrics."
         )
 
     def get_counters(self) -> List[NCUCounters]:
@@ -524,13 +521,13 @@ class NCUProfiler:
                 f"Kernel: {c.kernel_name}",
                 f"  Duration: {c.duration_ms:.3f} ms",
                 "",
-                f"  DRAM Traffic (MEASURED):",
+                "  DRAM Traffic (MEASURED):",
                 f"    Read:  {c.dram_bytes_read / 1e9:.4f} GB",
                 f"    Write: {c.dram_bytes_write / 1e9:.4f} GB",
                 f"    Total: {c.dram_total_bytes / 1e9:.4f} GB",
                 f"    Bandwidth: {c.achieved_bandwidth_gbps:.1f} GB/s",
                 "",
-                f"  Memory Stalls (MEASURED):",
+                "  Memory Stalls (MEASURED):",
                 f"    Long Scoreboard: {c.stall_long_scoreboard} cycles",
                 f"    Short Scoreboard: {c.stall_short_scoreboard} cycles",
                 f"    Wait: {c.stall_wait} cycles",
@@ -538,17 +535,17 @@ class NCUProfiler:
                 f"    Total Stall Cycles: {c.total_stall_cycles}",
                 f"    Memory Stall %: {c.memory_stall_pct:.1f}%",
                 "",
-                f"  Compute (MEASURED):",
+                "  Compute (MEASURED):",
                 f"    Cycles Active: {c.cycles_active}",
                 f"    Cycles Elapsed: {c.cycles_elapsed}",
                 f"    Compute Utilization: {c.compute_utilization_pct:.1f}%",
                 f"    FLOPS (SP): {c.flop_sp / 1e9:.2f} GFLOPS",
                 f"    TFLOPS: {c.achieved_tflops:.4f}",
                 "",
-                f"  Cache (MEASURED):",
+                "  Cache (MEASURED):",
                 f"    L2 Hit Rate: {c.l2_hit_rate_pct:.1f}%",
                 "",
-                f"  Occupancy (MEASURED):",
+                "  Occupancy (MEASURED):",
                 f"    Achieved: {c.achieved_occupancy_pct:.1f}%",
                 "",
                 f"  Arithmetic Intensity: {c.arithmetic_intensity:.2f} FLOPS/byte",

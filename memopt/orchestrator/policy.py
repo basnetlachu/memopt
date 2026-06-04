@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Protocol, Tuple
 
 
 logger = logging.getLogger("memopt.orchestrator.policy")

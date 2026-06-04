@@ -23,10 +23,8 @@ from __future__ import annotations
 
 import os
 import math
-import time
 import threading
 import tempfile
-import types
 import pytest
 import torch
 import torch.nn.functional as F
@@ -347,7 +345,7 @@ def test_fused_layer_norm_residual():
         assert not result["failed"], "Synthesis API call failed"
 
         if result["discarded"]:
-            print(f"\n  LN+Residual kernel discarded — baseline already fast.")
+            print("\n  LN+Residual kernel discarded — baseline already fast.")
             return
 
         key    = cache_key(event.op_name, event.input_shapes, event.hardware)
@@ -481,12 +479,12 @@ def test_print_pillar3_summary():
     """Prints hardware context for the results block."""
     free, total = torch.cuda.mem_get_info()
     print(f"\n{'='*56}")
-    print(f"  PILLAR 3 REVOLUTIONARY RESULTS")
+    print("  PILLAR 3 REVOLUTIONARY RESULTS")
     print(f"  Hardware: {torch.cuda.get_device_name(0)}")
     print(f"  VRAM: {total/1e9:.1f} GB total, {free/1e9:.1f} GB free")
     print(f"  Triton: {triton.__version__}")
     print(f"  PyTorch: {torch.__version__}")
-    print(f"  Ops tested: RoPE fusion, LayerNorm+Residual, Scaled Softmax")
-    print(f"  Note: 'discarded' = unfused PyTorch already optimal for this shape")
-    print(f"  Note: 'speedup'   = fused kernel beats unfused by measured margin")
+    print("  Ops tested: RoPE fusion, LayerNorm+Residual, Scaled Softmax")
+    print("  Note: 'discarded' = unfused PyTorch already optimal for this shape")
+    print("  Note: 'speedup'   = fused kernel beats unfused by measured margin")
     print(f"{'='*56}\n")
