@@ -213,8 +213,7 @@ memopt/                        ← Python package root
 │   ├── gpu_info.py            ← Shared CUDA/ROCm detection helper  [new]
 │   ├── hardware_detector.py   ← Rich HardwareProfile (ridge point, caps)
 │   ├── input_handler.py
-│   ├── model_loader.py
-│   └── multimodal.py
+│   └── model_loader.py
 ├── observability/             ← Pillar 4: Proof of Efficiency  [new]
 │   ├── collector.py           ← Prometheus-compatible metrics aggregator
 │   ├── ledger.py              ← Per-batch energy/CO₂/cost savings ledger (SQLite)
